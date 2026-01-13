@@ -36,6 +36,189 @@ config COPILOT_USE_FLOAT_MOTION
     bool "Use float (FPU) for motion math"
     default y
 
+choice COPILOT_MOTION_SOURCE
+    prompt "Motion data source"
+    default COPILOT_MOTION_SOURCE_EXTERNAL
+    help
+        Select the source for motion data (acceleration/angular velocity)
+        used to drive face deflection animations.
+
+config COPILOT_MOTION_SOURCE_DISABLED
+    bool "Disabled"
+    help
+        Disable motion-based face deflection. The face will not respond
+        to acceleration or angular velocity input.
+
+config COPILOT_MOTION_SOURCE_INTERNAL
+    bool "Internal IMU"
+    help
+        Use internal IMU sensor for motion data. Requires an IMU
+        connected to the board (QMI8658, BMI270, etc.).
+
+config COPILOT_MOTION_SOURCE_EXTERNAL
+    bool "External Input"
+    help
+        Receive motion data from external source via MQTT commands.
+        Use JSON format: {"type":"motion", "ax":0.3, "ay":0.0, "yaw":10.0}
+
+endchoice
+
+config COPILOT_IMU_UPDATE_INTERVAL_MS
+    int "IMU update interval (ms)"
+    default 25
+    depends on COPILOT_MOTION_SOURCE_INTERNAL
+    help
+        Interval for reading IMU data when using internal IMU mode.
+
+config COPILOT_IMU_I2C_ADDR
+    hex "QMI8658 I2C address"
+    default 0x6B
+    depends on COPILOT_MOTION_SOURCE_INTERNAL
+    help
+        I2C address of the QMI8658 IMU sensor.
+        Default is 0x6B. Some boards may use 0x6A.
+        Note: Uses the shared BSP I2C bus (GPIO14/15).
+
+config COPILOT_IMU_FREEZE_QUATERNION
+    bool "Freeze quaternion (use raw accel/gyro)"
+    default y
+    depends on COPILOT_MOTION_SOURCE_INTERNAL
+    help
+        When enabled, bypasses quaternion orientation estimation and uses
+        raw sensor data directly for animation:
+        - Forward/backward acceleration → up/down face shift
+        - Yaw angular velocity (turning) → left/right face shift
+
+        This mode assumes the screen always faces the driver and provides
+        more intuitive response to vehicle dynamics.
+
+        When disabled, uses Mahony AHRS for orientation-based animation.
+
+menu "IMU Installation Orientation"
+    depends on COPILOT_MOTION_SOURCE_INTERNAL
+
+    comment "IMU coordinate system (screen-based):"
+    comment "  X: parallel to screen UP direction"
+    comment "  Y: parallel to screen RIGHT direction"
+    comment "  Z: through screen BACKWARD"
+    comment ""
+    comment "Vehicle body frame: X=front, Y=left, Z=up"
+
+choice COPILOT_IMU_AXIS_VEHICLE_X
+    prompt "Vehicle X (front) corresponds to IMU axis"
+    default COPILOT_IMU_VEHICLE_X_IS_IMU_Z
+    help
+        Select which IMU axis points toward vehicle front.
+
+config COPILOT_IMU_VEHICLE_X_IS_IMU_X
+    bool "+IMU_X"
+config COPILOT_IMU_VEHICLE_X_IS_IMU_X_NEG
+    bool "-IMU_X"
+config COPILOT_IMU_VEHICLE_X_IS_IMU_Y
+    bool "+IMU_Y"
+config COPILOT_IMU_VEHICLE_X_IS_IMU_Y_NEG
+    bool "-IMU_Y"
+config COPILOT_IMU_VEHICLE_X_IS_IMU_Z
+    bool "+IMU_Z"
+config COPILOT_IMU_VEHICLE_X_IS_IMU_Z_NEG
+    bool "-IMU_Z"
+endchoice
+
+choice COPILOT_IMU_AXIS_VEHICLE_Y
+    prompt "Vehicle Y (left) corresponds to IMU axis"
+    default COPILOT_IMU_VEHICLE_Y_IS_IMU_Y_NEG
+    help
+        Select which IMU axis points toward vehicle left.
+
+config COPILOT_IMU_VEHICLE_Y_IS_IMU_X
+    bool "+IMU_X"
+config COPILOT_IMU_VEHICLE_Y_IS_IMU_X_NEG
+    bool "-IMU_X"
+config COPILOT_IMU_VEHICLE_Y_IS_IMU_Y
+    bool "+IMU_Y"
+config COPILOT_IMU_VEHICLE_Y_IS_IMU_Y_NEG
+    bool "-IMU_Y"
+config COPILOT_IMU_VEHICLE_Y_IS_IMU_Z
+    bool "+IMU_Z"
+config COPILOT_IMU_VEHICLE_Y_IS_IMU_Z_NEG
+    bool "-IMU_Z"
+endchoice
+
+choice COPILOT_IMU_AXIS_VEHICLE_Z
+    prompt "Vehicle Z (up) corresponds to IMU axis"
+    default COPILOT_IMU_VEHICLE_Z_IS_IMU_X
+    help
+        Select which IMU axis points toward vehicle up.
+
+config COPILOT_IMU_VEHICLE_Z_IS_IMU_X
+    bool "+IMU_X"
+config COPILOT_IMU_VEHICLE_Z_IS_IMU_X_NEG
+    bool "-IMU_X"
+config COPILOT_IMU_VEHICLE_Z_IS_IMU_Y
+    bool "+IMU_Y"
+config COPILOT_IMU_VEHICLE_Z_IS_IMU_Y_NEG
+    bool "-IMU_Y"
+config COPILOT_IMU_VEHICLE_Z_IS_IMU_Z
+    bool "+IMU_Z"
+config COPILOT_IMU_VEHICLE_Z_IS_IMU_Z_NEG
+    bool "-IMU_Z"
+endchoice
+
+endmenu
+
+config COPILOT_IMU_RESET_GPIO
+    int "Quaternion reset button GPIO (-1 to disable)"
+    default 0
+    depends on COPILOT_MOTION_SOURCE_INTERNAL
+    help
+        GPIO number for the button that resets quaternion to identity.
+        Press and hold to zero-out gyro drift. Default is GPIO0 (BOOT button).
+        Set to -1 to disable this feature.
+
+config COPILOT_IMU_FILTER_ALPHA
+    int "Complementary filter alpha (0-100)"
+    default 98
+    range 0 100
+    depends on COPILOT_MOTION_SOURCE_INTERNAL
+    help
+        Complementary filter coefficient for quaternion estimation.
+        Higher values trust gyroscope more (faster response, more drift).
+        Lower values trust accelerometer more (slower response, less drift).
+        Typical: 95-99. Default 98 means 98% gyro, 2% accel.
+
+choice COPILOT_MOTION_SENSITIVITY
+    prompt "Motion sensitivity"
+    default COPILOT_MOTION_SENSITIVITY_MEDIUM
+    help
+        Select motion sensitivity level for face animation.
+        Low: High sensitivity, large movement from slight shaking (handheld testing)
+        Medium: Balanced sensitivity (normal vehicle use)
+        High: Low sensitivity, stable animation (highway driving)
+
+config COPILOT_MOTION_SENSITIVITY_LOW
+    bool "Low (High sensitivity - handheld testing)"
+    help
+        High sensitivity mode for handheld testing.
+        Even slight shaking causes large face movement.
+        Sensitivity multiplier: 3.0x
+
+config COPILOT_MOTION_SENSITIVITY_MEDIUM
+    bool "Medium (Normal - city driving)"
+    help
+        Balanced sensitivity for normal vehicle use.
+        Suitable for city driving with moderate motion.
+        Sensitivity multiplier: 1.5x
+
+config COPILOT_MOTION_SENSITIVITY_HIGH
+    bool "High (Low sensitivity - highway)"
+    help
+        Low sensitivity mode for stable display.
+        Face moves only with significant motion.
+        Suitable for highway driving.
+        Sensitivity multiplier: 1.0x
+
+endchoice
+
 config COPILOT_PRELIGHT_MS
     int "Ring prelight time (ms)"
     default 500
@@ -54,11 +237,19 @@ config COPILOT_UNEASY_YAW_DEG
 
 config COPILOT_MOTION_MAX_SHIFT_PX
     int "Max face shift (px)"
-    default 18
+    default 45
+    help
+        Maximum pixel offset for face position when responding to motion.
+        Higher values allow more dramatic face movement.
+        Typical: 18 (subtle), 30 (moderate), 45 (large), 60 (very large).
 
 config COPILOT_MOTION_MAX_ANGLE_DEG
     int "Max face tilt angle (deg)"
-    default 12
+    default 25
+    help
+        Maximum tilt angle (degrees) for face rotation when responding to motion.
+        Higher values allow more dramatic face tilting.
+        Typical: 12 (subtle), 20 (moderate), 25 (large), 35 (very large).
 
 menu "Performance Profiling"
 

@@ -62,13 +62,13 @@ static void copilot_perf_report_rtos(void) {
     uint32_t total_runtime;
     UBaseType_t filled = uxTaskGetSystemState(s_task_status, task_count, &total_runtime);
 
-    if (filled == 0 || total_runtime == 0) {
+    if (filled == 0) {
         ESP_LOGW(TAG, "RTOS stats not available");
         return;
     }
 
     ESP_LOGI(TAG, "=== RTOS Task Statistics ===");
-    ESP_LOGI(TAG, "%-16s %8s %8s %6s", "Task", "Stack", "StackHW", "CPU%");
+    ESP_LOGI(TAG, "%-16s %6s %8s %6s", "Task", "State", "FreeStk", "CPU%");
 
     for (UBaseType_t i = 0; i < filled; i++) {
         TaskStatus_t *t = &s_task_status[i];
@@ -79,14 +79,32 @@ static void copilot_perf_report_rtos(void) {
             cpu_percent = (t->ulRunTimeCounter * 100UL) / total_runtime;
         }
 
-        // Stack high watermark (remaining stack in words -> bytes)
-        uint32_t stack_hw = t->usStackHighWaterMark * sizeof(StackType_t);
+        // Stack high watermark = minimum free stack ever (in words -> bytes)
+        uint32_t free_stack = t->usStackHighWaterMark * sizeof(StackType_t);
 
-        ESP_LOGI(TAG, "%-16s %8lu %8lu %5lu%%",
+        // Task state string
+        const char* state_str;
+        switch (t->eCurrentState) {
+            case eRunning:   state_str = "Run"; break;
+            case eReady:     state_str = "Ready"; break;
+            case eBlocked:   state_str = "Block"; break;
+            case eSuspended: state_str = "Susp"; break;
+            case eDeleted:   state_str = "Del"; break;
+            default:         state_str = "?"; break;
+        }
+
+        ESP_LOGI(TAG, "%-16s %6s %8lu %5lu%%",
                  t->pcTaskName,
-                 (unsigned long)(t->usStackHighWaterMark * sizeof(StackType_t)),
-                 (unsigned long)stack_hw,
+                 state_str,
+                 (unsigned long)free_stack,
                  (unsigned long)cpu_percent);
+    }
+
+    // Show total runtime info
+    if (total_runtime > 0) {
+        ESP_LOGI(TAG, "Total runtime ticks: %lu", (unsigned long)total_runtime);
+    } else {
+        ESP_LOGW(TAG, "Note: Enable configGENERATE_RUN_TIME_STATS for CPU%% stats");
     }
 }
 #endif

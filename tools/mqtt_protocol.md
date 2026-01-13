@@ -29,6 +29,11 @@ Fields:
 - `yaw`: steering yaw (deg)
 - `speed`: optional, reserved for future use
 
+Quaternion mode (for external IMU):
+```json
+{"type":"motion","qw":1.0,"qx":0.0,"qy":0.0,"qz":0.0}
+```
+
 ### Sound
 ```json
 {"type":"sound","id":"beep_short","prelight_ms":350}
@@ -40,3 +45,50 @@ IDs: `beep_short|beep_long|chime|tap`
 {"type":"ring","on":true}
 ```
 
+### Calibrate (IMU)
+```json
+{"type":"calibrate","target":"gyro"}
+```
+Starts gyroscope zero-bias calibration. The device must be kept **stationary** for approximately 3 seconds during calibration.
+
+Fields:
+- `target`: calibration target, currently only `"gyro"` is supported
+
+The calibration result is automatically saved to NVS (flash) and will be loaded on next boot.
+
+### Status Query
+```json
+{"type":"status","query":"imu"}
+```
+Queries device status. Results are logged to the device console (not sent via MQTT).
+
+Fields:
+- `query`: `"imu"` or `"all"`
+
+Response (logged on device):
+```
+IMU status: ready=1 calibrating=0 bias=2.35 dps
+```
+
+## Demo Script
+
+Use `tools/mqtt_demo.sh` for interactive testing:
+
+```bash
+# Default (localhost broker)
+./tools/mqtt_demo.sh
+
+# Custom broker
+./tools/mqtt_demo.sh -h 192.168.1.100
+
+# With custom device ID
+./tools/mqtt_demo.sh -h 192.168.1.100 -d my_device
+
+# Show help
+./tools/mqtt_demo.sh --help
+```
+
+Environment variables:
+- `MQTT_HOST`: broker hostname
+- `MQTT_PREFIX`: topic prefix (default: `copilot`)
+- `MQTT_DEVICE`: device ID (default: `s3_copilot`)

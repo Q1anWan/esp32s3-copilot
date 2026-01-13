@@ -1,6 +1,7 @@
 #include "copilot_app.h"
 
 #include <string.h>
+#include <math.h>
 
 #include "cJSON.h"
 #include "esp_log.h"
@@ -10,6 +11,7 @@
 #include "sdkconfig.h"
 
 #include "copilot_audio.h"
+#include "copilot_imu.h"
 #include "copilot_mqtt.h"
 #include "copilot_perf.h"
 #include "copilot_ui.h"
@@ -172,11 +174,69 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
 
     if (strcmp(type->valuestring, "motion") == 0) {
         copilot_motion_t motion = {};
-        motion.ax = copilot_get_number_fp(root, "ax", 0);
-        motion.ay = copilot_get_number_fp(root, "ay", 0);
-        motion.yaw_deg = copilot_get_number_fp(root, "yaw", 0);
-        motion.speed = copilot_get_number_fp(root, "speed", 0);
-        ESP_LOGI(TAG, "Motion ax=%d ay=%d yaw=%d speed=%d (Q8.8)", motion.ax, motion.ay, motion.yaw_deg, motion.speed);
+
+        // Check if quaternion is provided (external IMU with orientation)
+        const cJSON *qw_item = cJSON_GetObjectItemCaseSensitive(root, "qw");
+        if (cJSON_IsNumber(qw_item)) {
+            // Quaternion mode: extract roll/pitch/yaw from quaternion
+            // Vehicle body frame: X=front, Y=left, Z=up
+            // Quaternion represents vehicle orientation in world frame
+            float qw = qw_item->valuedouble;
+            float qx = 0, qy = 0, qz = 0;
+            const cJSON *qx_item = cJSON_GetObjectItemCaseSensitive(root, "qx");
+            const cJSON *qy_item = cJSON_GetObjectItemCaseSensitive(root, "qy");
+            const cJSON *qz_item = cJSON_GetObjectItemCaseSensitive(root, "qz");
+            if (cJSON_IsNumber(qx_item)) qx = qx_item->valuedouble;
+            if (cJSON_IsNumber(qy_item)) qy = qy_item->valuedouble;
+            if (cJSON_IsNumber(qz_item)) qz = qz_item->valuedouble;
+
+            // Quaternion to Euler angles (ZYX convention)
+            // Roll (X): left/right tilt → animation ax
+            // Pitch (Y): forward/backward tilt → animation ay
+            // Yaw (Z): heading rotation → animation yaw
+            float sinr_cosp = 2.0f * (qw * qx + qy * qz);
+            float cosr_cosp = 1.0f - 2.0f * (qx * qx + qy * qy);
+            float roll = atan2f(sinr_cosp, cosr_cosp);  // radians
+
+            float sinp = 2.0f * (qw * qy - qz * qx);
+            float pitch;
+            if (fabsf(sinp) >= 1.0f) {
+                pitch = copysignf(M_PI / 2.0f, sinp);  // Use 90 degrees if out of range
+            } else {
+                pitch = asinf(sinp);
+            }
+
+            float siny_cosp = 2.0f * (qw * qz + qx * qy);
+            float cosy_cosp = 1.0f - 2.0f * (qy * qy + qz * qz);
+            float yaw = atan2f(siny_cosp, cosy_cosp);  // radians
+
+            // Convert to animation values
+            // Roll → ax (left/right drift): positive roll = right side down = drift right
+            // Pitch → ay (up/down drift): positive pitch = nose up = drift up
+            // Yaw → yaw_deg
+            float ax = sinf(roll);   // sin(roll) gives normalized tilt (-1 to +1)
+            float ay = sinf(pitch);  // sin(pitch) gives normalized tilt
+            float yaw_deg = yaw * 57.2957795f;  // Convert to degrees
+
+            motion.ax = FP_FROM_FLOAT(ax);
+            motion.ay = FP_FROM_FLOAT(ay);
+            motion.yaw_deg = FP_FROM_FLOAT(yaw_deg);
+            motion.speed = copilot_get_number_fp(root, "speed", FP_ONE);
+
+            ESP_LOGI(TAG, "Motion (quat) ax=%d ay=%d yaw=%d speed=%d (Q8.8)",
+                     motion.ax, motion.ay, motion.yaw_deg, motion.speed);
+        } else {
+            // Direct mode: ax/ay/yaw values directly from JSON
+            // ax/ay are in g units (-1 to +1), yaw in degrees
+            motion.ax = copilot_get_number_fp(root, "ax", 0);
+            motion.ay = copilot_get_number_fp(root, "ay", 0);
+            motion.yaw_deg = copilot_get_number_fp(root, "yaw", 0);
+            motion.speed = copilot_get_number_fp(root, "speed", FP_ONE);
+
+            ESP_LOGI(TAG, "Motion ax=%d ay=%d yaw=%d speed=%d (Q8.8)",
+                     motion.ax, motion.ay, motion.yaw_deg, motion.speed);
+        }
+
         copilot_ui_set_motion_async(&motion);
     } else if (strcmp(type->valuestring, "emotion") == 0 || strcmp(type->valuestring, "expression") == 0) {
         const cJSON *name = cJSON_GetObjectItemCaseSensitive(root, "name");
@@ -220,6 +280,33 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
             ESP_LOGI(TAG, "Ring on=%s", cJSON_IsTrue(on) ? "true" : "false");
             copilot_ui_ring_show_async(cJSON_IsTrue(on));
         }
+    } else if (strcmp(type->valuestring, "calibrate") == 0) {
+        // IMU gyroscope zero-bias calibration
+        const cJSON *target = cJSON_GetObjectItemCaseSensitive(root, "target");
+        const char *target_str = cJSON_IsString(target) ? target->valuestring : "gyro";
+
+        if (strcmp(target_str, "gyro") == 0) {
+            ESP_LOGI(TAG, "IMU gyro calibration requested via MQTT");
+            if (copilot_imu_start_calibration()) {
+                ESP_LOGI(TAG, "Gyro calibration started. Keep device stationary!");
+            } else {
+                ESP_LOGW(TAG, "Gyro calibration failed to start (IMU not ready or already calibrating)");
+            }
+        } else {
+            ESP_LOGW(TAG, "Unknown calibration target: %s", target_str);
+        }
+    } else if (strcmp(type->valuestring, "status") == 0) {
+        // Query device status
+        const cJSON *query = cJSON_GetObjectItemCaseSensitive(root, "query");
+        const char *query_str = cJSON_IsString(query) ? query->valuestring : "all";
+
+        if (strcmp(query_str, "imu") == 0 || strcmp(query_str, "all") == 0) {
+            float bias = copilot_imu_get_gyro_bias();
+            bool calibrating = copilot_imu_is_calibrating();
+            bool ready = copilot_imu_is_ready();
+            ESP_LOGI(TAG, "IMU status: ready=%d calibrating=%d bias=%.2f dps",
+                     ready ? 1 : 0, calibrating ? 1 : 0, bias);
+        }
     }
 
     cJSON_Delete(root);
@@ -237,6 +324,7 @@ void copilot_app_init(void) {
     ESP_LOGI(TAG, "Init copilot app");
     copilot_perf_init();
     copilot_audio_init();
+    copilot_imu_init();
     if (!s_action_queue) {
         s_action_queue = xQueueCreate(8, sizeof(copilot_action_t));
         if (s_action_queue) {

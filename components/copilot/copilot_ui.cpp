@@ -808,6 +808,11 @@ void copilot_ui_set_motion(const copilot_motion_t *motion) {
         return;
     }
 
+#ifdef CONFIG_COPILOT_MOTION_SOURCE_DISABLED
+    // Motion disabled - ignore all input
+    return;
+#endif
+
     s_ui.motion_target = *motion;
     ESP_LOGD(TAG, "Motion target ax=%d ay=%d yaw=%d speed=%d (Q8.8)",
              motion->ax, motion->ay, motion->yaw_deg, motion->speed);
@@ -885,6 +890,20 @@ void copilot_ui_set_motion_async(const copilot_motion_t *motion) {
     }
     if (bsp_display_lock(0)) {
         copilot_ui_set_motion(motion);
+        bsp_display_unlock();
+    }
+}
+
+void copilot_ui_set_motion_only_async(const copilot_motion_t *motion) {
+    if (!s_ui.ready || !motion) {
+        return;
+    }
+    if (bsp_display_lock(0)) {
+        // Only update motion target without checking uneasy threshold
+        // This is used by internal IMU to avoid expression changes
+        s_ui.motion_target = *motion;
+        ESP_LOGD(TAG, "Motion only ax=%d ay=%d yaw=%d (Q8.8)",
+                 motion->ax, motion->ay, motion->yaw_deg);
         bsp_display_unlock();
     }
 }

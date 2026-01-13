@@ -35,6 +35,7 @@ void copilot_ui_on_touch(uint16_t x, uint16_t y);
 
 void copilot_ui_set_expression_async(copilot_expr_t expr, uint32_t duration_ms);
 void copilot_ui_set_motion_async(const copilot_motion_t *motion);
+void copilot_ui_set_motion_only_async(const copilot_motion_t *motion);  // Motion only, no expression trigger
 void copilot_ui_ring_show_async(bool on);
 
 #ifdef __cplusplus

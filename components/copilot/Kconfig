@@ -1,0 +1,106 @@
+menu "Copilot"
+
+config COPILOT_WIFI_SSID
+    string "WiFi SSID"
+    default ""
+
+config COPILOT_WIFI_PASSWORD
+    string "WiFi Password"
+    default ""
+
+config COPILOT_MQTT_BROKER_URI
+    string "MQTT Broker URI"
+    default "mqtt://192.168.1.10"
+
+config COPILOT_MQTT_TOPIC_PREFIX
+    string "MQTT Topic Prefix"
+    default "copilot"
+
+config COPILOT_DEVICE_ID
+    string "Device ID"
+    default "s3_copilot"
+
+config COPILOT_UI_CORE
+    int "UI/LVGL task core affinity (-1: no affinity, 0/1: core)"
+    default 1
+
+config COPILOT_ACTION_CORE
+    int "Action task core affinity (-1: no affinity, 0/1: core)"
+    default 1
+
+config COPILOT_AUDIO_CORE
+    int "Audio task core affinity (-1: no affinity, 0/1: core)"
+    default 0
+
+config COPILOT_USE_FLOAT_MOTION
+    bool "Use float (FPU) for motion math"
+    default y
+
+config COPILOT_PRELIGHT_MS
+    int "Ring prelight time (ms)"
+    default 500
+
+config COPILOT_EXPR_TRANSITION_MS
+    int "Expression transition time (ms)"
+    default 400
+
+config COPILOT_UNEASY_ACCEL_CG
+    int "Uneasy threshold (centi-g)"
+    default 70
+
+config COPILOT_UNEASY_YAW_DEG
+    int "Uneasy yaw threshold (deg)"
+    default 25
+
+config COPILOT_MOTION_MAX_SHIFT_PX
+    int "Max face shift (px)"
+    default 18
+
+config COPILOT_MOTION_MAX_ANGLE_DEG
+    int "Max face tilt angle (deg)"
+    default 12
+
+menu "Performance Profiling"
+
+config COPILOT_PERF_ENABLE
+    bool "Enable performance profiling"
+    default n
+    help
+        Enable performance profiling output including FPS, RTOS task
+        statistics, and hardware resource usage.
+
+config COPILOT_PERF_INTERVAL_MS
+    int "Profiling report interval (ms)"
+    default 5000
+    depends on COPILOT_PERF_ENABLE
+    help
+        Interval in milliseconds between performance reports.
+
+config COPILOT_PERF_FPS
+    bool "Enable FPS monitoring"
+    default y
+    depends on COPILOT_PERF_ENABLE
+    help
+        Enable animation frame rate (FPS) monitoring and reporting.
+
+config COPILOT_PERF_RTOS_STATS
+    bool "Enable RTOS task statistics"
+    default y
+    depends on COPILOT_PERF_ENABLE
+    select FREERTOS_USE_TRACE_FACILITY
+    select FREERTOS_GENERATE_RUN_TIME_STATS
+    help
+        Enable FreeRTOS task stack usage and CPU utilization statistics.
+        This enables FREERTOS_USE_TRACE_FACILITY and
+        FREERTOS_GENERATE_RUN_TIME_STATS automatically.
+
+config COPILOT_PERF_HEAP
+    bool "Enable heap memory monitoring"
+    default y
+    depends on COPILOT_PERF_ENABLE
+    help
+        Enable heap and SPIRAM memory usage monitoring.
+
+endmenu
+
+endmenu

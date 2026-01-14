@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         "copilot_voice.cpp"
         "copilot_audio_out.cpp"
+        "copilot_ws_client.cpp"
     INCLUDE_DIRS
         "include"
         "."
@@ -11,6 +12,8 @@ idf_component_register(
         driver
         nvs_flash
         esp_http_client
+        esp_websocket_client
+        json
     REQUIRES
         esp32_s3_touch_amoled_1_75
         esp_codec_dev

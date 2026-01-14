@@ -15,13 +15,43 @@ config COPILOT_VOICE_SERVER_URL
         URL of the Python voice backend server for WebRTC signaling.
         Example: http://192.168.1.100:8080
 
-config COPILOT_VOICE_LOOPBACK_TEST
-    bool "Enable audio loopback test"
-    default n
+choice COPILOT_VOICE_MODE
+    prompt "Voice communication mode"
+    default COPILOT_VOICE_MODE_FULL_DUPLEX
     depends on COPILOT_VOICE_ENABLE
     help
-        When enabled, microphone input is directly routed to speaker output
-        for testing audio hardware without WebRTC.
+        Select the voice communication mode.
+
+config COPILOT_VOICE_MODE_FULL_DUPLEX
+    bool "Full-duplex (send and receive)"
+    help
+        ESP32 sends microphone audio to backend and receives TTS audio.
+        This is the normal operation mode for voice assistant.
+
+config COPILOT_VOICE_MODE_TX_ONLY
+    bool "TX only (send microphone to backend)"
+    help
+        ESP32 only sends microphone audio to backend.
+        Useful for testing ASR without TTS playback.
+
+config COPILOT_VOICE_MODE_RX_ONLY
+    bool "RX only (receive TTS from backend)"
+    help
+        ESP32 only receives and plays TTS audio from backend.
+        Useful for testing TTS without microphone input.
+
+config COPILOT_VOICE_MODE_LOOPBACK
+    bool "Local loopback (mic -> speaker)"
+    help
+        Microphone input is directly routed to speaker output.
+        For testing audio hardware without network connection.
+
+endchoice
+
+config COPILOT_VOICE_LOOPBACK_TEST
+    bool
+    default y if COPILOT_VOICE_MODE_LOOPBACK
+    default n
 
 config COPILOT_VOICE_SAMPLE_RATE
     int "Audio sample rate (Hz)"

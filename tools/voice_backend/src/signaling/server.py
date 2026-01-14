@@ -13,13 +13,14 @@ from uuid import uuid4
 from aiohttp import web
 
 from ..session import VoiceSession
+from ..streaming import AudioStreamServer
 
 
 logger = logging.getLogger(__name__)
 
 
 class SignalingServer:
-    """HTTP server for WebRTC signaling with ESP32 clients."""
+    """HTTP server for WebRTC signaling and WebSocket audio streaming."""
 
     def __init__(self, config: dict):
         self.config = config
@@ -27,16 +28,25 @@ class SignalingServer:
         self.runner: Optional[web.AppRunner] = None
         self.sessions: Dict[str, VoiceSession] = {}
 
+        # WebSocket audio streaming server (simpler alternative to WebRTC)
+        self.audio_stream_server = AudioStreamServer(config)
+
         self._setup_routes()
 
     def _setup_routes(self):
-        """Setup HTTP routes."""
+        """Setup HTTP and WebSocket routes."""
+        # Health check
         self.app.router.add_get("/", self._handle_health)
         self.app.router.add_get("/health", self._handle_health)
+
+        # WebRTC signaling (full WebRTC mode)
         self.app.router.add_post("/voice/session", self._handle_create_session)
         self.app.router.add_post("/voice/offer", self._handle_offer)
         self.app.router.add_post("/voice/stop", self._handle_stop_session)
         self.app.router.add_get("/voice/status/{session_id}", self._handle_status)
+
+        # WebSocket audio streaming (simpler mode for ESP32)
+        self.audio_stream_server.setup_routes(self.app)
 
     async def start(self, host: str, port: int):
         """Start the HTTP server."""

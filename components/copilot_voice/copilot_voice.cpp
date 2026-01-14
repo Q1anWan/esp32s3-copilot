@@ -11,6 +11,7 @@
 
 #include "copilot_voice.h"
 #include "copilot_audio_out.h"
+#include "copilot_ws_client.h"
 
 #include <string.h>
 #include <stdint.h>
@@ -86,6 +87,7 @@ static struct {
 
     // Tasks
     TaskHandle_t loopback_task;
+    TaskHandle_t streaming_task;
     TaskHandle_t voice_rx_task;
     TaskHandle_t voice_tx_task;
 
@@ -93,6 +95,7 @@ static struct {
     volatile copilot_voice_state_t state;
     volatile bool loopback_running;
     volatile bool session_active;
+    volatile bool streaming_running;
 
     // Callback
     copilot_voice_event_cb_t event_cb;
@@ -101,6 +104,9 @@ static struct {
     // Settings
     int mic_gain_db;
     int speaker_volume;
+
+    // WebSocket client initialized flag
+    bool ws_client_inited;
 } s_voice = {};
 
 // ============================================================================
@@ -308,6 +314,243 @@ static void loopback_task_func(void *arg) {
 #endif // CONFIG_COPILOT_VOICE_LOOPBACK_TEST
 
 // ============================================================================
+// WebSocket Streaming Session
+// ============================================================================
+
+#if !CONFIG_COPILOT_VOICE_MODE_LOOPBACK
+
+// Callback for receiving audio from WebSocket server
+static void ws_audio_callback(const int16_t *pcm_data, size_t samples, void *user_data) {
+    (void)user_data;
+
+    // Write TTS audio to speaker
+    if (samples > 0) {
+        // The audio_out module handles mono-to-stereo conversion
+        copilot_audio_out_write(AUDIO_SRC_VOICE, pcm_data, (int)samples, 0);
+    }
+}
+
+// Callback for WebSocket state changes
+static void ws_state_callback(copilot_ws_client_state_t state, void *user_data) {
+    (void)user_data;
+
+    switch (state) {
+        case WS_CLIENT_STATE_CONNECTED:
+            LOGI_VOICE("WebSocket connected");
+            break;
+        case WS_CLIENT_STATE_STREAMING:
+            LOGI_VOICE("Streaming started");
+            notify_state_change(VOICE_STATE_LISTENING);
+            break;
+        case WS_CLIENT_STATE_DISCONNECTING:
+        case WS_CLIENT_STATE_IDLE:
+            LOGI_VOICE("WebSocket disconnected");
+            if (s_voice.session_active) {
+                notify_state_change(VOICE_STATE_READY);
+            }
+            break;
+        case WS_CLIENT_STATE_ERROR:
+            ESP_LOGE(TAG, "WebSocket error");
+            notify_state_change(VOICE_STATE_ERROR);
+            break;
+        default:
+            break;
+    }
+}
+
+// Streaming task: reads mic and sends to WebSocket
+static void streaming_task_func(void *arg) {
+    (void)arg;
+    LOGI_VOICE("Streaming task started");
+
+    // Allocate mic buffer (stereo from ES7210)
+    int16_t *mic_stereo_buffer = (int16_t *)heap_caps_malloc(
+        MIC_AUDIO_FRAME_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!mic_stereo_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate mic buffer");
+        s_voice.streaming_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Allocate mono buffer for sending
+    int16_t *mono_buffer = (int16_t *)heap_caps_malloc(
+        VOICE_AUDIO_FRAME_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!mono_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate mono buffer");
+        heap_caps_free(mic_stereo_buffer);
+        s_voice.streaming_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Acquire audio output for receiving TTS
+    if (!copilot_audio_out_acquire(AUDIO_SRC_VOICE)) {
+        ESP_LOGE(TAG, "Failed to acquire audio output");
+        heap_caps_free(mic_stereo_buffer);
+        heap_caps_free(mono_buffer);
+        s_voice.streaming_running = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint32_t frame_count = 0;
+    uint32_t last_log_time = 0;
+
+    while (s_voice.streaming_running) {
+        // Wait for WebSocket to be streaming
+        if (!copilot_ws_client_is_streaming()) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        // Read mic data (stereo)
+        int read_bytes = esp_codec_dev_read(s_voice.mic_dev, mic_stereo_buffer, MIC_AUDIO_FRAME_BYTES);
+        if (read_bytes != MIC_AUDIO_FRAME_BYTES) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        // Convert stereo to mono (take left channel only for ES7210 ADC1)
+        int mono_samples = VOICE_AUDIO_FRAME_SAMPLES;
+        for (int i = 0; i < mono_samples; i++) {
+            mono_buffer[i] = mic_stereo_buffer[i * 2];
+        }
+
+        // Send to WebSocket server (for ASR)
+#if CONFIG_COPILOT_VOICE_MODE_FULL_DUPLEX || CONFIG_COPILOT_VOICE_MODE_TX_ONLY
+        copilot_ws_client_send_audio(mono_buffer, mono_samples);
+#endif
+
+        frame_count++;
+
+        // Log stats every 5 seconds
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        if (now - last_log_time >= 5000) {
+            last_log_time = now;
+            LOGI_VOICE("Streaming: %lu frames sent", (unsigned long)frame_count);
+        }
+
+        taskYIELD();
+    }
+
+    // Cleanup
+    copilot_audio_out_release(AUDIO_SRC_VOICE);
+    heap_caps_free(mic_stereo_buffer);
+    heap_caps_free(mono_buffer);
+
+    LOGI_VOICE("Streaming task stopped (total frames: %lu)", (unsigned long)frame_count);
+    vTaskDelete(NULL);
+}
+
+static bool start_streaming_session(void) {
+    // Build WebSocket URL from config
+#ifndef CONFIG_COPILOT_VOICE_SERVER_URL
+    const char *server_url = "ws://192.168.1.100:8080/audio/stream";
+#else
+    // Convert HTTP URL to WebSocket URL and add path
+    char ws_url[256];
+    const char *http_url = CONFIG_COPILOT_VOICE_SERVER_URL;
+
+    // Replace http:// with ws://
+    if (strncmp(http_url, "http://", 7) == 0) {
+        snprintf(ws_url, sizeof(ws_url), "ws://%s/audio/stream", http_url + 7);
+    } else if (strncmp(http_url, "https://", 8) == 0) {
+        snprintf(ws_url, sizeof(ws_url), "wss://%s/audio/stream", http_url + 8);
+    } else {
+        snprintf(ws_url, sizeof(ws_url), "ws://%s/audio/stream", http_url);
+    }
+    const char *server_url = ws_url;
+#endif
+
+    // Initialize WebSocket client if not already
+    if (!s_voice.ws_client_inited) {
+        copilot_ws_client_config_t ws_cfg = {};
+        ws_cfg.server_url = server_url;
+        ws_cfg.device_id = "esp32_copilot";
+        ws_cfg.sample_rate = CONFIG_COPILOT_VOICE_SAMPLE_RATE;
+        ws_cfg.on_audio = ws_audio_callback;
+        ws_cfg.on_state = ws_state_callback;
+        ws_cfg.user_data = nullptr;
+
+        if (!copilot_ws_client_init(&ws_cfg)) {
+            ESP_LOGE(TAG, "WebSocket client init failed");
+            return false;
+        }
+        s_voice.ws_client_inited = true;
+    }
+
+    // Connect to server
+    if (!copilot_ws_client_connect()) {
+        ESP_LOGE(TAG, "WebSocket connect failed");
+        return false;
+    }
+
+    // Start streaming task
+    s_voice.streaming_running = true;
+
+    int core = normalize_core(CONFIG_COPILOT_VOICE_TASK_CORE);
+    BaseType_t result;
+
+    if (core >= 0) {
+        result = xTaskCreatePinnedToCore(
+            streaming_task_func,
+            "voice_stream",
+            CONFIG_COPILOT_VOICE_TASK_STACK,
+            nullptr,
+            CONFIG_COPILOT_VOICE_TASK_PRIORITY,
+            &s_voice.streaming_task,
+            core);
+    } else {
+        result = xTaskCreate(
+            streaming_task_func,
+            "voice_stream",
+            CONFIG_COPILOT_VOICE_TASK_STACK,
+            nullptr,
+            CONFIG_COPILOT_VOICE_TASK_PRIORITY,
+            &s_voice.streaming_task);
+    }
+
+    if (result != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create streaming task");
+        copilot_ws_client_disconnect();
+        s_voice.streaming_running = false;
+        return false;
+    }
+
+    s_voice.session_active = true;
+    LOGI_VOICE("Streaming session started");
+    return true;
+}
+
+static void stop_streaming_session(void) {
+    if (!s_voice.streaming_running) {
+        return;
+    }
+
+    LOGI_VOICE("Stopping streaming session");
+
+    s_voice.streaming_running = false;
+
+    // Disconnect WebSocket
+    copilot_ws_client_disconnect();
+
+    // Wait for task to exit
+    if (s_voice.streaming_task) {
+        int timeout = 50;  // 500ms
+        while (eTaskGetState(s_voice.streaming_task) != eDeleted && timeout > 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            timeout--;
+        }
+        s_voice.streaming_task = NULL;
+    }
+
+    s_voice.session_active = false;
+}
+
+#endif // !CONFIG_COPILOT_VOICE_MODE_LOOPBACK
+
+// ============================================================================
 // Public API Implementation
 // ============================================================================
 
@@ -366,9 +609,14 @@ bool copilot_voice_start_session(void) {
         return false;
     }
 
-    // TODO: Phase 2+ - Implement WebRTC signaling and ByteRTC connection
-    ESP_LOGW(TAG, "WebRTC session not yet implemented (Phase 2)");
+#if CONFIG_COPILOT_VOICE_MODE_LOOPBACK
+    // In loopback mode, start_session is not applicable
+    ESP_LOGW(TAG, "start_session not applicable in loopback mode");
     return false;
+#else
+    // Start WebSocket streaming session
+    return start_streaming_session();
+#endif
 }
 
 void copilot_voice_stop_session(void) {
@@ -376,7 +624,10 @@ void copilot_voice_stop_session(void) {
         return;
     }
 
-    // TODO: Phase 2+ - Implement WebRTC disconnect
+#if !CONFIG_COPILOT_VOICE_MODE_LOOPBACK
+    stop_streaming_session();
+#endif
+
     s_voice.session_active = false;
     notify_state_change(VOICE_STATE_READY);
 }

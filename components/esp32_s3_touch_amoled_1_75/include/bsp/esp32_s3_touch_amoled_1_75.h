@@ -13,6 +13,7 @@
 
 #include "lvgl.h"
 #include "esp_lvgl_port.h"
+#include "esp_lcd_panel_io.h"
 
 
 /**************************************************************************************************
@@ -328,6 +329,13 @@ void bsp_display_unlock(void);
  * @param[in] rotation Angle of the display rotation
  */
 void bsp_display_rotate(lv_display_t *disp, lv_disp_rotation_t rotation);
+
+/**
+ * @brief Get LCD panel IO handle
+ *
+ * @return LCD panel IO handle, or NULL if not initialized
+ */
+esp_lcd_panel_io_handle_t bsp_display_get_io_handle(void);
 #endif // BSP_CONFIG_NO_GRAPHIC_LIB == 0
 
 #ifdef __cplusplus

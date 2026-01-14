@@ -51,12 +51,13 @@ extern "C" void app_main(void) {
         .trans_size = 0,
         .double_buffer = BSP_LCD_DRAW_BUFF_DOUBLE,
         .flags = {
-            .buff_dma = false,
-            .buff_spiram = true,
+            .buff_dma = true,
+            .buff_spiram = false,
         },
     };
     // Optimize LVGL task: reduce from 7168 to 6144 (touch read needs extra stack)
     disp_cfg.lvgl_port_cfg.task_stack = 6144;
+    disp_cfg.lvgl_port_cfg.task_priority = 5;
     disp_cfg.lvgl_port_cfg.task_affinity = copilot_normalize_core(CONFIG_COPILOT_UI_CORE);
     ESP_LOGI(TAG, "LVGL task affinity=%d", disp_cfg.lvgl_port_cfg.task_affinity);
     lv_display_t *disp = bsp_display_start_with_config(&disp_cfg);

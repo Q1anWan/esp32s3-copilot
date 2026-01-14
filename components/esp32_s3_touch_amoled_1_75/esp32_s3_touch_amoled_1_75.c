@@ -437,7 +437,22 @@ esp_err_t bsp_display_new(const bsp_display_config_t *config, esp_lcd_panel_hand
                                                                  BSP_LCD_H_RES * BSP_LCD_V_RES * BSP_LCD_BITS_PER_PIXEL / 8);
     ESP_ERROR_CHECK(spi_bus_initialize(BSP_LCD_SPI_NUM, &buscfg, SPI_DMA_CH_AUTO));
 
-    const esp_lcd_panel_io_spi_config_t io_config = SH8601_PANEL_IO_QSPI_CONFIG(BSP_LCD_CS, NULL, NULL);
+    // Use custom config with larger queue depth to avoid "spi transmit (queue) color failed"
+    // Default SH8601_PANEL_IO_QSPI_CONFIG uses trans_queue_depth = 10 which is too small
+    const esp_lcd_panel_io_spi_config_t io_config = {
+        .cs_gpio_num = BSP_LCD_CS,
+        .dc_gpio_num = -1,
+        .spi_mode = 0,
+        .pclk_hz = 40 * 1000 * 1000,
+        .trans_queue_depth = 20,  // Increased from 10 to reduce queue overflow errors
+        .on_color_trans_done = NULL,
+        .user_ctx = NULL,
+        .lcd_cmd_bits = 32,
+        .lcd_param_bits = 8,
+        .flags = {
+            .quad_mode = true,
+        },
+    };
 
     sh8601_vendor_config_t vendor_config = {
         .init_cmds = lcd_init_cmds,
@@ -644,4 +659,9 @@ bool bsp_display_lock(uint32_t timeout_ms)
 void bsp_display_unlock(void)
 {
     lvgl_port_unlock();
+}
+
+esp_lcd_panel_io_handle_t bsp_display_get_io_handle(void)
+{
+    return io_handle;
 }

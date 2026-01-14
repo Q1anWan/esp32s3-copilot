@@ -20,7 +20,7 @@ A cute animated face companion for ESP32-S3 with AMOLED display, featuring smoot
 - **Motion Response**: Face shifts and tilts based on accelerometer input
 - **Ring Indicator**: Animated ring for notifications
 - **MQTT Control**: Remote expression/sound control via JSON commands
-- **Audio Playback**: Beep and chime sounds via I2S
+- **Audio Playback**: Tone overlay and voice loopback via unified audio output
 
 ## Build
 
@@ -42,7 +42,9 @@ idf.py flash monitor
 Use `idf.py menuconfig` to configure:
 
 - **Copilot**: WiFi credentials, MQTT broker, core affinity, animation parameters
+- **Debug Logging**: Per-module log toggles (app/ui/audio/audio_out/mqtt/imu/voice)
 - **Performance Profiling**: Enable FPS/RTOS/heap monitoring (disabled by default)
+- **Copilot Voice**: Loopback test, sample rate, task stack/priority, mic gain
 
 ## MQTT Commands
 
@@ -74,6 +76,7 @@ Subscribe to `copilot/<device_id>/cmd` and send JSON:
 │   │   ├── copilot_mqtt   # WiFi/MQTT connection
 │   │   ├── copilot_perf   # Performance profiling
 │   │   └── copilot_face_data # Expression keyframes
+│   ├── copilot_voice     # Voice module + audio output manager
 │   └── esp32_s3_touch_amoled_1_75/  # BSP for display
 ├── spiffs/                 # Audio assets
 └── sdkconfig.defaults      # Default configuration

@@ -14,6 +14,13 @@
 
 static const char *TAG = "copilot_ui";
 
+// Conditional logging
+#if CONFIG_COPILOT_LOG_UI
+#define LOGI_UI(fmt, ...) ESP_LOGI(TAG, fmt, ##__VA_ARGS__)
+#else
+#define LOGI_UI(fmt, ...) do {} while(0)
+#endif
+
 #define UI_OFFSET_X (-10)
 #define UI_OFFSET_Y (-10)
 #define FACE_INNER_OFFSET_X (0)
@@ -52,7 +59,7 @@ static const char *TAG = "copilot_ui";
 #define RING_INNER_WIDTH 7
 
 // Animation timing - optimized for smoothness
-#define ANIM_TIMER_MS 25          // 40fps for smooth animation
+#define ANIM_TIMER_MS 33          // ~30fps to match available CPU headroom
 #define BLINK_CLOSE_MS 100        // Slightly slower close for cute effect
 #define BLINK_OPEN_MS 140         // Slower open for natural feel
 #define BLINK_INTERVAL_MIN 2000   // More frequent blinking
@@ -769,7 +776,7 @@ void copilot_ui_init(lv_obj_t *root) {
     s_ui.breath_start_ms = lv_tick_get();
     s_ui.ready = true;
 
-    ESP_LOGI(TAG, "UI ready");
+    LOGI_UI( "UI ready");
 }
 
 bool copilot_ui_is_ready(void) {
@@ -785,7 +792,7 @@ void copilot_ui_set_expression(copilot_expr_t expr, uint32_t duration_ms) {
         return;
     }
 
-    ESP_LOGI(TAG, "Expression change: %d -> %d (%u ms)", (int)s_ui.expr_current, (int)expr, (unsigned)duration_ms);
+    LOGI_UI( "Expression change: %d -> %d (%u ms)", (int)s_ui.expr_current, (int)expr, (unsigned)duration_ms);
     s_ui.expr_change_id++;
     s_ui.expr_current = expr;
 
@@ -845,7 +852,7 @@ void copilot_ui_ring_show(bool on) {
         return;
     }
     s_ui.ring_visible = on;
-    ESP_LOGI(TAG, "Ring show=%s", on ? "on" : "off");
+    LOGI_UI( "Ring show=%s", on ? "on" : "off");
 
     if (on) {
         copilot_ring_set_opa(s_ui.ring_outer, 150);
@@ -868,7 +875,7 @@ void copilot_ui_on_touch(uint16_t x, uint16_t y) {
         return;
     }
     s_ui.last_touch_ms = now;
-    ESP_LOGI(TAG, "Touch x=%u y=%u", (unsigned)x, (unsigned)y);
+    LOGI_UI( "Touch x=%u y=%u", (unsigned)x, (unsigned)y);
     // Disable ring flash animation - too heavy for single-core ESP32-C6
     // The ring show/hide causes full screen redraws which starve WiFi
     // s_ui.touch_pending = true;

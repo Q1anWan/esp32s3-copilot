@@ -15,8 +15,16 @@
 #include "copilot_mqtt.h"
 #include "copilot_perf.h"
 #include "copilot_ui.h"
+#include "copilot_voice.h"
 
 static const char *TAG = "copilot_app";
+
+// Conditional logging
+#if CONFIG_COPILOT_LOG_APP
+#define LOGI_APP(fmt, ...) ESP_LOGI(TAG, fmt, ##__VA_ARGS__)
+#else
+#define LOGI_APP(fmt, ...) do {} while(0)
+#endif
 
 static int copilot_normalize_core(int core) {
     if (core < 0) {
@@ -60,11 +68,11 @@ static void copilot_action_task(void *arg) {
         copilot_ui_ring_show_async(false);
 
         if (action.type == ACTION_EXPR) {
-            ESP_LOGI(TAG, "Apply expression=%d duration=%u sound=%s", (int)action.expr, (unsigned)action.duration_ms,
+            LOGI_APP( "Apply expression=%d duration=%u sound=%s", (int)action.expr, (unsigned)action.duration_ms,
                      action.sound_id[0] ? action.sound_id : "none");
             copilot_ui_set_expression_async(action.expr, action.duration_ms);
         } else if (action.type == ACTION_SOUND) {
-            ESP_LOGI(TAG, "Play sound=%s", action.sound_id[0] ? action.sound_id : "none");
+            LOGI_APP( "Play sound=%s", action.sound_id[0] ? action.sound_id : "none");
         }
 
         if (action.sound_id[0] != '\0') {
@@ -121,7 +129,7 @@ static void copilot_schedule_expression(copilot_expr_t expr, uint32_t duration_m
         strncpy(action.sound_id, sound_id, sizeof(action.sound_id) - 1);
         action.sound_id[sizeof(action.sound_id) - 1] = '\0';
     }
-    ESP_LOGI(TAG, "Schedule expression=%d duration=%u prelight=%u sound=%s", (int)expr, (unsigned)duration_ms,
+    LOGI_APP( "Schedule expression=%d duration=%u prelight=%u sound=%s", (int)expr, (unsigned)duration_ms,
              (unsigned)prelight_ms, sound_id ? sound_id : "none");
     copilot_enqueue_action(&action);
 }
@@ -136,7 +144,7 @@ static void copilot_schedule_sound(const char *sound_id, uint32_t prelight_ms) {
         strncpy(action.sound_id, sound_id, sizeof(action.sound_id) - 1);
         action.sound_id[sizeof(action.sound_id) - 1] = '\0';
     }
-    ESP_LOGI(TAG, "Schedule sound=%s prelight=%u", sound_id ? sound_id : "none", (unsigned)prelight_ms);
+    LOGI_APP( "Schedule sound=%s prelight=%u", sound_id ? sound_id : "none", (unsigned)prelight_ms);
     copilot_enqueue_action(&action);
 }
 
@@ -159,7 +167,7 @@ static uint32_t copilot_get_u32(const cJSON *obj, const char *key, uint32_t def_
 }
 
 static void copilot_handle_payload(const char *payload, int payload_len) {
-    ESP_LOGI(TAG, "MQTT payload: %.*s", payload_len, payload);
+    LOGI_APP( "MQTT payload: %.*s", payload_len, payload);
     cJSON *root = cJSON_ParseWithLength(payload, payload_len);
     if (!root) {
         ESP_LOGW(TAG, "Invalid JSON payload");
@@ -223,7 +231,7 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
             motion.yaw_deg = FP_FROM_FLOAT(yaw_deg);
             motion.speed = copilot_get_number_fp(root, "speed", FP_ONE);
 
-            ESP_LOGI(TAG, "Motion (quat) ax=%d ay=%d yaw=%d speed=%d (Q8.8)",
+            LOGI_APP( "Motion (quat) ax=%d ay=%d yaw=%d speed=%d (Q8.8)",
                      motion.ax, motion.ay, motion.yaw_deg, motion.speed);
         } else {
             // Direct mode: ax/ay/yaw values directly from JSON
@@ -233,7 +241,7 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
             motion.yaw_deg = copilot_get_number_fp(root, "yaw", 0);
             motion.speed = copilot_get_number_fp(root, "speed", FP_ONE);
 
-            ESP_LOGI(TAG, "Motion ax=%d ay=%d yaw=%d speed=%d (Q8.8)",
+            LOGI_APP( "Motion ax=%d ay=%d yaw=%d speed=%d (Q8.8)",
                      motion.ax, motion.ay, motion.yaw_deg, motion.speed);
         }
 
@@ -262,7 +270,7 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
             sound_id = "beep_short";
         }
 
-        ESP_LOGI(TAG, "Expression cmd: name=%s id=%s expr=%d duration=%u prelight=%u sound=%s",
+        LOGI_APP( "Expression cmd: name=%s id=%s expr=%d duration=%u prelight=%u sound=%s",
                  cJSON_IsString(name) ? name->valuestring : "null",
                  cJSON_IsNumber(id) ? "num" : "null",
                  (int)expr, (unsigned)duration_ms, (unsigned)prelight_ms,
@@ -272,12 +280,12 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
         const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
         const char *sound_id = cJSON_IsString(id) ? id->valuestring : "beep_short";
         uint32_t prelight_ms = copilot_get_u32(root, "prelight_ms", CONFIG_COPILOT_PRELIGHT_MS);
-        ESP_LOGI(TAG, "Sound id=%s prelight=%u", sound_id, (unsigned)prelight_ms);
+        LOGI_APP( "Sound id=%s prelight=%u", sound_id, (unsigned)prelight_ms);
         copilot_schedule_sound(sound_id, prelight_ms);
     } else if (strcmp(type->valuestring, "ring") == 0) {
         const cJSON *on = cJSON_GetObjectItemCaseSensitive(root, "on");
         if (cJSON_IsBool(on)) {
-            ESP_LOGI(TAG, "Ring on=%s", cJSON_IsTrue(on) ? "true" : "false");
+            LOGI_APP( "Ring on=%s", cJSON_IsTrue(on) ? "true" : "false");
             copilot_ui_ring_show_async(cJSON_IsTrue(on));
         }
     } else if (strcmp(type->valuestring, "calibrate") == 0) {
@@ -286,9 +294,9 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
         const char *target_str = cJSON_IsString(target) ? target->valuestring : "gyro";
 
         if (strcmp(target_str, "gyro") == 0) {
-            ESP_LOGI(TAG, "IMU gyro calibration requested via MQTT");
+            LOGI_APP( "IMU gyro calibration requested via MQTT");
             if (copilot_imu_start_calibration()) {
-                ESP_LOGI(TAG, "Gyro calibration started. Keep device stationary!");
+                LOGI_APP( "Gyro calibration started. Keep device stationary!");
             } else {
                 ESP_LOGW(TAG, "Gyro calibration failed to start (IMU not ready or already calibrating)");
             }
@@ -301,11 +309,13 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
         const char *query_str = cJSON_IsString(query) ? query->valuestring : "all";
 
         if (strcmp(query_str, "imu") == 0 || strcmp(query_str, "all") == 0) {
+#if CONFIG_COPILOT_LOG_APP
             float bias = copilot_imu_get_gyro_bias();
             bool calibrating = copilot_imu_is_calibrating();
             bool ready = copilot_imu_is_ready();
-            ESP_LOGI(TAG, "IMU status: ready=%d calibrating=%d bias=%.2f dps",
+            LOGI_APP("IMU status: ready=%d calibrating=%d bias=%.2f dps",
                      ready ? 1 : 0, calibrating ? 1 : 0, bias);
+#endif
         }
     }
 
@@ -316,15 +326,25 @@ static void copilot_mqtt_cmd_handler(const char *topic, const char *payload, int
     if (!payload || payload_len <= 0) {
         return;
     }
-    ESP_LOGI(TAG, "MQTT cmd topic=%s len=%d", topic ? topic : "null", payload_len);
+    LOGI_APP( "MQTT cmd topic=%s len=%d", topic ? topic : "null", payload_len);
     copilot_handle_payload(payload, payload_len);
 }
 
 void copilot_app_init(void) {
-    ESP_LOGI(TAG, "Init copilot app");
+    LOGI_APP( "Init copilot app");
     copilot_perf_init();
     copilot_audio_init();
     copilot_imu_init();
+
+    // Initialize voice module and start loopback test
+    if (copilot_voice_init()) {
+        LOGI_APP( "Voice module initialized");
+#if CONFIG_COPILOT_VOICE_LOOPBACK_TEST
+        if (copilot_voice_start_loopback()) {
+            LOGI_APP( "Voice loopback test started - speak into mic!");
+        }
+#endif
+    }
     if (!s_action_queue) {
         s_action_queue = xQueueCreate(8, sizeof(copilot_action_t));
         if (s_action_queue) {
@@ -341,7 +361,7 @@ void copilot_app_init(void) {
             if (task_ok != pdPASS) {
                 ESP_LOGE(TAG, "Failed to create action task");
             } else {
-                ESP_LOGI(TAG, "Action task core=%d", core);
+                LOGI_APP( "Action task core=%d", core);
             }
         } else {
             ESP_LOGE(TAG, "Failed to create action queue");
@@ -351,7 +371,7 @@ void copilot_app_init(void) {
 }
 
 void copilot_app_ui_init(lv_obj_t *root) {
-    ESP_LOGI(TAG, "Init copilot UI (root=%p)", root);
+    LOGI_APP( "Init copilot UI (root=%p)", root);
     copilot_ui_init(root);
 }
 

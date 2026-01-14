@@ -13,6 +13,13 @@
 
 static const char *TAG = "copilot_imu";
 
+// Conditional logging
+#if CONFIG_COPILOT_LOG_IMU
+#define LOGI_IMU(fmt, ...) ESP_LOGI(TAG, fmt, ##__VA_ARGS__)
+#else
+#define LOGI_IMU(fmt, ...) do {} while(0)
+#endif
+
 // NVS namespace and keys for calibration data
 #define NVS_NAMESPACE "copilot_imu"
 #define NVS_KEY_GYRO_BIAS "gyro_bias"
@@ -49,7 +56,7 @@ static bool nvs_load_gyro_bias(float* bias) {
     err = nvs_get_u8(handle, NVS_KEY_CAL_VALID, &valid);
     if (err != ESP_OK || valid != 1) {
         nvs_close(handle);
-        ESP_LOGI(TAG, "No valid calibration in NVS");
+        LOGI_IMU( "No valid calibration in NVS");
         return false;
     }
 
@@ -59,7 +66,7 @@ static bool nvs_load_gyro_bias(float* bias) {
     nvs_close(handle);
 
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Loaded gyro bias from NVS: %.2f dps", *bias);
+        LOGI_IMU( "Loaded gyro bias from NVS: %.2f dps", *bias);
         return true;
     }
     return false;
@@ -91,7 +98,7 @@ static bool nvs_save_gyro_bias(float bias) {
     nvs_close(handle);
 
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "Saved gyro bias to NVS: %.2f dps", bias);
+        LOGI_IMU( "Saved gyro bias to NVS: %.2f dps", bias);
         return true;
     }
     return false;
@@ -328,7 +335,7 @@ static bool copilot_imu_hw_init(void) {
         return false;
     }
 
-    ESP_LOGI(TAG, "Using shared I2C bus from BSP");
+    LOGI_IMU( "Using shared I2C bus from BSP");
 
     // Initialize QMI8658 sensor
     esp_err_t ret = qmi8658_init(&s_qmi, i2c_bus, CONFIG_COPILOT_IMU_I2C_ADDR);
@@ -348,7 +355,7 @@ static bool copilot_imu_hw_init(void) {
     // Enable both sensors
     qmi8658_enable_sensors(&s_qmi, QMI8658_ENABLE_ACCEL | QMI8658_ENABLE_GYRO);
 
-    ESP_LOGI(TAG, "QMI8658 configured: ACC 4G@125Hz, GYRO 512DPS@125Hz, addr=0x%02X",
+    LOGI_IMU( "QMI8658 configured: ACC 4G@125Hz, GYRO 512DPS@125Hz, addr=0x%02X",
              CONFIG_COPILOT_IMU_I2C_ADDR);
 
     // Setup reset button
@@ -364,7 +371,7 @@ static bool copilot_imu_hw_init(void) {
     gpio_install_isr_service(0);
     gpio_isr_handler_add((gpio_num_t)CONFIG_COPILOT_IMU_RESET_GPIO, gpio_isr_handler, nullptr);
 
-    ESP_LOGI(TAG, "Reset button configured on GPIO%d", CONFIG_COPILOT_IMU_RESET_GPIO);
+    LOGI_IMU( "Reset button configured on GPIO%d", CONFIG_COPILOT_IMU_RESET_GPIO);
 #endif
 
     return true;
@@ -394,7 +401,7 @@ static void copilot_imu_task(void *arg) {
 
     s_ahrs = new MahonyAHRS(sampleFreq, kp, ki);
 
-    ESP_LOGI(TAG, "IMU task started: Mahony AHRS, freq=%.1fHz, Kp=%.2f, Ki=%.2f",
+    LOGI_IMU( "IMU task started: Mahony AHRS, freq=%.1fHz, Kp=%.2f, Ki=%.2f",
              sampleFreq, kp, ki);
 
     for (;;) {
@@ -402,7 +409,7 @@ static void copilot_imu_task(void *arg) {
         if (s_reset_requested) {
             s_reset_requested = false;
             s_ahrs->reset();
-            ESP_LOGI(TAG, "AHRS reset to identity");
+            LOGI_IMU( "AHRS reset to identity");
         }
 
         bool ready = false;
@@ -510,7 +517,7 @@ static void copilot_imu_task(void *arg) {
             s_cal_request = false;
             cal_accumulator = 0.0f;
             cal_sample_count = 0;
-            ESP_LOGI(TAG, "Starting gyro calibration... Keep device STATIONARY!");
+            LOGI_IMU( "Starting gyro calibration... Keep device STATIONARY!");
         }
 
         // Calibration in progress
@@ -527,13 +534,13 @@ static void copilot_imu_task(void *arg) {
 
                 // Save to NVS
                 if (nvs_save_gyro_bias(new_bias)) {
-                    ESP_LOGI(TAG, "Calibration complete! Bias=%.2f dps saved to NVS", new_bias);
+                    LOGI_IMU( "Calibration complete! Bias=%.2f dps saved to NVS", new_bias);
                 } else {
                     ESP_LOGW(TAG, "Calibration complete (%.2f dps) but NVS save failed", new_bias);
                 }
             } else if (cal_sample_count % 40 == 0) {
                 // Progress update every ~1 second
-                ESP_LOGI(TAG, "Calibrating... %lu/%lu samples",
+                LOGI_IMU( "Calibrating... %lu/%lu samples",
                          (unsigned long)cal_sample_count, (unsigned long)CAL_SAMPLES);
             }
         }
@@ -668,17 +675,17 @@ static void copilot_imu_task(void *arg) {
         if (now_ms - last_debug_ms >= 500) {
             last_debug_ms = now_ms;
             // Show coordinate system data flow (using Y-axis based on IMU installation)
-            ESP_LOGI(TAG, "IMU sensor: gy=%.1f (dps) ay=%.1f (mg)",
+            LOGI_IMU( "IMU sensor: gy=%.1f (dps) ay=%.1f (mg)",
                      imu_data.gyroY, imu_data.accelY);
-            ESP_LOGI(TAG, "Yaw(Y-rot): raw=%.1f -> bias=%.1f -> %.1fdps [%s]",
+            LOGI_IMU( "Yaw(Y-rot): raw=%.1f -> bias=%.1f -> %.1fdps [%s]",
                      veh_yaw_rate, gyro_bias, veh_yaw_rate_corrected,
                      s_calibrating ? "CAL" : (s_bias_loaded ? "OK" : "NO_CAL"));
-            ESP_LOGI(TAG, "Accel(Y): raw=%.2fg base=%.2fg -> %.3fg [%c]",
+            LOGI_IMU( "Accel(Y): raw=%.2fg base=%.2fg -> %.3fg [%c]",
                      veh_fwd_accel, accel_baseline, veh_fwd_accel_filtered,
                      active_accel ? 'A' : '_');
             int16_t shift_x = (int16_t)(ax * CONFIG_COPILOT_MOTION_MAX_SHIFT_PX);
             int16_t shift_y = (int16_t)(ay * CONFIG_COPILOT_MOTION_MAX_SHIFT_PX);
-            ESP_LOGI(TAG, "Screen: yaw[%c]->ax accel[%c]->ay -> shift(%d,%d)px",
+            LOGI_IMU( "Screen: yaw[%c]->ax accel[%c]->ay -> shift(%d,%d)px",
                      active_yaw ? 'A' : '_', active_accel ? 'A' : '_', shift_x, shift_y);
         }
 
@@ -752,16 +759,16 @@ static void copilot_imu_task(void *arg) {
         static uint32_t last_debug_ms = 0;
         if (now_ms - last_debug_ms >= 500) {
             last_debug_ms = now_ms;
-            ESP_LOGI(TAG, "IMU: acc(%.0f,%.0f,%.0f) gyro(%.0f,%.0f,%.0f)",
+            LOGI_IMU( "IMU: acc(%.0f,%.0f,%.0f) gyro(%.0f,%.0f,%.0f)",
                      imu_data.accelX, imu_data.accelY, imu_data.accelZ,
                      imu_data.gyroX, imu_data.gyroY, imu_data.gyroZ);
-            ESP_LOGI(TAG, "Euler: roll=%.1f pitch=%.1f yaw=%.1f",
+            LOGI_IMU( "Euler: roll=%.1f pitch=%.1f yaw=%.1f",
                      roll * 57.2957795f, pitch * 57.2957795f, yaw_anim);
-            ESP_LOGI(TAG, "Raw: tilt(%.2f,%.2f) accel(%.2f,%.2f)",
+            LOGI_IMU( "Raw: tilt(%.2f,%.2f) accel(%.2f,%.2f)",
                      tilt_lateral, tilt_forward, accel_lateral, accel_forward);
             int16_t shift_x = (int16_t)(ax * CONFIG_COPILOT_MOTION_MAX_SHIFT_PX);
             int16_t shift_y = (int16_t)(ay * CONFIG_COPILOT_MOTION_MAX_SHIFT_PX);
-            ESP_LOGI(TAG, "Output: ax=%.2f ay=%.2f -> shift(%d,%d)px",
+            LOGI_IMU( "Output: ax=%.2f ay=%.2f -> shift(%d,%d)px",
                      ax, ay, shift_x, shift_y);
         }
 #endif  // CONFIG_COPILOT_IMU_FREEZE_QUATERNION
@@ -785,18 +792,18 @@ static void copilot_imu_task(void *arg) {
 
 void copilot_imu_init(void) {
 #if CONFIG_COPILOT_IMU_FREEZE_QUATERNION
-    ESP_LOGI(TAG, "Initializing QMI8658 IMU (Freeze Quaternion mode)");
-    ESP_LOGI(TAG, "  Yaw rate -> left/right shift, Fwd accel -> up/down shift");
+    LOGI_IMU( "Initializing QMI8658 IMU (Freeze Quaternion mode)");
+    LOGI_IMU( "  Yaw rate -> left/right shift, Fwd accel -> up/down shift");
 
     // Load gyro bias calibration from NVS
     if (nvs_load_gyro_bias(&s_stored_gyro_bias)) {
         s_bias_loaded = true;
-        ESP_LOGI(TAG, "  Using stored gyro bias: %.2f dps", s_stored_gyro_bias);
+        LOGI_IMU( "  Using stored gyro bias: %.2f dps", s_stored_gyro_bias);
     } else {
         ESP_LOGW(TAG, "  No gyro calibration found. Run calibration for accurate centering.");
     }
 #else
-    ESP_LOGI(TAG, "Initializing QMI8658 IMU with Mahony AHRS");
+    LOGI_IMU( "Initializing QMI8658 IMU with Mahony AHRS");
 #endif
 
     if (!copilot_imu_hw_init()) {
@@ -820,7 +827,7 @@ void copilot_imu_init(void) {
     }
 
     s_imu_ready = true;
-    ESP_LOGI(TAG, "QMI8658 IMU initialized successfully with Mahony AHRS");
+    LOGI_IMU( "QMI8658 IMU initialized successfully with Mahony AHRS");
 }
 
 bool copilot_imu_is_ready(void) {
@@ -855,7 +862,7 @@ bool copilot_imu_start_calibration(void) {
         return false;
     }
 
-    ESP_LOGI(TAG, "Gyro calibration requested. Keep device STATIONARY!");
+    LOGI_IMU( "Gyro calibration requested. Keep device STATIONARY!");
     s_cal_request = true;
     return true;
 }

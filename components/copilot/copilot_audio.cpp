@@ -1,22 +1,27 @@
 #include "copilot_audio.h"
 
-#include <math.h>
 #include <string.h>
 #include <stdint.h>
 
-#include "esp_codec_dev.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
-#include "bsp/esp-bsp.h"
+#include "freertos/idf_additions.h"
 #include "sdkconfig.h"
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
+// Use unified audio output manager
+#include "copilot_audio_out.h"
 
 static const char *TAG = "copilot_audio";
+
+// Conditional logging
+#if CONFIG_COPILOT_LOG_AUDIO
+#define LOGI_AUDIO(fmt, ...) ESP_LOGI(TAG, fmt, ##__VA_ARGS__)
+#else
+#define LOGI_AUDIO(fmt, ...) do {} while(0)
+#endif
 
 static int copilot_normalize_core(int core) {
     if (core < 0) {
@@ -28,16 +33,26 @@ static int copilot_normalize_core(int core) {
     return core;
 }
 
-static esp_codec_dev_handle_t s_play_dev = nullptr;
-static esp_codec_dev_sample_info_t s_sample_info = {};
+// Audio output manager handles the codec now
 static QueueHandle_t s_audio_queue = nullptr;
 static TaskHandle_t s_audio_task = nullptr;
+
+// Sample rate must match audio_out (16kHz)
+static const int kSampleRate = 16000;
+
+#define AUDIO_TASK_STACK_BYTES (4 * 1024)
 
 struct audio_req_t {
     uint16_t freq_hz;
     uint16_t duration_ms;
     uint8_t volume;
 };
+
+static const UBaseType_t kAudioQueueLen = 6;
+#if CONFIG_FREERTOS_SUPPORT_STATIC_ALLOCATION
+static StaticQueue_t s_audio_queue_struct;
+static uint8_t s_audio_queue_storage[kAudioQueueLen * sizeof(audio_req_t)];
+#endif
 
 struct tone_desc_t {
     const char *id;
@@ -69,48 +84,19 @@ static bool copilot_audio_lookup(const char *id, audio_req_t *out) {
 }
 
 static void copilot_audio_play_tone(const audio_req_t &req) {
-    if (!s_play_dev) {
+    if (!copilot_audio_out_play_tone(req.freq_hz, req.duration_ms, req.volume)) {
+        LOGI_AUDIO("Audio output not ready, skip tone");
         return;
     }
 
-    const int sample_rate = s_sample_info.sample_rate;
-    const int channels = 2;
-    const int amplitude = 12000;
-    const int total_samples = (req.duration_ms * sample_rate) / 1000;
-    const int fade_samples = sample_rate / 100; // 10ms fade
-    const int chunk_samples = 240;
-    int samples_left = total_samples;
-
-    float phase = 0.0f;
-    const float phase_inc = 2.0f * (float)M_PI * (float)req.freq_hz / (float)sample_rate;
-
-    int16_t buffer[chunk_samples * channels];
-    int sample_index = 0;
-
-    esp_codec_dev_set_out_vol(s_play_dev, req.volume);
-
-    while (samples_left > 0) {
-        int now_samples = samples_left > chunk_samples ? chunk_samples : samples_left;
-        for (int i = 0; i < now_samples; ++i) {
-            float env = 1.0f;
-            if (sample_index < fade_samples) {
-                env = (float)sample_index / (float)fade_samples;
-            } else if (sample_index > total_samples - fade_samples) {
-                env = (float)(total_samples - sample_index) / (float)fade_samples;
-            }
-            float sample_f = sinf(phase) * (float)amplitude * env;
-            int16_t sample = (int16_t)sample_f;
-            buffer[i * 2] = sample;
-            buffer[i * 2 + 1] = sample;
-
-            phase += phase_inc;
-            if (phase > 2.0f * (float)M_PI) {
-                phase -= 2.0f * (float)M_PI;
-            }
-            sample_index++;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(req.duration_ms + 200);
+    while (copilot_audio_out_is_tone_active()) {
+        TickType_t elapsed = xTaskGetTickCount() - start;
+        if (elapsed >= timeout) {
+            break;
         }
-        esp_codec_dev_write(s_play_dev, buffer, now_samples * channels * sizeof(int16_t));
-        samples_left -= now_samples;
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -125,43 +111,66 @@ static void copilot_audio_task(void *arg) {
 }
 
 void copilot_audio_init(void) {
-    if (s_audio_queue || s_play_dev) {
+    if (s_audio_queue) {
         return;
     }
 
-    s_play_dev = bsp_audio_codec_speaker_init();
-    if (!s_play_dev) {
-        ESP_LOGE(TAG, "Failed to init speaker codec");
-        return;
+    // Initialize audio output manager (shared with voice module)
+    if (!copilot_audio_out_is_ready()) {
+        copilot_audio_out_config_t config = {};
+        config.sample_rate = kSampleRate;
+        config.speaker_volume = 80;
+        if (!copilot_audio_out_init(&config)) {
+            ESP_LOGE(TAG, "Failed to init audio output manager");
+            return;
+        }
     }
-    s_sample_info.sample_rate = 24000;
-    s_sample_info.channel = 2;
-    s_sample_info.bits_per_sample = 16;
-    esp_codec_dev_open(s_play_dev, &s_sample_info);
-    esp_codec_dev_set_out_vol(s_play_dev, 80);
 
-    s_audio_queue = xQueueCreate(6, sizeof(audio_req_t));
+#if CONFIG_FREERTOS_SUPPORT_STATIC_ALLOCATION
+    s_audio_queue = xQueueCreateStatic(kAudioQueueLen, sizeof(audio_req_t),
+                                       s_audio_queue_storage, &s_audio_queue_struct);
+#else
+    s_audio_queue = xQueueCreate(kAudioQueueLen, sizeof(audio_req_t));
+#endif
     if (!s_audio_queue) {
+        ESP_LOGE(TAG, "Failed to create audio queue");
         return;
     }
 
     int core = copilot_normalize_core(CONFIG_COPILOT_AUDIO_CORE);
-    BaseType_t task_ok;
-    // Stack optimized based on high watermark: 720-2288 bytes used -> 2.5KB allocation
-    if (core >= 0) {
-        task_ok = xTaskCreatePinnedToCore(copilot_audio_task, "copilot_audio", 2560, nullptr, 3, &s_audio_task, core);
-    } else {
-        task_ok = xTaskCreate(copilot_audio_task, "copilot_audio", 2560, nullptr, 3, &s_audio_task);
+    BaseType_t task_ok = pdFAIL;
+#if CONFIG_FREERTOS_SUPPORT_STATIC_ALLOCATION
+    BaseType_t affinity = (core >= 0) ? core : tskNO_AFFINITY;
+    task_ok = xTaskCreatePinnedToCoreWithCaps(
+        copilot_audio_task,
+        "copilot_audio",
+        AUDIO_TASK_STACK_BYTES,
+        nullptr,
+        3,
+        &s_audio_task,
+        affinity,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (task_ok != pdPASS) {
+        ESP_LOGW(TAG, "Audio task PSRAM stack alloc failed, fallback to internal");
+    }
+#endif
+    if (task_ok != pdPASS) {
+        if (core >= 0) {
+            task_ok = xTaskCreatePinnedToCore(copilot_audio_task, "copilot_audio", AUDIO_TASK_STACK_BYTES, nullptr, 3,
+                                              &s_audio_task, core);
+        } else {
+            task_ok = xTaskCreate(copilot_audio_task, "copilot_audio", AUDIO_TASK_STACK_BYTES, nullptr, 3, &s_audio_task);
+        }
     }
     if (task_ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create audio task");
     } else {
-        ESP_LOGI(TAG, "Audio task core=%d", core);
+        LOGI_AUDIO("Audio task core=%d (using unified audio_out)", core);
     }
 }
 
 void copilot_audio_play(const char *sound_id) {
-    if (!s_audio_queue || !s_play_dev) {
+    if (!s_audio_queue) {
         return;
     }
 
@@ -175,5 +184,5 @@ void copilot_audio_play(const char *sound_id) {
 }
 
 bool copilot_audio_is_ready(void) {
-    return s_play_dev && s_audio_queue;
+    return s_audio_queue && copilot_audio_out_is_ready();
 }

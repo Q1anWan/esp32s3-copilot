@@ -1,0 +1,46 @@
+# Copilot Voice Backend Configuration
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+# Volcano Engine API credentials
+# Get these from https://console.volcengine.com/
+volcano:
+  app_id: ""
+  access_token: ""
+  # TTS settings
+  tts:
+    voice_type: "BV001_streaming"  # Default voice
+    encoding: "pcm"  # pcm for low latency
+    sample_rate: 16000
+  # ASR settings
+  asr:
+    language: "zh-CN"
+    format: "pcm"
+    sample_rate: 16000
+
+# WebRTC settings
+webrtc:
+  # OPUS codec parameters
+  opus:
+    sample_rate: 16000
+    channels: 1
+    bitrate: 32000
+
+# Audio pipeline settings
+audio:
+  # VAD (Voice Activity Detection)
+  vad:
+    enabled: true
+    threshold: 0.5
+    min_speech_duration_ms: 250
+    min_silence_duration_ms: 500
+  # Buffer sizes
+  buffer_size_ms: 20
+  max_queue_size: 50
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"

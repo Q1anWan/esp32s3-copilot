@@ -1,0 +1,78 @@
+menu "Copilot Voice"
+
+config COPILOT_VOICE_ENABLE
+    bool "Enable voice module"
+    default n
+    help
+        Enable the voice module for WebRTC-based bidirectional audio
+        communication with Python backend and Volcano Engine TTS/ASR.
+
+config COPILOT_VOICE_SERVER_URL
+    string "Voice backend server URL"
+    default "http://192.168.1.100:8080"
+    depends on COPILOT_VOICE_ENABLE
+    help
+        URL of the Python voice backend server for WebRTC signaling.
+        Example: http://192.168.1.100:8080
+
+config COPILOT_VOICE_LOOPBACK_TEST
+    bool "Enable audio loopback test"
+    default n
+    depends on COPILOT_VOICE_ENABLE
+    help
+        When enabled, microphone input is directly routed to speaker output
+        for testing audio hardware without WebRTC.
+
+config COPILOT_VOICE_SAMPLE_RATE
+    int "Audio sample rate (Hz)"
+    default 16000
+    depends on COPILOT_VOICE_ENABLE
+    help
+        Sample rate for voice audio. 16000 Hz is standard for voice.
+        Must match the WebRTC codec configuration.
+
+config COPILOT_VOICE_TASK_STACK
+    int "Voice task stack size (bytes)"
+    default 8192
+    depends on COPILOT_VOICE_ENABLE
+    help
+        Stack size for voice processing tasks.
+        Increase if stack overflow occurs.
+
+config COPILOT_VOICE_TASK_PRIORITY
+    int "Voice task priority"
+    default 5
+    depends on COPILOT_VOICE_ENABLE
+    help
+        FreeRTOS priority for voice tasks.
+        Higher priority ensures lower latency but may affect other tasks.
+
+config COPILOT_VOICE_TASK_CORE
+    int "Voice task CPU core (-1 for any)"
+    default 0
+    range -1 1
+    depends on COPILOT_VOICE_ENABLE
+    help
+        Pin voice tasks to specific CPU core.
+        -1 = no affinity, 0 = Core 0, 1 = Core 1.
+        Recommend Core 0 (same as WiFi) to avoid cross-core audio issues.
+
+config COPILOT_VOICE_MIC_GAIN
+    int "Microphone gain (dB)"
+    default 24
+    range 0 36
+    depends on COPILOT_VOICE_ENABLE
+    help
+        ES8311 microphone gain in dB.
+        Higher values amplify quiet sounds but may introduce noise.
+        Typical: 18-30 dB.
+
+config COPILOT_VOICE_SPEAKER_VOLUME
+    int "Speaker volume (%)"
+    default 80
+    range 0 100
+    depends on COPILOT_VOICE_ENABLE
+    help
+        Default speaker volume percentage.
+
+endmenu

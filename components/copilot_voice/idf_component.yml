@@ -1,0 +1,8 @@
+description: "Copilot Voice Module - WebRTC bidirectional audio"
+version: "1.0.0"
+
+# Dependencies will be expanded when ByteRTC is integrated
+# For now, using only BSP audio codec
+dependencies:
+  idf:
+    version: ">=5.0.0"

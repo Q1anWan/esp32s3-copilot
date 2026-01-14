@@ -9,5 +9,5 @@ idf_component_register(
     "copilot_imu.cpp"
   INCLUDE_DIRS "."
   PRIV_REQUIRES lvgl esp_wifi esp_event esp_netif nvs_flash mqtt cjson esp_timer driver waveshare__qmi8658
-  REQUIRES esp32_s3_touch_amoled_1_75 esp_codec_dev
+  REQUIRES esp32_s3_touch_amoled_1_75 esp_codec_dev copilot_voice
 )

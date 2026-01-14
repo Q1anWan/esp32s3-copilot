@@ -17,6 +17,13 @@
 
 static const char *TAG = "copilot_mqtt";
 
+// Conditional logging
+#if CONFIG_COPILOT_LOG_MQTT
+#define LOGI_MQTT(fmt, ...) ESP_LOGI(TAG, fmt, ##__VA_ARGS__)
+#else
+#define LOGI_MQTT(fmt, ...) do {} while(0)
+#endif
+
 static esp_mqtt_client_handle_t s_mqtt = nullptr;
 static bool s_mqtt_started = false;
 static bool s_mqtt_connected = false;
@@ -47,14 +54,14 @@ static void copilot_build_device_id(void) {
     if (CONFIG_COPILOT_DEVICE_ID[0] != '\0') {
         strncpy(s_device_id, CONFIG_COPILOT_DEVICE_ID, sizeof(s_device_id) - 1);
         s_device_id[sizeof(s_device_id) - 1] = '\0';
-        ESP_LOGI(TAG, "Device ID (config): %s", s_device_id);
+        LOGI_MQTT( "Device ID (config): %s", s_device_id);
         return;
     }
 
     uint8_t mac[6] = {};
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     snprintf(s_device_id, sizeof(s_device_id), "s3_%02X%02X%02X", mac[3], mac[4], mac[5]);
-    ESP_LOGI(TAG, "Device ID (mac): %s", s_device_id);
+    LOGI_MQTT( "Device ID (mac): %s", s_device_id);
 }
 
 static void copilot_build_topics(void) {
@@ -64,8 +71,8 @@ static void copilot_build_topics(void) {
     }
     snprintf(s_topic_cmd, sizeof(s_topic_cmd), "%s/%s/cmd", prefix, s_device_id);
     snprintf(s_topic_status, sizeof(s_topic_status), "%s/%s/status", prefix, s_device_id);
-    ESP_LOGI(TAG, "MQTT cmd topic: %s", s_topic_cmd);
-    ESP_LOGI(TAG, "MQTT status topic: %s", s_topic_status);
+    LOGI_MQTT( "MQTT cmd topic: %s", s_topic_cmd);
+    LOGI_MQTT( "MQTT status topic: %s", s_topic_status);
 }
 
 static void copilot_mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
@@ -75,7 +82,7 @@ static void copilot_mqtt_event_handler(void *handler_args, esp_event_base_t base
 
     switch (event->event_id) {
         case MQTT_EVENT_CONNECTED:
-            ESP_LOGI(TAG, "MQTT connected, subscribing: %s", s_topic_cmd);
+            LOGI_MQTT( "MQTT connected, subscribing: %s", s_topic_cmd);
             s_mqtt_connected = true;
             esp_mqtt_client_subscribe(s_mqtt, s_topic_cmd, 1);
             break;
@@ -87,7 +94,7 @@ static void copilot_mqtt_event_handler(void *handler_args, esp_event_base_t base
             if (!s_cmd_cb) {
                 break;
             }
-            ESP_LOGI(TAG, "MQTT data topic_len=%d payload_len=%d", event->topic_len, event->data_len);
+            LOGI_MQTT( "MQTT data topic_len=%d payload_len=%d", event->topic_len, event->data_len);
             char *topic = (char *)malloc(event->topic_len + 1);
             char *payload = (char *)malloc(event->data_len + 1);
             if (!topic || !payload) {
@@ -123,12 +130,12 @@ static void copilot_mqtt_start_client(void) {
         return;
     }
 
-    ESP_LOGI(TAG, "MQTT broker: %s", CONFIG_COPILOT_MQTT_BROKER_URI);
+    LOGI_MQTT( "MQTT broker: %s", CONFIG_COPILOT_MQTT_BROKER_URI);
     copilot_build_device_id();
     copilot_build_topics();
 
     if (s_mqtt) {
-        ESP_LOGI(TAG, "MQTT restart");
+        LOGI_MQTT( "MQTT restart");
         esp_mqtt_client_start(s_mqtt);
         s_mqtt_started = true;
         return;
@@ -155,10 +162,10 @@ static void copilot_wifi_event_handler(void *arg, esp_event_base_t event_base, i
     (void)event_data;
 
     if (event_id == WIFI_EVENT_STA_START) {
-        ESP_LOGI(TAG, "WiFi start, connecting...");
+        LOGI_MQTT( "WiFi start, connecting...");
         esp_wifi_connect();
     } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
-        ESP_LOGI(TAG, "WiFi connected, waiting for IP...");
+        LOGI_MQTT( "WiFi connected, waiting for IP...");
     } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
         ESP_LOGW(TAG, "WiFi disconnected, reason=%d", disc ? disc->reason : -1);
@@ -183,7 +190,7 @@ static void copilot_ip_event_handler(void *arg, esp_event_base_t event_base, int
     s_retry_num = 0;
     s_wifi_connected = true;
     if (ip_event) {
-        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&ip_event->ip_info.ip));
+        LOGI_MQTT( "Got IP: " IPSTR, IP2STR(&ip_event->ip_info.ip));
     }
     copilot_mqtt_start_client();
 }
@@ -194,10 +201,10 @@ static void copilot_wifi_init(void) {
         return;
     }
     if (s_wifi_started) {
-        ESP_LOGI(TAG, "WiFi already started");
+        LOGI_MQTT( "WiFi already started");
         return;
     }
-    ESP_LOGI(TAG, "WiFi SSID: %s", CONFIG_COPILOT_WIFI_SSID);
+    LOGI_MQTT( "WiFi SSID: %s", CONFIG_COPILOT_WIFI_SSID);
 
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -220,7 +227,12 @@ static void copilot_wifi_init(void) {
     }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    err = esp_wifi_init(&cfg);
+    if (err == ESP_ERR_NO_MEM) {
+        ESP_LOGE(TAG, "esp_wifi_init failed: no memory (try freeing internal RAM before WiFi init)");
+        return;
+    }
+    ESP_ERROR_CHECK(err);
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &copilot_wifi_event_handler, nullptr, nullptr));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &copilot_ip_event_handler, nullptr, nullptr));
@@ -245,12 +257,12 @@ static void copilot_wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_start());
     s_wifi_started = true;
-    ESP_LOGI(TAG, "WiFi init done, connecting...");
+    LOGI_MQTT( "WiFi init done, connecting...");
 }
 
 void copilot_mqtt_start(copilot_mqtt_cmd_cb cb) {
     s_cmd_cb = cb;
-    ESP_LOGI(TAG, "MQTT start (callback=%p)", cb);
+    LOGI_MQTT( "MQTT start (callback=%p)", cb);
     copilot_wifi_init();
 }
 
@@ -271,7 +283,7 @@ void copilot_mqtt_publish(const char *topic_suffix, const char *payload) {
         prefix = "copilot";
     }
     snprintf(topic, sizeof(topic), "%s/%s/%s", prefix, s_device_id, topic_suffix);
-    ESP_LOGI(TAG, "MQTT publish: %s (%d bytes)", topic, (int)strlen(payload));
+    LOGI_MQTT( "MQTT publish: %s (%d bytes)", topic, (int)strlen(payload));
     esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 0);
 }
 

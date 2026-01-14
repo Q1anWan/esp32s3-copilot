@@ -251,6 +251,52 @@ config COPILOT_MOTION_MAX_ANGLE_DEG
         Higher values allow more dramatic face tilting.
         Typical: 12 (subtle), 20 (moderate), 25 (large), 35 (very large).
 
+menu "Debug Logging"
+
+config COPILOT_LOG_APP
+    bool "App module logs"
+    default n
+    help
+        Enable debug logging for copilot_app (MQTT commands, actions).
+
+config COPILOT_LOG_UI
+    bool "UI module logs"
+    default n
+    help
+        Enable debug logging for copilot_ui (expression, motion, ring).
+
+config COPILOT_LOG_AUDIO
+    bool "Audio module logs"
+    default n
+    help
+        Enable debug logging for copilot_audio (tone playback).
+
+config COPILOT_LOG_AUDIO_OUT
+    bool "Audio output logs"
+    default n
+    help
+        Enable debug logging for copilot_audio_out (tone mix and output).
+
+config COPILOT_LOG_MQTT
+    bool "MQTT module logs"
+    default n
+    help
+        Enable debug logging for copilot_mqtt (WiFi, MQTT connection).
+
+config COPILOT_LOG_IMU
+    bool "IMU module logs"
+    default n
+    help
+        Enable debug logging for copilot_imu (sensor data, calibration).
+
+config COPILOT_LOG_VOICE
+    bool "Voice module logs"
+    default y
+    help
+        Enable debug logging for copilot_voice (audio loopback, WebRTC).
+
+endmenu
+
 menu "Performance Profiling"
 
 config COPILOT_PERF_ENABLE

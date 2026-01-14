@@ -5,6 +5,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <string.h>
 
 #if CONFIG_COPILOT_PERF_HEAP
 #include "esp_heap_caps.h"
@@ -29,8 +30,24 @@ static esp_timer_handle_t s_report_timer = nullptr;
 
 #if CONFIG_COPILOT_PERF_RTOS_STATS
 // Task info buffer
-#define MAX_TASKS 16
+#define MAX_TASKS 32
 static TaskStatus_t s_task_status[MAX_TASKS];
+
+static int copilot_idle_core_index(const char *name) {
+    if (!name) {
+        return -1;
+    }
+    if (strncmp(name, "IDLE", 4) != 0) {
+        return -1;
+    }
+    if (name[4] == '\0') {
+        return 0;
+    }
+    if (name[4] >= '0' && name[4] <= '9') {
+        return name[4] - '0';
+    }
+    return -1;
+}
 #endif
 
 static void copilot_perf_update_fps(void) {
@@ -59,7 +76,7 @@ static void copilot_perf_report_rtos(void) {
         task_count = MAX_TASKS;
     }
 
-    uint32_t total_runtime;
+    configRUN_TIME_COUNTER_TYPE total_runtime = 0;
     UBaseType_t filled = uxTaskGetSystemState(s_task_status, task_count, &total_runtime);
 
     if (filled == 0) {
@@ -70,17 +87,27 @@ static void copilot_perf_report_rtos(void) {
     ESP_LOGI(TAG, "=== RTOS Task Statistics ===");
     ESP_LOGI(TAG, "%-16s %6s %8s %6s", "Task", "State", "FreeStk", "CPU%");
 
+    uint64_t idle_runtime[configNUM_CORES] = {};
+    bool idle_found[configNUM_CORES] = {};
+
     for (UBaseType_t i = 0; i < filled; i++) {
         TaskStatus_t *t = &s_task_status[i];
 
         // Calculate CPU percentage (runtime * 100 / total)
         uint32_t cpu_percent = 0;
         if (total_runtime > 0) {
-            cpu_percent = (t->ulRunTimeCounter * 100UL) / total_runtime;
+            uint64_t denom = (uint64_t)total_runtime * (uint64_t)configNUM_CORES;
+            cpu_percent = (uint32_t)((t->ulRunTimeCounter * 100ULL) / denom);
         }
 
         // Stack high watermark = minimum free stack ever (in words -> bytes)
         uint32_t free_stack = t->usStackHighWaterMark * sizeof(StackType_t);
+
+        int idle_core = copilot_idle_core_index(t->pcTaskName);
+        if (idle_core >= 0 && idle_core < (int)configNUM_CORES) {
+            idle_runtime[idle_core] = (uint64_t)t->ulRunTimeCounter;
+            idle_found[idle_core] = true;
+        }
 
         // Task state string
         const char* state_str;
@@ -98,6 +125,21 @@ static void copilot_perf_report_rtos(void) {
                  state_str,
                  (unsigned long)free_stack,
                  (unsigned long)cpu_percent);
+    }
+
+    if (total_runtime > 0) {
+        uint64_t total_runtime_64 = (uint64_t)total_runtime;
+        for (int core = 0; core < (int)configNUM_CORES; ++core) {
+            if (!idle_found[core]) {
+                continue;
+            }
+            uint32_t idle_percent = (uint32_t)((idle_runtime[core] * 100ULL) / total_runtime_64);
+            uint32_t load_percent = (idle_percent <= 100) ? (100 - idle_percent) : 0;
+            ESP_LOGI(TAG, "Core%d load: %lu%% (idle: %lu%%)",
+                     core,
+                     (unsigned long)load_percent,
+                     (unsigned long)idle_percent);
+        }
     }
 
     // Show total runtime info

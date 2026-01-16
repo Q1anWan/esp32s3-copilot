@@ -336,13 +336,17 @@ void copilot_app_init(void) {
     copilot_audio_init();
     copilot_imu_init();
 
-    // Initialize voice module and start loopback test
+    // Initialize voice module (session will start after WiFi connects)
     if (copilot_voice_init()) {
         LOGI_APP( "Voice module initialized");
 #if CONFIG_COPILOT_VOICE_LOOPBACK_TEST
+        // Loopback test doesn't need network, start immediately
         if (copilot_voice_start_loopback()) {
             LOGI_APP( "Voice loopback test started - speak into mic!");
         }
+#else
+        // Streaming session will be started by copilot_mqtt after WiFi connects
+        LOGI_APP( "Voice streaming will start after WiFi connects");
 #endif
     }
     if (!s_action_queue) {

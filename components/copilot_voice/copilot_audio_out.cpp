@@ -21,6 +21,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/idf_additions.h"
 #include "driver/i2s_std.h"
 #include "bsp/esp-bsp.h"
 #include "sdkconfig.h"
@@ -168,12 +169,15 @@ static int ring_write(ring_buffer_t *rb, const uint8_t *data, int len, int timeo
     while (written < len) {
         int free_space = ring_free(rb);
         if (free_space <= 0) {
+            if (timeout_ms <= 0) {
+                break;  // Non-blocking mode: no space available
+            }
             // Wait for space
             TickType_t elapsed = xTaskGetTickCount() - start;
-            if (timeout_ms > 0 && elapsed >= timeout) {
+            if (elapsed >= timeout) {
                 break;  // Timeout
             }
-            TickType_t wait = (timeout_ms > 0) ? (timeout - elapsed) : pdMS_TO_TICKS(10);
+            TickType_t wait = timeout - elapsed;
             xSemaphoreTake(rb->write_sem, wait);
             continue;
         }
@@ -372,26 +376,36 @@ static void output_task_func(void *arg) {
     while (s_out.running) {
         // Read from ring buffer into DMA buffer
         bool tone_active = copilot_audio_out_is_tone_active();
-        int read_timeout = tone_active ? 5 : 50;
+        bool source_active = (s_out.active_src != AUDIO_SRC_NONE);
+        bool need_warmup = tone_active || source_active;
+
+        int read_timeout = need_warmup ? 5 : 50;
         int bytes_read = ring_read(&s_out.ring, (uint8_t *)s_out.dma_buffer,
                                    DMA_CHUNK_BYTES, read_timeout);
 
-        if (bytes_read == 0 && !tone_active) {
-            // No data available - yield to prevent watchdog trigger
+        if (bytes_read == 0 && !need_warmup) {
+            // No data and no active source - yield to prevent watchdog trigger
             // This is critical: without a delay, this task starves IDLE task on CPU1
             vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
 
         int bytes_to_write = bytes_read;
-        if (tone_active) {
+
+        // When a source is active or tone is playing, keep writing silence
+        // to keep the codec DAC warm and prevent audio popping
+        if (need_warmup) {
             if (bytes_read == 0) {
                 memset(s_out.dma_buffer, 0, DMA_CHUNK_BYTES);
             } else if (bytes_read < DMA_CHUNK_BYTES) {
                 memset(((uint8_t *)s_out.dma_buffer) + bytes_read, 0, DMA_CHUNK_BYTES - bytes_read);
             }
             bytes_to_write = DMA_CHUNK_BYTES;
-            copilot_mix_tone(s_out.dma_buffer, DMA_CHUNK_SAMPLES);
+
+            // Mix tone if active
+            if (tone_active) {
+                copilot_mix_tone(s_out.dma_buffer, DMA_CHUNK_SAMPLES);
+            }
         }
 
         if (bytes_to_write > 0) {
@@ -512,22 +526,45 @@ bool copilot_audio_out_init(const copilot_audio_out_config_t *config) {
     int core = normalize_core(OUTPUT_TASK_CORE);
     BaseType_t ret;
     if (core >= 0) {
-        ret = xTaskCreatePinnedToCore(
+        ret = xTaskCreatePinnedToCoreWithCaps(
             output_task_func,
             "audio_out",
             OUTPUT_TASK_STACK,
             NULL,
             OUTPUT_TASK_PRIORITY,
             &s_out.output_task,
-            core);
+            core,
+            MALLOC_CAP_SPIRAM);
+        if (ret != pdPASS) {
+            ESP_LOGW(TAG, "SPIRAM stack alloc failed, retrying with internal RAM");
+            ret = xTaskCreatePinnedToCore(
+                output_task_func,
+                "audio_out",
+                OUTPUT_TASK_STACK,
+                NULL,
+                OUTPUT_TASK_PRIORITY,
+                &s_out.output_task,
+                core);
+        }
     } else {
-        ret = xTaskCreate(
+        ret = xTaskCreateWithCaps(
             output_task_func,
             "audio_out",
             OUTPUT_TASK_STACK,
             NULL,
             OUTPUT_TASK_PRIORITY,
-            &s_out.output_task);
+            &s_out.output_task,
+            MALLOC_CAP_SPIRAM);
+        if (ret != pdPASS) {
+            ESP_LOGW(TAG, "SPIRAM stack alloc failed, retrying with internal RAM");
+            ret = xTaskCreate(
+                output_task_func,
+                "audio_out",
+                OUTPUT_TASK_STACK,
+                NULL,
+                OUTPUT_TASK_PRIORITY,
+                &s_out.output_task);
+        }
     }
 
     if (ret != pdPASS) {
@@ -598,9 +635,24 @@ bool copilot_audio_out_acquire(copilot_audio_src_t src) {
     if (src > current) {
         if (current != AUDIO_SRC_NONE) {
             LOGI_OUT("Source %d preempts %d", src, current);
-            // Clear buffer when preempting to avoid playing old data
-            ring_clear(&s_out.ring);
         }
+        // Always clear buffer when acquiring to avoid playing stale data
+        // This fixes first TTS audio popping caused by residual buffer data
+        ring_clear(&s_out.ring);
+        // Also clear DMA buffer to prevent any leftover audio
+        if (s_out.dma_buffer) {
+            memset(s_out.dma_buffer, 0, DMA_CHUNK_BYTES);
+        }
+
+        // Pre-fill ring buffer with silence to warm up the codec DAC
+        // This prevents audio popping when first audio data arrives
+        // Write ~20ms of silence (320 stereo samples at 16kHz)
+        // Use static buffer to avoid stack allocation
+        static int16_t silence[64 * 2] = {0};  // 64 stereo samples per chunk
+        for (int i = 0; i < 5; i++) {  // 5 * 64 = 320 samples = 20ms
+            ring_write(&s_out.ring, (uint8_t *)silence, sizeof(silence), 0);
+        }
+
         s_out.active_src = src;
         xSemaphoreGive(s_out.src_mutex);
         LOGI_OUT("Source %d acquired", src);

@@ -9,6 +9,7 @@
 #include <cJSON.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -19,6 +20,8 @@ static const char *TAG = "ws_client";
 // ============================================================================
 // Configuration and State
 // ============================================================================
+
+#define WS_AUDIO_SEND_TIMEOUT_MS 1000
 
 typedef struct {
     esp_websocket_client_handle_t client;
@@ -36,6 +39,10 @@ typedef struct {
 
     // Session
     char session_id[64];
+
+    // Connection tracking
+    uint32_t connect_attempts;
+    uint32_t last_connect_time;
 
     // Synchronization
     SemaphoreHandle_t mutex;
@@ -142,16 +149,34 @@ static void websocket_event_handler(void *arg, esp_event_base_t event_base,
     esp_websocket_event_data_t *data = (esp_websocket_event_data_t *)event_data;
 
     switch (event_id) {
+        case WEBSOCKET_EVENT_BEFORE_CONNECT:
+            s_ctx.connect_attempts++;
+            s_ctx.last_connect_time = (uint32_t)(esp_timer_get_time() / 1000);
+            ESP_LOGI(TAG, "Connecting... (attempt #%lu)", (unsigned long)s_ctx.connect_attempts);
+            // Ensure we're in CONNECTING state for reconnect attempts
+            if (s_ctx.state != WS_CLIENT_STATE_CONNECTING) {
+                set_state(WS_CLIENT_STATE_CONNECTING);
+            }
+            break;
+
         case WEBSOCKET_EVENT_CONNECTED:
-            ESP_LOGI(TAG, "WebSocket connected");
+            ESP_LOGI(TAG, "WebSocket connected after %lu attempts", (unsigned long)s_ctx.connect_attempts);
+            s_ctx.connect_attempts = 0;  // Reset counter on success
+            s_ctx.session_id[0] = '\0';  // Clear old session ID
             set_state(WS_CLIENT_STATE_CONNECTED);
-            // Send start message
+            // Send start message to initiate session
             send_start_message();
             break;
 
         case WEBSOCKET_EVENT_DISCONNECTED:
-            ESP_LOGI(TAG, "WebSocket disconnected");
-            set_state(WS_CLIENT_STATE_IDLE);
+            ESP_LOGI(TAG, "WebSocket disconnected (auto-reconnect enabled)");
+            // Reset session and go back to CONNECTING for auto-reconnect
+            s_ctx.session_id[0] = '\0';
+            if (s_ctx.state == WS_CLIENT_STATE_STREAMING ||
+                s_ctx.state == WS_CLIENT_STATE_CONNECTED) {
+                set_state(WS_CLIENT_STATE_CONNECTING);
+            }
+            // Note: esp_websocket_client handles auto-reconnect internally
             break;
 
         case WEBSOCKET_EVENT_DATA:
@@ -165,11 +190,31 @@ static void websocket_event_handler(void *arg, esp_event_base_t event_base,
             break;
 
         case WEBSOCKET_EVENT_ERROR:
-            ESP_LOGE(TAG, "WebSocket error");
-            set_state(WS_CLIENT_STATE_ERROR);
+            ESP_LOGW(TAG, "WebSocket error (state=%d, attempt=%lu, heap_free=%lu)",
+                     (int)s_ctx.state, (unsigned long)s_ctx.connect_attempts,
+                     (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+            // For connection errors, stay in CONNECTING to allow auto-reconnect
+            // For streaming errors, also go to CONNECTING to allow recovery
+            if (s_ctx.state == WS_CLIENT_STATE_CONNECTING) {
+                // Connection attempt failed - esp_websocket_client will retry
+                ESP_LOGI(TAG, "Server unreachable, retrying...");
+            } else if (s_ctx.state == WS_CLIENT_STATE_STREAMING ||
+                       s_ctx.state == WS_CLIENT_STATE_CONNECTED) {
+                // Connection lost during session - go back to connecting
+                s_ctx.session_id[0] = '\0';
+                set_state(WS_CLIENT_STATE_CONNECTING);
+            }
+            break;
+
+        case WEBSOCKET_EVENT_CLOSED:
+            ESP_LOGI(TAG, "WebSocket closed by server");
+            s_ctx.session_id[0] = '\0';
+            // Go to CONNECTING to allow auto-reconnect (not IDLE)
+            set_state(WS_CLIENT_STATE_CONNECTING);
             break;
 
         default:
+            ESP_LOGD(TAG, "WebSocket event: %ld", event_id);
             break;
     }
 }
@@ -239,17 +284,31 @@ bool copilot_ws_client_connect(void) {
     }
 
     if (s_ctx.client) {
-        ESP_LOGW(TAG, "Already connected");
+        // Already have a client - check if it's trying to connect
+        if (s_ctx.state == WS_CLIENT_STATE_CONNECTING) {
+            ESP_LOGI(TAG, "Already connecting (attempt #%lu)", (unsigned long)s_ctx.connect_attempts);
+            return true;
+        }
+        ESP_LOGW(TAG, "Client exists, state=%d", (int)s_ctx.state);
         return true;
     }
 
     xSemaphoreTake(s_ctx.mutex, portMAX_DELAY);
 
+    // Reset connection tracking
+    s_ctx.connect_attempts = 0;
+    s_ctx.last_connect_time = 0;
+    s_ctx.session_id[0] = '\0';
+
     esp_websocket_client_config_t ws_cfg = {};
     ws_cfg.uri = s_ctx.server_url;
-    ws_cfg.buffer_size = 4096;
-    ws_cfg.reconnect_timeout_ms = 5000;
-    ws_cfg.network_timeout_ms = 10000;
+    ws_cfg.buffer_size = 2048;             // Buffer for 2-3 audio frames (640 bytes + overhead each)
+    ws_cfg.reconnect_timeout_ms = 3000;    // Retry every 3s on failure
+    ws_cfg.network_timeout_ms = 10000;     // Connection timeout 10s
+    ws_cfg.ping_interval_sec = 5;          // Keep-alive ping every 5s
+    ws_cfg.pingpong_timeout_sec = 10;      // Pong response timeout 10s
+    ws_cfg.disable_auto_reconnect = false; // Enable auto-reconnect (default)
+    ws_cfg.task_stack = 4096;              // WebSocket task stack size
 
     s_ctx.client = esp_websocket_client_init(&ws_cfg);
     if (!s_ctx.client) {
@@ -307,7 +366,28 @@ void copilot_ws_client_disconnect(void) {
 }
 
 bool copilot_ws_client_send_audio(const int16_t *pcm_data, size_t samples) {
+    static uint32_t send_count = 0;
+    static uint32_t last_log_time = 0;
+    static uint32_t consecutive_failures = 0;
+
     if (!s_ctx.client || s_ctx.state != WS_CLIENT_STATE_STREAMING) {
+        static uint32_t skip_count = 0;
+        skip_count++;
+        if (skip_count <= 3 || skip_count % 100 == 0) {
+            ESP_LOGW(TAG, "send_audio skipped: client=%p, state=%d (count=%lu)",
+                     s_ctx.client, (int)s_ctx.state, (unsigned long)skip_count);
+        }
+        return false;
+    }
+
+    // Double-check connection is actually connected
+    if (!esp_websocket_client_is_connected(s_ctx.client)) {
+        static uint32_t not_connected_count = 0;
+        not_connected_count++;
+        if (not_connected_count <= 3 || not_connected_count % 100 == 0) {
+            ESP_LOGW(TAG, "send_audio: not connected (state=%d, count=%lu)",
+                     (int)s_ctx.state, (unsigned long)not_connected_count);
+        }
         return false;
     }
 
@@ -317,10 +397,47 @@ bool copilot_ws_client_send_audio(const int16_t *pcm_data, size_t samples) {
 
     size_t len = samples * sizeof(int16_t);
 
-    int ret = esp_websocket_client_send_bin(s_ctx.client, (const char *)pcm_data, len, portMAX_DELAY);
-    if (ret < 0) {
-        ESP_LOGW(TAG, "Failed to send audio: %d", ret);
+    // Debug: log first send attempt
+    static bool first_send_logged = false;
+    if (!first_send_logged) {
+        ESP_LOGI(TAG, "About to send first audio frame (%d bytes)", (int)len);
+        first_send_logged = true;
+    }
+
+    // Use longer timeout to tolerate WiFi jitter and avoid poll timeouts
+    // Note: If send fails, the connection may have dropped - auto-reconnect will handle it
+    int ret = esp_websocket_client_send_bin(
+        s_ctx.client, (const char *)pcm_data, len, pdMS_TO_TICKS(WS_AUDIO_SEND_TIMEOUT_MS));
+
+    // Debug: log first send result
+    static bool first_result_logged = false;
+    if (!first_result_logged) {
+        ESP_LOGI(TAG, "First send result: ret=%d (expected=%d)", ret, (int)len);
+        first_result_logged = true;
+    }
+
+    if (ret != (int)len) {
+        consecutive_failures++;
+        if (consecutive_failures <= 5 || consecutive_failures % 100 == 0) {
+            ESP_LOGW(TAG, "WebSocket send failed: ret=%d len=%d (consecutive=%lu, connected=%d)",
+                     ret, (int)len, (unsigned long)consecutive_failures,
+                     esp_websocket_client_is_connected(s_ctx.client));
+        }
+        // If we have many consecutive failures, connection might be dead
+        if (consecutive_failures >= 10) {
+            ESP_LOGW(TAG, "Too many send failures, connection may be dead");
+        }
         return false;
+    }
+
+    // Reset consecutive failure count on success
+    consecutive_failures = 0;
+    send_count++;
+
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (now - last_log_time >= 5000) {
+        last_log_time = now;
+        ESP_LOGI(TAG, "Audio sent: %lu frames (%d bytes each)", (unsigned long)send_count, (int)len);
     }
 
     return true;
@@ -332,4 +449,41 @@ copilot_ws_client_state_t copilot_ws_client_get_state(void) {
 
 bool copilot_ws_client_is_streaming(void) {
     return s_ctx.state == WS_CLIENT_STATE_STREAMING;
+}
+
+bool copilot_ws_client_is_connected(void) {
+    return s_ctx.client && esp_websocket_client_is_connected(s_ctx.client);
+}
+
+bool copilot_ws_client_is_connecting(void) {
+    return s_ctx.state == WS_CLIENT_STATE_CONNECTING;
+}
+
+uint32_t copilot_ws_client_get_connect_attempts(void) {
+    return s_ctx.connect_attempts;
+}
+
+bool copilot_ws_client_force_reconnect(void) {
+    if (!s_ctx.initialized || !s_ctx.client) {
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Forcing reconnect...");
+
+    // Stop current connection
+    esp_websocket_client_stop(s_ctx.client);
+
+    // Reset state
+    s_ctx.session_id[0] = '\0';
+    s_ctx.connect_attempts = 0;
+    set_state(WS_CLIENT_STATE_CONNECTING);
+
+    // Restart
+    esp_err_t err = esp_websocket_client_start(s_ctx.client);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Force reconnect failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    return true;
 }

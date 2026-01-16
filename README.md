@@ -46,6 +46,13 @@ Use `idf.py menuconfig` to configure:
 - **Performance Profiling**: Enable FPS/RTOS/heap monitoring (disabled by default)
 - **Copilot Voice**: Loopback test, sample rate, task stack/priority, mic gain
 
+## Voice Backend (ASR/TTS)
+
+Python backend lives in `tools/voice_backend`. It uses WebSocket audio streaming
+with Volcano SAUC ASR (bidirectional async) and unidirectional TTS.
+See `docs/VOICE_ARCHITECTURE.md` for protocol details and recommended SAUC
+streaming settings (100-200ms packets, 200ms default).
+
 ## MQTT Commands
 
 Subscribe to `copilot/<device_id>/cmd` and send JSON:

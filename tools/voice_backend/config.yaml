@@ -7,18 +7,55 @@ server:
 # Volcano Engine API credentials
 # Get these from https://console.volcengine.com/
 volcano:
-  app_id: ""
-  access_token: ""
-  # TTS settings
+  # Legacy API credentials
+  app_id: "1508363907"
+  access_token: "VuM2GhRb7K5XBNQqzIlUi_si3Yvp6VI5"
+
+  # SAUC BigModel API credentials (for streaming ASR)
+  # Get from: https://console.volcengine.com/speech/app
+  app_key: "1508363907"      # Fill in your app_key
+  access_key: "VuM2GhRb7K5XBNQqzIlUi_si3Yvp6VI5"   # Fill in your access_key
+
+  # TTS settings (Unidirectional Stream API v3)
   tts:
-    voice_type: "BV001_streaming"  # Default voice
+    # Voice type options:
+    # - zh_female_cancan_mars_bigtts (BigTTS 1.0, female)
+    # - zh_male_zhongyuan_speech_mars_bigtts (BigTTS 1.0, male)
+    # - zh_female_shuangkuaisisi_moon_bigtts (BigTTS 1.0, sweet female)
+    # - BV001_streaming (Legacy streaming voice)
+    # - S_xxx (ICL custom voice)
+    voice_type: "zh_female_cancan_mars_bigtts"
     encoding: "pcm"  # pcm for low latency
     sample_rate: 16000
-  # ASR settings
+    # Resource ID options:
+    # - seed-tts-1.0 or volc.service_type.10029 (BigTTS 1.0 char-based)
+    # - seed-tts-2.0 (BigTTS 2.0)
+    # - volc.megatts.default (ICL voices)
+    # Leave empty to auto-detect based on voice_type
+    resource_id: ""
+
+  # ASR settings (SAUC BigModel)
   asr:
+    # Streaming mode: bidirectional, bidirectional_async, nostream
+    mode: "bidirectional_async"
+    # Optional override for the SAUC endpoint
+    endpoint: ""
+    # SAUC resource id: duration or concurrent
+    resource_id: "volc.bigasr.sauc.duration"
     language: "zh-CN"
     format: "pcm"
+    codec: "raw"
     sample_rate: 16000
+    segment_duration_ms: 200  # Recommended 200ms for bidirectional streaming
+    send_interval_ms: 200     # Packet interval, keep in 100-200ms range
+    result_type: "single"     # full or single (incremental)
+    enable_itn: true
+    enable_punc: true
+    enable_ddc: true
+    show_utterances: true
+    enable_nonstream: false  # Two-pass mode (async only)
+    end_window_size: 800      # VAD endpointing, in ms
+    force_to_speech_time: 1000  # Minimum speech time before endpointing
 
 # WebRTC settings
 webrtc:
@@ -42,5 +79,11 @@ audio:
 
 # Logging
 logging:
-  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  level: "DEBUG"  # DEBUG, INFO, WARNING, ERROR
   format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+# Debug settings
+debug:
+  # Save audio to files for debugging ASR/TTS issues
+  save_audio: true
+  audio_dir: "./audio_recordings"

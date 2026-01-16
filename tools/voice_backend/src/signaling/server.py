@@ -58,13 +58,16 @@ class SignalingServer:
 
     async def stop(self):
         """Stop the HTTP server and cleanup sessions."""
-        # Stop all active sessions
+        # Stop all WebRTC sessions
         for session_id, session in list(self.sessions.items()):
             try:
                 await session.stop()
             except Exception as e:
                 logger.warning(f"Error stopping session {session_id}: {e}")
         self.sessions.clear()
+
+        # Stop all WebSocket audio streaming sessions
+        await self.audio_stream_server.stop_all_sessions()
 
         # Stop HTTP server
         if self.runner:

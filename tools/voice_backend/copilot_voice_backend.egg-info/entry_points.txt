@@ -1,0 +1,2 @@
+[console_scripts]
+voice-backend = src.main:main

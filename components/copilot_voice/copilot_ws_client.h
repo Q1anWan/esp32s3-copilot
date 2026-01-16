@@ -113,6 +113,34 @@ copilot_ws_client_state_t copilot_ws_client_get_state(void);
  */
 bool copilot_ws_client_is_streaming(void);
 
+/**
+ * @brief Check if TCP connection is established (may not be streaming yet)
+ *
+ * @return true if connected
+ */
+bool copilot_ws_client_is_connected(void);
+
+/**
+ * @brief Check if client is attempting to connect
+ *
+ * @return true if connecting
+ */
+bool copilot_ws_client_is_connecting(void);
+
+/**
+ * @brief Get number of connection attempts since last successful connection
+ *
+ * @return Number of attempts
+ */
+uint32_t copilot_ws_client_get_connect_attempts(void);
+
+/**
+ * @brief Force reconnection (stop and restart connection)
+ *
+ * @return true if reconnect initiated
+ */
+bool copilot_ws_client_force_reconnect(void);
+
 #ifdef __cplusplus
 }
 #endif

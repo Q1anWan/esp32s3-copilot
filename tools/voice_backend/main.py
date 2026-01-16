@@ -78,9 +78,12 @@ async def main_async(config: dict) -> None:
     # Wait for shutdown signal
     await stop_event.wait()
 
-    # Cleanup
+    # Cleanup with timeout to avoid hanging
     logger.info("Shutting down...")
-    await server.stop()
+    try:
+        await asyncio.wait_for(server.stop(), timeout=5.0)
+    except asyncio.TimeoutError:
+        logger.warning("Shutdown timed out, forcing exit")
     logger.info("Shutdown complete")
 
 

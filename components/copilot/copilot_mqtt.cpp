@@ -1,4 +1,5 @@
 #include "copilot_mqtt.h"
+#include "copilot_voice.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +11,7 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "mqtt_client.h"
 #include "nvs_flash.h"
@@ -181,6 +183,19 @@ static void copilot_wifi_event_handler(void *arg, esp_event_base_t event_base, i
     }
 }
 
+// Timer callback to start voice session (runs in timer task with adequate stack)
+#if CONFIG_COPILOT_VOICE_ENABLE && !CONFIG_COPILOT_VOICE_MODE_LOOPBACK
+static void voice_session_timer_cb(void *arg) {
+    (void)arg;
+    ESP_LOGI(TAG, "Starting voice streaming session...");
+    if (copilot_voice_start_session()) {
+        ESP_LOGI(TAG, "Voice streaming session started");
+    } else {
+        ESP_LOGW(TAG, "Voice streaming session failed to start");
+    }
+}
+#endif
+
 static void copilot_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     (void)arg;
     (void)event_base;
@@ -193,6 +208,22 @@ static void copilot_ip_event_handler(void *arg, esp_event_base_t event_base, int
         LOGI_MQTT( "Got IP: " IPSTR, IP2STR(&ip_event->ip_info.ip));
     }
     copilot_mqtt_start_client();
+
+    // Defer voice session start using timer (event handler stack too small)
+#if CONFIG_COPILOT_VOICE_ENABLE && !CONFIG_COPILOT_VOICE_MODE_LOOPBACK
+    const esp_timer_create_args_t timer_args = {
+        .callback = voice_session_timer_cb,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "voice_start",
+        .skip_unhandled_events = false,
+    };
+    esp_timer_handle_t timer;
+    if (esp_timer_create(&timer_args, &timer) == ESP_OK) {
+        // Start after 100ms delay
+        esp_timer_start_once(timer, 100 * 1000);
+    }
+#endif
 }
 
 static void copilot_wifi_init(void) {

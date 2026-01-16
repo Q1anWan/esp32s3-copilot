@@ -24,6 +24,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/idf_additions.h"
 #include "bsp/esp-bsp.h"
 #include "sdkconfig.h"
 
@@ -84,6 +85,10 @@ static struct {
     // Microphone codec (voice owns this directly)
     esp_codec_dev_handle_t mic_dev;
     esp_codec_dev_sample_info_t mic_sample_info;
+
+    // Pre-allocated DMA buffers (allocated at init to avoid fragmentation)
+    int16_t *mic_dma_buffer;    // DMA-capable buffer for mic read (stereo)
+    int16_t *mono_buffer;       // Buffer for mono conversion (not DMA)
 
     // Tasks
     TaskHandle_t loopback_task;
@@ -219,18 +224,13 @@ static void loopback_task_func(void *arg) {
     // Set volume for voice
     copilot_audio_out_set_volume(s_voice.speaker_volume);
 
-    // Allocate DMA-aligned microphone buffer (stereo from ES7210)
-    int16_t *mic_stereo_buffer = (int16_t *)heap_caps_aligned_alloc(
-        4, MIC_AUDIO_FRAME_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-
-    // Allocate mono buffer for output
-    int16_t *mono_buffer = (int16_t *)heap_caps_malloc(
-        VOICE_AUDIO_FRAME_BYTES, MALLOC_CAP_INTERNAL);
+    // Use pre-allocated DMA buffers (allocated in init to avoid fragmentation)
+    int16_t *mic_stereo_buffer = s_voice.mic_dma_buffer;
+    int16_t *mono_buffer = s_voice.mono_buffer;
 
     if (!mic_stereo_buffer || !mono_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate loopback buffers");
-        heap_caps_free(mic_stereo_buffer);
-        heap_caps_free(mono_buffer);
+        ESP_LOGE(TAG, "Pre-allocated buffers not available (mic=%p, mono=%p)",
+                 mic_stereo_buffer, mono_buffer);
         copilot_audio_out_release(AUDIO_SRC_VOICE);
         s_voice.loopback_running = false;
         vTaskDelete(NULL);
@@ -302,11 +302,9 @@ static void loopback_task_func(void *arg) {
         taskYIELD();
     }
 
-    // Release audio output
+    // Release audio output (don't free pre-allocated buffers - owned by voice module)
     copilot_audio_out_release(AUDIO_SRC_VOICE);
 
-    heap_caps_free(mic_stereo_buffer);
-    heap_caps_free(mono_buffer);
     LOGI_VOICE("Loopback test stopped (total frames: %lu)", (unsigned long)frame_count);
     vTaskDelete(NULL);
 }
@@ -363,32 +361,24 @@ static void streaming_task_func(void *arg) {
     (void)arg;
     LOGI_VOICE("Streaming task started");
 
-    // Allocate mic buffer (stereo from ES7210)
-    int16_t *mic_stereo_buffer = (int16_t *)heap_caps_malloc(
-        MIC_AUDIO_FRAME_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!mic_stereo_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate mic buffer");
+    // Use pre-allocated DMA buffers (allocated in init to avoid fragmentation)
+    int16_t *mic_stereo_buffer = s_voice.mic_dma_buffer;
+    int16_t *mono_buffer = s_voice.mono_buffer;
+
+    if (!mic_stereo_buffer || !mono_buffer) {
+        ESP_LOGE(TAG, "Pre-allocated buffers not available (mic=%p, mono=%p)",
+                 mic_stereo_buffer, mono_buffer);
         s_voice.streaming_running = false;
         vTaskDelete(NULL);
         return;
     }
 
-    // Allocate mono buffer for sending
-    int16_t *mono_buffer = (int16_t *)heap_caps_malloc(
-        VOICE_AUDIO_FRAME_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!mono_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate mono buffer");
-        heap_caps_free(mic_stereo_buffer);
-        s_voice.streaming_running = false;
-        vTaskDelete(NULL);
-        return;
-    }
+    ESP_LOGI(TAG, "Using pre-allocated buffers: mic=%p, mono=%p",
+             mic_stereo_buffer, mono_buffer);
 
     // Acquire audio output for receiving TTS
     if (!copilot_audio_out_acquire(AUDIO_SRC_VOICE)) {
         ESP_LOGE(TAG, "Failed to acquire audio output");
-        heap_caps_free(mic_stereo_buffer);
-        heap_caps_free(mono_buffer);
         s_voice.streaming_running = false;
         vTaskDelete(NULL);
         return;
@@ -396,17 +386,61 @@ static void streaming_task_func(void *arg) {
 
     uint32_t frame_count = 0;
     uint32_t last_log_time = 0;
+    uint32_t wait_count = 0;
+    uint32_t read_fail_count = 0;
+    uint32_t send_fail_count = 0;
+    const int64_t frame_interval_us = (int64_t)VOICE_AUDIO_FRAME_MS * 1000;
+    int64_t last_frame_us = esp_timer_get_time();
+
+    ESP_LOGI(TAG, "Streaming loop starting, mic_dev=%p", s_voice.mic_dev);
 
     while (s_voice.streaming_running) {
         // Wait for WebSocket to be streaming
         if (!copilot_ws_client_is_streaming()) {
+            wait_count++;
+            if (wait_count % 100 == 1) {  // Log every 5 seconds (100 * 50ms)
+                ESP_LOGI(TAG, "Waiting for WebSocket streaming... (state=%d, attempts=%lu)",
+                         (int)copilot_ws_client_get_state(),
+                         (unsigned long)copilot_ws_client_get_connect_attempts());
+            }
             vTaskDelay(pdMS_TO_TICKS(50));
+            last_frame_us = esp_timer_get_time();  // Reset pacing when not streaming
             continue;
         }
 
+        // Log when streaming becomes active (first time)
+        static bool streaming_active_logged = false;
+        if (!streaming_active_logged) {
+            ESP_LOGI(TAG, "WebSocket now streaming, starting mic capture loop");
+            streaming_active_logged = true;
+            last_frame_us = esp_timer_get_time();
+        }
+        wait_count = 0;
+
+        // Debug: log before mic read (to detect if read is blocking)
+        static bool first_read_logged = false;
+        if (!first_read_logged) {
+            ESP_LOGI(TAG, "About to read mic (first time), buffer=%p, size=%d",
+                     mic_stereo_buffer, MIC_AUDIO_FRAME_BYTES);
+            first_read_logged = true;
+        }
+
         // Read mic data (stereo)
-        int read_bytes = esp_codec_dev_read(s_voice.mic_dev, mic_stereo_buffer, MIC_AUDIO_FRAME_BYTES);
-        if (read_bytes != MIC_AUDIO_FRAME_BYTES) {
+        // Note: esp_codec_dev_read returns 0 on success, negative on error
+        int ret = esp_codec_dev_read(s_voice.mic_dev, mic_stereo_buffer, MIC_AUDIO_FRAME_BYTES);
+
+        // Debug: log after first successful read
+        static bool first_success_logged = false;
+        if (ret >= 0 && !first_success_logged) {
+            ESP_LOGI(TAG, "First mic read success! ret=%d", ret);
+            first_success_logged = true;
+        }
+
+        if (ret < 0) {
+            read_fail_count++;
+            if (read_fail_count <= 5 || read_fail_count % 100 == 0) {
+                ESP_LOGW(TAG, "Mic read failed: %d (count=%lu)", ret, (unsigned long)read_fail_count);
+            }
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
@@ -417,9 +451,30 @@ static void streaming_task_func(void *arg) {
             mono_buffer[i] = mic_stereo_buffer[i * 2];
         }
 
+        // Debug: log first conversion
+        static bool first_convert_logged = false;
+        if (!first_convert_logged) {
+            ESP_LOGI(TAG, "First stereo->mono conversion done, sending %d samples", mono_samples);
+            first_convert_logged = true;
+        }
+
         // Send to WebSocket server (for ASR)
 #if CONFIG_COPILOT_VOICE_MODE_FULL_DUPLEX || CONFIG_COPILOT_VOICE_MODE_TX_ONLY
-        copilot_ws_client_send_audio(mono_buffer, mono_samples);
+        bool sent = copilot_ws_client_send_audio(mono_buffer, mono_samples);
+
+        // Debug: log first send result
+        static bool first_send_result_logged = false;
+        if (!first_send_result_logged) {
+            ESP_LOGI(TAG, "First send_audio returned: %s", sent ? "true" : "false");
+            first_send_result_logged = true;
+        }
+
+        if (!sent) {
+            send_fail_count++;
+            if (send_fail_count <= 5 || send_fail_count % 100 == 0) {
+                ESP_LOGW(TAG, "Audio send failed (count=%lu)", (unsigned long)send_fail_count);
+            }
+        }
 #endif
 
         frame_count++;
@@ -428,16 +483,24 @@ static void streaming_task_func(void *arg) {
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
         if (now - last_log_time >= 5000) {
             last_log_time = now;
-            LOGI_VOICE("Streaming: %lu frames sent", (unsigned long)frame_count);
+            ESP_LOGI(TAG, "Streaming: %lu frames sent, read_fail=%lu, send_fail=%lu",
+                     (unsigned long)frame_count,
+                     (unsigned long)read_fail_count,
+                     (unsigned long)send_fail_count);
         }
 
-        taskYIELD();
+        // Pace sends to real-time to avoid bursting and TCP send buffer overflows
+        int64_t now_us = esp_timer_get_time();
+        int64_t elapsed_us = now_us - last_frame_us;
+        if (elapsed_us < frame_interval_us) {
+            int64_t wait_us = frame_interval_us - elapsed_us;
+            vTaskDelay(pdMS_TO_TICKS((wait_us + 999) / 1000));
+        }
+        last_frame_us = esp_timer_get_time();
     }
 
-    // Cleanup
+    // Cleanup (don't free pre-allocated buffers - they're owned by voice module)
     copilot_audio_out_release(AUDIO_SRC_VOICE);
-    heap_caps_free(mic_stereo_buffer);
-    heap_caps_free(mono_buffer);
 
     LOGI_VOICE("Streaming task stopped (total frames: %lu)", (unsigned long)frame_count);
     vTaskDelete(NULL);
@@ -486,33 +549,36 @@ static bool start_streaming_session(void) {
         return false;
     }
 
-    // Start streaming task
+    // Start streaming task (use PSRAM for stack since internal RAM is fragmented)
     s_voice.streaming_running = true;
 
     int core = normalize_core(CONFIG_COPILOT_VOICE_TASK_CORE);
     BaseType_t result;
 
     if (core >= 0) {
-        result = xTaskCreatePinnedToCore(
+        result = xTaskCreatePinnedToCoreWithCaps(
             streaming_task_func,
             "voice_stream",
             CONFIG_COPILOT_VOICE_TASK_STACK,
             nullptr,
             CONFIG_COPILOT_VOICE_TASK_PRIORITY,
             &s_voice.streaming_task,
-            core);
+            core,
+            MALLOC_CAP_SPIRAM);
     } else {
-        result = xTaskCreate(
+        result = xTaskCreateWithCaps(
             streaming_task_func,
             "voice_stream",
             CONFIG_COPILOT_VOICE_TASK_STACK,
             nullptr,
             CONFIG_COPILOT_VOICE_TASK_PRIORITY,
-            &s_voice.streaming_task);
+            &s_voice.streaming_task,
+            MALLOC_CAP_SPIRAM);
     }
 
     if (result != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create streaming task");
+        ESP_LOGE(TAG, "Failed to create streaming task (SPIRAM free: %lu bytes)",
+                 (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         copilot_ws_client_disconnect();
         s_voice.streaming_running = false;
         return false;
@@ -565,6 +631,36 @@ bool copilot_voice_init(void) {
     LOGI_VOICE("  Frame size: %d samples (%d ms, %d bytes)",
              VOICE_AUDIO_FRAME_SAMPLES, VOICE_AUDIO_FRAME_MS, VOICE_AUDIO_FRAME_BYTES);
 
+    // Pre-allocate DMA buffers FIRST, before other allocations fragment memory
+    // This is critical for the mic read which requires DMA-capable memory
+    ESP_LOGI(TAG, "DMA memory before alloc: free=%u, largest=%u",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+
+    s_voice.mic_dma_buffer = (int16_t *)heap_caps_aligned_alloc(
+        4, MIC_AUDIO_FRAME_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (!s_voice.mic_dma_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate mic DMA buffer (%d bytes)", MIC_AUDIO_FRAME_BYTES);
+        return false;
+    }
+
+    s_voice.mono_buffer = (int16_t *)heap_caps_malloc(
+        VOICE_AUDIO_FRAME_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_voice.mono_buffer) {
+        s_voice.mono_buffer = (int16_t *)heap_caps_malloc(
+            VOICE_AUDIO_FRAME_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (!s_voice.mono_buffer) {
+        ESP_LOGE(TAG, "Failed to allocate mono buffer");
+        heap_caps_free(s_voice.mic_dma_buffer);
+        s_voice.mic_dma_buffer = NULL;
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Pre-allocated DMA buffers: mic=%p (%d bytes), mono=%p (%d bytes)",
+             s_voice.mic_dma_buffer, MIC_AUDIO_FRAME_BYTES,
+             s_voice.mono_buffer, VOICE_AUDIO_FRAME_BYTES);
+
     // Initialize default settings
     s_voice.mic_gain_db = CONFIG_COPILOT_VOICE_MIC_GAIN;
     s_voice.speaker_volume = CONFIG_COPILOT_VOICE_SPEAKER_VOLUME;
@@ -599,6 +695,16 @@ void copilot_voice_deinit(void) {
 
     // Release microphone
     deinit_audio();
+
+    // Free pre-allocated buffers
+    if (s_voice.mic_dma_buffer) {
+        heap_caps_free(s_voice.mic_dma_buffer);
+        s_voice.mic_dma_buffer = NULL;
+    }
+    if (s_voice.mono_buffer) {
+        heap_caps_free(s_voice.mono_buffer);
+        s_voice.mono_buffer = NULL;
+    }
 
     notify_state_change(VOICE_STATE_IDLE);
 }

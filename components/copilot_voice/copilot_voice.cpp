@@ -317,12 +317,35 @@ static void loopback_task_func(void *arg) {
 
 #if !CONFIG_COPILOT_VOICE_MODE_LOOPBACK
 
+// Track TTS audio reception for state management
+static volatile uint32_t s_last_tts_audio_ms = 0;
+static volatile uint32_t s_tts_frames_received = 0;
+
 // Callback for receiving audio from WebSocket server
 static void ws_audio_callback(const int16_t *pcm_data, size_t samples, void *user_data) {
     (void)user_data;
 
     // Write TTS audio to speaker
     if (samples > 0) {
+        // Track TTS audio reception
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        s_last_tts_audio_ms = now_ms;
+        s_tts_frames_received++;
+
+        // Log first TTS audio reception
+        static bool first_tts_logged = false;
+        if (!first_tts_logged) {
+            ESP_LOGI(TAG, "TTS audio received: %d samples (first frame)", (int)samples);
+            first_tts_logged = true;
+        }
+
+        // Notify state change to SPEAKING when TTS audio starts
+        // This enables mouth animation in the UI
+        if (s_voice.state != VOICE_STATE_SPEAKING) {
+            notify_state_change(VOICE_STATE_SPEAKING);
+            LOGI_VOICE("TTS playback started -> SPEAKING");
+        }
+
         // The audio_out module handles mono-to-stereo conversion
         copilot_audio_out_write(AUDIO_SRC_VOICE, pcm_data, (int)samples, 0);
     }
@@ -483,10 +506,20 @@ static void streaming_task_func(void *arg) {
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
         if (now - last_log_time >= 5000) {
             last_log_time = now;
-            ESP_LOGI(TAG, "Streaming: %lu frames sent, read_fail=%lu, send_fail=%lu",
+            ESP_LOGI(TAG, "Streaming: %lu TX, %lu TTS RX, read_fail=%lu, send_fail=%lu",
                      (unsigned long)frame_count,
+                     (unsigned long)s_tts_frames_received,
                      (unsigned long)read_fail_count,
                      (unsigned long)send_fail_count);
+        }
+
+        // Check if TTS playback finished (no TTS audio for 300ms)
+        // Return to LISTENING state when TTS ends
+        if (s_voice.state == VOICE_STATE_SPEAKING && s_last_tts_audio_ms > 0) {
+            if (now - s_last_tts_audio_ms > 300) {
+                notify_state_change(VOICE_STATE_LISTENING);
+                LOGI_VOICE("TTS playback finished -> LISTENING");
+            }
         }
 
         // Pace sends to real-time to avoid bursting and TCP send buffer overflows
@@ -776,6 +809,7 @@ bool copilot_voice_start_loopback(void) {
     }
 
     s_voice.loopback_running = true;
+    notify_state_change(VOICE_STATE_SPEAKING);  // Loopback outputs audio -> SPEAKING state
 
     int core = normalize_core(CONFIG_COPILOT_VOICE_TASK_CORE);
     BaseType_t result;
@@ -829,6 +863,8 @@ void copilot_voice_stop_loopback(void) {
         vTaskDelay(pdMS_TO_TICKS(100));
         s_voice.loopback_task = nullptr;
     }
+
+    notify_state_change(VOICE_STATE_READY);  // Back to ready state
 #endif
 }
 
@@ -851,8 +887,8 @@ void copilot_voice_set_speaker_volume(int volume_percent) {
     s_voice.speaker_volume = volume_percent;
 
     // Use audio output manager for volume control
+    ESP_LOGI(TAG, "Setting speaker volume to %d%%", volume_percent);
     copilot_audio_out_set_volume(volume_percent);
-    LOGI_VOICE("Speaker volume set to %d%%", volume_percent);
 }
 
 #else // !CONFIG_COPILOT_VOICE_ENABLE

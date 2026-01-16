@@ -46,6 +46,45 @@ IDs: `beep_short|beep_long|chime|tap`
 {"type":"ring","on":true}
 ```
 
+### Voice Control
+Control the voice module for WebSocket-based voice streaming.
+
+**Start voice session:**
+```json
+{"type":"voice","action":"start"}
+```
+Connects to the Python backend via WebSocket and starts bidirectional audio streaming.
+
+**Stop voice session:**
+```json
+{"type":"voice","action":"stop"}
+```
+Disconnects from backend. Audio hardware remains initialized.
+
+**Toggle loopback test:**
+```json
+{"type":"voice","action":"loopback"}
+```
+Routes microphone input directly to speaker output for testing. Toggles on/off.
+Note: Loopback mode triggers `VOICE_STATE_SPEAKING`, enabling mouth animation.
+
+**Set speaker volume:**
+```json
+{"type":"voice","volume":80}
+```
+- `volume`: 0-100 (percentage)
+
+**Set microphone gain:**
+```json
+{"type":"voice","mic_gain":24}
+```
+- `mic_gain`: 0-36 (dB)
+
+**Combined example:**
+```json
+{"type":"voice","action":"start","volume":70,"mic_gain":30}
+```
+
 ### Calibrate (IMU)
 ```json
 {"type":"calibrate","target":"gyro"}
@@ -65,12 +104,25 @@ Queries device status. Results are logged to the device console (not sent via MQ
 Note: status logging requires `CONFIG_COPILOT_LOG_APP=y`.
 
 Fields:
-- `query`: `"imu"` or `"all"`
+- `query`: `"imu"`, `"voice"`, or `"all"`
 
-Response (logged on device):
+Response examples (logged on device):
 ```
 IMU status: ready=1 calibrating=0 bias=2.35 dps
+Voice status: state=LISTENING active=1 loopback=0
 ```
+
+Voice states: `IDLE|READY|CONNECTING|LISTENING|PROCESSING|SPEAKING|ERROR`
+
+## Voice-UI Integration
+
+The UI automatically responds to voice states:
+- **LISTENING**: Ring indicator shows
+- **SPEAKING**: Ring indicator + mouth animation (driven by audio envelope)
+- **ERROR**: Ring indicator flashes
+
+Mouth animation is driven by audio envelope detection in the audio output path.
+The envelope is calculated from voice audio samples and smoothed for natural animation.
 
 ## Demo Script
 
@@ -86,23 +138,34 @@ Requires `paho-mqtt`:
 python -m pip install paho-mqtt
 ```
 
-You can also use the Bash script on Linux/macOS:
+### Voice-UI Demo
 
-```bash
-# Default (localhost broker)
-./tools/mqtt_demo.sh
+The demo includes a voice-UI test mode (`vdemo` command) that:
+1. Starts loopback mode
+2. Sets happy expression
+3. Waits 5 seconds for you to speak (mouth should animate)
+4. Returns to neutral and stops loopback
 
-# Custom broker
-./tools/mqtt_demo.sh -h 192.168.1.100
+### Command Reference
 
-# With custom device ID
-./tools/mqtt_demo.sh -h 192.168.1.100 -d my_device
+| Command | Description |
+|---------|-------------|
+| `1-7` | Expressions: happy, sad, angry, surprised, sleepy, dizzy, neutral |
+| `m0-m4` | Motion: reset, drift right/left/up/down |
+| `s1-s4` | Sounds: beep_short, beep_long, chime, tap |
+| `r0/r1` | Ring off/on |
+| `v0/v1` | Voice session stop/start |
+| `vl` | Toggle voice loopback |
+| `vs` | Query voice status |
+| `v+/v-` | Volume up/down |
+| `g+/g-` | Mic gain up/down |
+| `cal` | Start gyro calibration |
+| `st` | Query all status |
+| `demo` | Run expression demo |
+| `vdemo` | Run voice-UI demo |
 
-# Show help
-./tools/mqtt_demo.sh --help
-```
+### Environment Variables
 
-Environment variables:
 - `MQTT_HOST`: broker hostname
 - `MQTT_PORT`: broker port (default: 1883)
 - `MQTT_PREFIX`: topic prefix (default: `copilot`)

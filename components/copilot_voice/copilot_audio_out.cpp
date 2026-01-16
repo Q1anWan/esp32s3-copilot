@@ -16,6 +16,7 @@
 #include <math.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_codec_dev.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -297,6 +298,10 @@ static struct {
 
 static portMUX_TYPE s_tone_lock = portMUX_INITIALIZER_UNLOCKED;
 
+// Audio envelope for voice animation (mouth sync)
+static volatile uint8_t s_envelope = 0;
+static volatile uint32_t s_envelope_time_ms = 0;
+
 static inline int16_t copilot_clip_i16(int32_t value) {
     if (value > 32767) {
         return 32767;
@@ -517,7 +522,13 @@ bool copilot_audio_out_init(const copilot_audio_out_config_t *config) {
         return false;
     }
 
-    esp_codec_dev_set_out_vol(s_out.codec_dev, s_out.volume);
+    // Set initial volume
+    err = esp_codec_dev_set_out_vol(s_out.codec_dev, s_out.volume);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set initial volume: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "Initial volume set to %d%%", s_out.volume);
+    }
 
     // Start output task
     s_out.running = true;
@@ -702,6 +713,21 @@ int copilot_audio_out_write(copilot_audio_src_t src,
         return 0;
     }
 
+    // Calculate envelope for voice source (for mouth animation)
+    if (src == AUDIO_SRC_VOICE && num_samples > 0) {
+        int32_t peak = 0;
+        // Fast peak detection: sample every 4th sample for speed
+        for (int i = 0; i < num_samples; i += 4) {
+            int32_t abs_val = samples[i] > 0 ? samples[i] : -samples[i];
+            if (abs_val > peak) peak = abs_val;
+        }
+        // Normalize: typical TTS peak ~8000-16000, map to 0-255
+        int32_t env = (peak * 255) / 12000;
+        if (env > 255) env = 255;
+        s_envelope = (uint8_t)env;
+        s_envelope_time_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    }
+
     // Convert mono to stereo and write
     // Process in chunks to avoid large stack allocation
     const int chunk_size = 128;
@@ -782,8 +808,14 @@ void copilot_audio_out_set_volume(int volume) {
     s_out.volume = volume;
 
     if (s_out.codec_dev) {
-        esp_codec_dev_set_out_vol(s_out.codec_dev, volume);
-        LOGI_OUT("Volume set to %d%%", volume);
+        esp_err_t ret = esp_codec_dev_set_out_vol(s_out.codec_dev, volume);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to set volume: %s", esp_err_to_name(ret));
+        } else {
+            ESP_LOGI(TAG, "Volume set to %d%%", volume);
+        }
+    } else {
+        ESP_LOGW(TAG, "Cannot set volume: codec not initialized");
     }
 }
 
@@ -851,4 +883,25 @@ bool copilot_audio_out_is_tone_active(void) {
     active = s_out.tone.active;
     portEXIT_CRITICAL(&s_tone_lock);
     return active;
+}
+
+uint8_t copilot_audio_out_get_envelope(void) {
+    // Decay envelope if stale (>100ms since last audio write)
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t last_ms = s_envelope_time_ms;
+    uint32_t age = now_ms - last_ms;
+
+    if (age > 100) {
+        // No audio for >100ms, return 0
+        return 0;
+    }
+
+    uint8_t env = s_envelope;
+
+    // Linear decay over 50-100ms for smooth mouth closing
+    if (age > 50) {
+        env = (uint8_t)(env * (100 - age) / 50);
+    }
+
+    return env;
 }

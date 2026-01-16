@@ -8,6 +8,7 @@
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
 #include "copilot_perf.h"
+#include "copilot_voice_ui.h"
 
 #define LCD_H_RES BSP_LCD_H_RES
 #define LCD_V_RES BSP_LCD_V_RES
@@ -127,10 +128,18 @@ struct copilot_ui_state_t {
     int16_t last_mouth_y;
     bool last_eye_rounded;
     bool last_mouth_rounded;
+    bool last_mouth_visible;
+    int16_t last_mouth_size;    // Last mouth arc size for scaling animation
 
     // Breathing animation state
     uint32_t breath_start_ms;
     int16_t breath_offset;      // Current breath offset in pixels
+
+    // Voice-UI state for mouth animation
+    uint8_t mouth_open_smooth;  // Smoothed mouth opening (0-255)
+    copilot_voice_state_t last_voice_state;
+    bool is_speaking;           // True when actively speaking (for eye/mouth animation)
+    uint8_t eye_open_smooth;    // Smoothed eye opening for speaking transition (0-255)
 };
 
 static copilot_ui_state_t s_ui = {};
@@ -327,11 +336,36 @@ static void copilot_apply_face(const face_arc_keyframe_t *frame, int16_t blink_r
         return;
     }
 
-    int16_t eye_start = frame->eye_start;
-    int16_t eye_end = frame->eye_end;
+    // --- Eye Animation ---
+    // Not speaking: semicircle (180 degrees, bottom half like a smile)
+    // Speaking: ellipse/full circle (360 degrees) using eye_open_smooth for transition
+    int16_t eye_start, eye_end;
+
+    // Semicircle: 180-360 (bottom half arc, like relaxed/happy eyes)
+    // Full circle: 0-360 (wide open eyes during speech)
+    // Interpolate based on eye_open_smooth (0=semicircle, 255=full circle)
+    uint8_t eye_ratio = s_ui.eye_open_smooth;
+
+    // Base semicircle: 200-340 (140 deg) -> target: 180-360 (180 deg semicircle)
+    // When speaking: interpolate toward 0-360 (full ellipse)
+    if (eye_ratio < 10) {
+        // Not speaking: semicircle (180 degrees, centered at 270 = bottom)
+        eye_start = 180;
+        eye_end = 360;
+    } else if (eye_ratio > 245) {
+        // Fully speaking: complete ellipse
+        eye_start = 0;
+        eye_end = 360;
+    } else {
+        // Transition: expand from semicircle to full circle
+        // Start: 180 -> 0, End: 360 -> 360
+        // eye_start = 180 - (180 * eye_ratio / 255)
+        eye_start = 180 - (int16_t)((180 * eye_ratio) >> 8);
+        eye_end = 360;
+    }
+
+    // Apply blink animation (squeezes eyes closed)
     if (blink_ratio > 0) {
-        // Fixed-point interpolation: (1-ratio)*start + ratio*target
-        // = start + ratio*(target - start)
         int32_t diff_start = BLINK_EYE_START - eye_start;
         int32_t diff_end = BLINK_EYE_END - eye_end;
         eye_start = eye_start + (int16_t)((diff_start * blink_ratio) >> FP_SHIFT);
@@ -341,10 +375,30 @@ static void copilot_apply_face(const face_arc_keyframe_t *frame, int16_t blink_r
     int16_t eye_span = copilot_arc_span(eye_start, eye_end);
     bool eye_rounded = eye_span < 350;
 
-    int16_t mouth_start = frame->mouth_start;
-    int16_t mouth_end = frame->mouth_end;
-    int16_t mouth_span = copilot_arc_span(mouth_start, mouth_end);
-    bool mouth_rounded = mouth_span < 350;
+    // --- Mouth Animation ---
+    // Not speaking: hidden (opacity 0 handled below)
+    // Speaking: ellipse that scales with audio envelope
+    int16_t mouth_start = 0;
+    int16_t mouth_end = 360;
+    int16_t mouth_span;
+    bool mouth_rounded;
+    bool mouth_visible = false;
+
+    if (s_ui.mouth_open_smooth > 15) {
+        // Speaking: show mouth as scaling ellipse
+        mouth_visible = true;
+
+        // Mouth is always a full ellipse (0-360) when visible
+        mouth_start = 0;
+        mouth_end = 360;
+        mouth_span = 360;
+        mouth_rounded = false;  // Full circle, no rounded caps needed
+    } else {
+        // Not speaking: hide mouth completely
+        mouth_visible = false;
+        mouth_span = 0;
+        mouth_rounded = true;
+    }
 
     bool force = !s_ui.face_applied;
     if (force || eye_rounded != s_ui.last_eye_rounded) {
@@ -370,8 +424,25 @@ static void copilot_apply_face(const face_arc_keyframe_t *frame, int16_t blink_r
     int16_t eye_r_x = (int16_t)(EYE_X_R + FACE_INNER_OFFSET_X);
     int16_t eye_l_y = (int16_t)(eye_center_y - (EYE_SIZE / 2));
     int16_t eye_r_y = (int16_t)(eye_center_y - (EYE_SIZE / 2));
-    int16_t mouth_x = (int16_t)(MOUTH_X + FACE_INNER_OFFSET_X);
-    int16_t mouth_y = (int16_t)(mouth_center_y - (MOUTH_SIZE / 2));
+
+    // --- Mouth size scaling based on audio envelope ---
+    // Mouth scales from 30% to 100% of MOUTH_SIZE based on envelope
+    // This creates a "talking" effect where mouth opens/closes with speech
+    int16_t mouth_size;
+    if (mouth_visible) {
+        // Scale: min 30% (when mouth_open_smooth ~15) to max 100% (when ~255)
+        // mouth_size = MOUTH_SIZE * (0.3 + 0.7 * (mouth_open_smooth - 15) / 240)
+        int16_t scale_factor = 77 + (int16_t)(((int32_t)(s_ui.mouth_open_smooth - 15) * 179) / 240);
+        if (scale_factor > 255) scale_factor = 255;
+        mouth_size = (int16_t)(((int32_t)MOUTH_SIZE * scale_factor) >> 8);
+        if (mouth_size < 20) mouth_size = 20;  // Minimum visible size
+    } else {
+        mouth_size = 0;
+    }
+
+    // Center mouth position based on scaled size
+    int16_t mouth_x = (int16_t)((FACE_SIZE - mouth_size) / 2 + FACE_INNER_OFFSET_X);
+    int16_t mouth_y = (int16_t)(mouth_center_y - (mouth_size / 2));
 
     if (force || eye_l_x != s_ui.last_eye_l_x || eye_l_y != s_ui.last_eye_l_y) {
         lv_obj_set_pos(s_ui.eye_l, eye_l_x, eye_l_y);
@@ -383,10 +454,28 @@ static void copilot_apply_face(const face_arc_keyframe_t *frame, int16_t blink_r
         s_ui.last_eye_r_x = eye_r_x;
         s_ui.last_eye_r_y = eye_r_y;
     }
-    if (force || mouth_x != s_ui.last_mouth_x || mouth_y != s_ui.last_mouth_y) {
-        lv_obj_set_pos(s_ui.mouth, mouth_x, mouth_y);
-        s_ui.last_mouth_x = mouth_x;
-        s_ui.last_mouth_y = mouth_y;
+
+    // Update mouth visibility
+    if (force || mouth_visible != s_ui.last_mouth_visible) {
+        if (mouth_visible) {
+            lv_obj_clear_flag(s_ui.mouth, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_ui.mouth, LV_OBJ_FLAG_HIDDEN);
+        }
+        s_ui.last_mouth_visible = mouth_visible;
+    }
+
+    // Update mouth size and position when visible
+    if (mouth_visible) {
+        if (force || mouth_size != s_ui.last_mouth_size) {
+            lv_obj_set_size(s_ui.mouth, mouth_size, mouth_size);
+            s_ui.last_mouth_size = mouth_size;
+        }
+        if (force || mouth_x != s_ui.last_mouth_x || mouth_y != s_ui.last_mouth_y) {
+            lv_obj_set_pos(s_ui.mouth, mouth_x, mouth_y);
+            s_ui.last_mouth_x = mouth_x;
+            s_ui.last_mouth_y = mouth_y;
+        }
     }
 
     if (force || eye_start != s_ui.last_eye_start || eye_end != s_ui.last_eye_end ||
@@ -398,11 +487,12 @@ static void copilot_apply_face(const face_arc_keyframe_t *frame, int16_t blink_r
         s_ui.last_eye_rotation = frame->eye_rotation;
     }
 
-    if (force || frame->mouth_start != s_ui.last_mouth_start || frame->mouth_end != s_ui.last_mouth_end ||
-        frame->mouth_rotation != s_ui.last_mouth_rotation) {
-        copilot_apply_arc(s_ui.mouth, frame->mouth_start, frame->mouth_end, frame->mouth_rotation);
-        s_ui.last_mouth_start = frame->mouth_start;
-        s_ui.last_mouth_end = frame->mouth_end;
+    // Apply mouth arc angles (full ellipse when visible)
+    if (mouth_visible && (force || mouth_start != s_ui.last_mouth_start || mouth_end != s_ui.last_mouth_end ||
+        frame->mouth_rotation != s_ui.last_mouth_rotation)) {
+        copilot_apply_arc(s_ui.mouth, mouth_start, mouth_end, frame->mouth_rotation);
+        s_ui.last_mouth_start = mouth_start;
+        s_ui.last_mouth_end = mouth_end;
         s_ui.last_mouth_rotation = frame->mouth_rotation;
     }
 
@@ -659,6 +749,66 @@ static void copilot_anim_timer(lv_timer_t *timer) {
     if (breath_offset != last_breath_offset) {
         last_breath_offset = breath_offset;
         s_ui.breath_offset = breath_offset;
+        need_redraw = true;
+    }
+
+    // Voice-UI integration: update mouth opening (optimized to reduce overhead)
+    // Only check every 2 frames (~66ms) to reduce cross-module calls
+    static uint8_t voice_check_counter = 0;
+    static uint8_t cached_raw_mouth = 0;
+
+    voice_check_counter++;
+    if (voice_check_counter >= 2) {
+        voice_check_counter = 0;
+        cached_raw_mouth = copilot_voice_ui_get_mouth_open();
+
+        // Check for voice state changes (less frequent)
+        copilot_voice_state_t voice_state = copilot_voice_ui_get_state();
+        if (voice_state != s_ui.last_voice_state) {
+            s_ui.last_voice_state = voice_state;
+
+            // Update is_speaking flag for eye/mouth animation
+            bool was_speaking = s_ui.is_speaking;
+            s_ui.is_speaking = (voice_state == VOICE_STATE_SPEAKING);
+
+            // Ring only shows during SPEAKING state (not LISTENING/PROCESSING)
+            if (s_ui.is_speaking) {
+                copilot_ui_ring_show(true);
+            } else if (was_speaking && !s_ui.is_speaking) {
+                // Just stopped speaking - hide ring
+                if (!s_ui.touch_flash_active) {
+                    copilot_ui_ring_show(false);
+                }
+            }
+
+            need_redraw = true;
+        }
+    }
+
+    // Exponential smoothing for mouth animation (runs every frame for smooth animation)
+    // alpha ~0.3 for faster response: smooth = (smooth * 179 + raw * 77) >> 8
+    uint8_t old_mouth = s_ui.mouth_open_smooth;
+    s_ui.mouth_open_smooth = (uint8_t)(
+        ((uint16_t)s_ui.mouth_open_smooth * 179 + (uint16_t)cached_raw_mouth * 77) >> 8
+    );
+
+    // Eye smoothing: transition between semicircle (not speaking) and ellipse (speaking)
+    // Target: 0 when not speaking, 255 when speaking
+    uint8_t eye_target = s_ui.is_speaking ? 255 : 0;
+    uint8_t old_eye = s_ui.eye_open_smooth;
+    // Faster smoothing for snappy response (alpha ~0.25)
+    s_ui.eye_open_smooth = (uint8_t)(
+        ((uint16_t)s_ui.eye_open_smooth * 192 + (uint16_t)eye_target * 64) >> 8
+    );
+
+    // Eye animation triggers redraw when changed
+    if (s_ui.eye_open_smooth != old_eye) {
+        need_redraw = true;
+    }
+
+    // Mouth animation triggers redraw only when changed significantly
+    if (s_ui.mouth_open_smooth > 10 &&
+        (s_ui.mouth_open_smooth > old_mouth + 3 || old_mouth > s_ui.mouth_open_smooth + 3)) {
         need_redraw = true;
     }
 

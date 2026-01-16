@@ -223,6 +223,64 @@ python tools/test_asr_client.py --server ws://localhost:8080 --verbose
 3. **Tune `end_window_size`/`force_to_speech_time`** for faster finals
 4. **Adjust `segment_duration_ms`** between 100-200ms if latency drifts
 
+## Voice-UI Integration
+
+The voice module integrates with the UI system to provide visual feedback during voice interactions.
+
+### Voice-UI Bridge (`components/copilot/copilot_voice_ui.cpp`)
+
+| File | Purpose |
+|------|---------|
+| `copilot_voice_ui.cpp` | Bridge between voice and UI modules |
+| `copilot_voice_ui.h` | Voice-UI API declarations |
+
+**Key APIs:**
+- `copilot_voice_ui_init()` - Initialize voice-UI integration (registers state callback)
+- `copilot_voice_ui_get_mouth_open()` - Get audio envelope for mouth animation (0-255)
+- `copilot_voice_ui_get_state()` - Get current voice state for UI feedback
+
+### Audio Envelope Detection
+
+The audio output module calculates envelope for mouth animation sync:
+- Peak detection runs on every audio write (samples every 4th sample for speed)
+- Envelope normalized to 0-255 range (12000 peak = 255)
+- Automatic decay if no audio for >50ms (smooth mouth closing)
+
+### UI Animations During Voice States
+
+| Voice State | Eye Shape | Mouth | Ring Light |
+|-------------|-----------|-------|------------|
+| IDLE/READY | Semicircle (180°) | Hidden | Off |
+| LISTENING | Semicircle | Hidden | Off |
+| SPEAKING | Full ellipse (360°) | Scaling ellipse | On |
+| ERROR | Semicircle | Hidden | Off |
+
+**Eye Animation:**
+- Not speaking: Eyes display as semicircles (bottom half arc, 180°-360°)
+- Speaking: Eyes smoothly transition to full ellipses (0°-360°)
+- Transition uses exponential smoothing (α≈0.25) for natural feel
+
+**Mouth Animation:**
+- Hidden when not speaking (`mouth_open_smooth < 15`)
+- Appears as scaling ellipse during speech
+- Size scales 30%-100% of base size based on audio envelope
+- Creates "talking" effect synchronized with audio
+
+### Cross-Thread Communication
+
+```
+Voice Task ─────> s_voice_state (atomic uint8_t)
+                              │
+Audio Task ────> s_envelope   │
+              (atomic uint8_t)│
+                              ▼
+              UI Task reads at 30 FPS
+```
+
+- Single-byte atomics are naturally thread-safe on ESP32
+- No queue overhead needed
+- UI polls state every 2 frames (~66ms) to reduce overhead
+
 ## Related Documentation
 
 - [ESP-IDF WebSocket Client](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/protocols/esp_websocket_client.html)

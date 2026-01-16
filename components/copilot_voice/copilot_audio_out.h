@@ -169,6 +169,17 @@ bool copilot_audio_out_play_tone(uint16_t freq_hz, uint16_t duration_ms, uint8_t
  */
 bool copilot_audio_out_is_tone_active(void);
 
+/**
+ * @brief Get current audio envelope level for voice source
+ *
+ * Returns the peak amplitude envelope of recent voice audio.
+ * Used for mouth animation during TTS playback.
+ * Envelope decays automatically when no audio is written.
+ *
+ * @return Envelope level 0-255 (Q8 fixed-point for 0.0-1.0)
+ */
+uint8_t copilot_audio_out_get_envelope(void);
+
 #ifdef __cplusplus
 }
 #endif

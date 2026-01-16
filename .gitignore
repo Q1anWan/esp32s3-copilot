@@ -32,3 +32,6 @@ Thumbs.db
 
 # Debug files
 *.log
+
+# Audio recordings (debug output)
+tools/voice_backend/audio_recordings/

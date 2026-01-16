@@ -16,6 +16,7 @@
 #include "copilot_perf.h"
 #include "copilot_ui.h"
 #include "copilot_voice.h"
+#include "copilot_voice_ui.h"
 
 static const char *TAG = "copilot_app";
 
@@ -317,6 +318,64 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
                      ready ? 1 : 0, calibrating ? 1 : 0, bias);
 #endif
         }
+        if (strcmp(query_str, "voice") == 0 || strcmp(query_str, "all") == 0) {
+            copilot_voice_state_t state = copilot_voice_get_state();
+            bool active = copilot_voice_is_active();
+            bool loopback = copilot_voice_is_loopback_running();
+            const char *state_names[] = {"IDLE", "READY", "CONNECTING", "LISTENING", "PROCESSING", "SPEAKING", "ERROR"};
+            const char *state_name = (state < sizeof(state_names)/sizeof(state_names[0])) ? state_names[state] : "UNKNOWN";
+            ESP_LOGI(TAG, "Voice status: state=%s active=%d loopback=%d", state_name, active ? 1 : 0, loopback ? 1 : 0);
+        }
+    } else if (strcmp(type->valuestring, "voice") == 0) {
+        // Voice module control
+        const cJSON *action = cJSON_GetObjectItemCaseSensitive(root, "action");
+        const char *action_str = cJSON_IsString(action) ? action->valuestring : "";
+
+        if (strcmp(action_str, "start") == 0) {
+            LOGI_APP("Voice session start requested");
+            if (copilot_voice_start_session()) {
+                LOGI_APP("Voice session started");
+            } else {
+                ESP_LOGW(TAG, "Voice session failed to start");
+            }
+        } else if (strcmp(action_str, "stop") == 0) {
+            LOGI_APP("Voice session stop requested");
+            copilot_voice_stop_session();
+            LOGI_APP("Voice session stopped");
+        } else if (strcmp(action_str, "loopback") == 0) {
+            // Toggle loopback test
+            if (copilot_voice_is_loopback_running()) {
+                LOGI_APP("Stopping voice loopback");
+                copilot_voice_stop_loopback();
+            } else {
+                LOGI_APP("Starting voice loopback");
+                if (copilot_voice_start_loopback()) {
+                    LOGI_APP("Voice loopback started - speak into mic!");
+                } else {
+                    ESP_LOGW(TAG, "Voice loopback failed to start");
+                }
+            }
+        } else {
+            ESP_LOGW(TAG, "Unknown voice action: %s", action_str);
+        }
+
+        // Handle volume/gain settings
+        const cJSON *volume = cJSON_GetObjectItemCaseSensitive(root, "volume");
+        if (cJSON_IsNumber(volume)) {
+            int vol = (int)volume->valuedouble;
+            if (vol >= 0 && vol <= 100) {
+                copilot_voice_set_speaker_volume(vol);
+                LOGI_APP("Voice speaker volume set to %d", vol);
+            }
+        }
+        const cJSON *mic_gain = cJSON_GetObjectItemCaseSensitive(root, "mic_gain");
+        if (cJSON_IsNumber(mic_gain)) {
+            int gain = (int)mic_gain->valuedouble;
+            if (gain >= 0 && gain <= 36) {
+                copilot_voice_set_mic_gain(gain);
+                LOGI_APP("Voice mic gain set to %d dB", gain);
+            }
+        }
     }
 
     cJSON_Delete(root);
@@ -339,6 +398,7 @@ void copilot_app_init(void) {
     // Initialize voice module (session will start after WiFi connects)
     if (copilot_voice_init()) {
         LOGI_APP( "Voice module initialized");
+        copilot_voice_ui_init();  // Register voice-UI callback for mouth animation
 #if CONFIG_COPILOT_VOICE_LOOPBACK_TEST
         // Loopback test doesn't need network, start immediately
         if (copilot_voice_start_loopback()) {

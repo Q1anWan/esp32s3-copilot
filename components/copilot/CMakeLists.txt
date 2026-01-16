@@ -3,6 +3,7 @@ idf_component_register(
     "copilot_face_data.cpp"
     "copilot_app.cpp"
     "copilot_ui.cpp"
+    "copilot_voice_ui.cpp"
     "copilot_audio.cpp"
     "copilot_mqtt.cpp"
     "copilot_perf.cpp"

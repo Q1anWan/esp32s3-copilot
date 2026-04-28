@@ -84,6 +84,10 @@ static bool copilot_audio_lookup(const char *id, audio_req_t *out) {
 }
 
 static void copilot_audio_play_tone(const audio_req_t &req) {
+    LOGI_AUDIO("Play tone start freq=%u duration=%u volume=%u",
+               (unsigned)req.freq_hz,
+               (unsigned)req.duration_ms,
+               (unsigned)req.volume);
     if (!copilot_audio_out_play_tone(req.freq_hz, req.duration_ms, req.volume)) {
         LOGI_AUDIO("Audio output not ready, skip tone");
         return;
@@ -98,6 +102,7 @@ static void copilot_audio_play_tone(const audio_req_t &req) {
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+    LOGI_AUDIO("Play tone done freq=%u", (unsigned)req.freq_hz);
 }
 
 static void copilot_audio_task(void *arg) {
@@ -180,6 +185,11 @@ void copilot_audio_play(const char *sound_id) {
         req.duration_ms = 160;
         req.volume = 80;
     }
+    LOGI_AUDIO("Queue tone id=%s freq=%u duration=%u volume=%u",
+               sound_id ? sound_id : "default",
+               (unsigned)req.freq_hz,
+               (unsigned)req.duration_ms,
+               (unsigned)req.volume);
     xQueueSend(s_audio_queue, &req, 0);
 }
 

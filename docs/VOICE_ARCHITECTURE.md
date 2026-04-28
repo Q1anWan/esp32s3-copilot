@@ -136,8 +136,19 @@ buffer tuning.
 CONFIG_COPILOT_VOICE_ENABLE=y
 CONFIG_COPILOT_VOICE_MODE_FULL_DUPLEX=y
 CONFIG_COPILOT_VOICE_SAMPLE_RATE=16000
-CONFIG_COPILOT_VOICE_SERVER_URL="http://192.168.31.98:8080"
+CONFIG_COPILOT_VOICE_SERVER_URL="http://<host-ip>:8080"
 ```
+
+On a local bench setup, resolve `<host-ip>` from the workstation before
+flashing:
+
+```bash
+HOST_IP=$(python tools/host_ip.py)
+```
+
+Use that same host IP for both:
+- `CONFIG_COPILOT_MQTT_BROKER_URI="mqtt://$HOST_IP:1883"`
+- `CONFIG_COPILOT_VOICE_SERVER_URL="http://$HOST_IP:8080"`
 
 ### Python config.yaml
 ```yaml
@@ -236,28 +247,27 @@ The voice module integrates with the UI system to provide visual feedback during
 
 **Key APIs:**
 - `copilot_voice_ui_init()` - Initialize voice-UI integration (registers state callback)
-- `copilot_voice_ui_get_mouth_open()` - Get audio envelope for mouth animation (0-255)
+- `copilot_voice_ui_get_mouth_open()` - Get audio envelope used as a speaking-state trigger (0-255)
 - `copilot_voice_ui_get_state()` - Get current voice state for UI feedback
 
 ### Audio Envelope Detection
 
-The audio output module calculates envelope for mouth animation sync:
+The audio output module calculates envelope for speaking-state detection:
 - Peak detection runs on every audio write (samples every 4th sample for speed)
 - Envelope normalized to 0-255 range (12000 peak = 255)
 - Automatic decay if no audio for >50ms (smooth mouth closing)
 
 ### UI Animations During Voice States
 
-| Voice State | Eye Shape | Mouth | Ring Light |
+| Voice State | Avatar State | Mouth | Ring Light |
 |-------------|-----------|-------|------------|
-| IDLE/READY | Semicircle (180°) | Hidden | Off |
-| LISTENING | Semicircle | Hidden | Off |
-| SPEAKING | Full ellipse (360°) | Scaling ellipse | On |
-| ERROR | Semicircle | Hidden | Off |
+| IDLE/READY | Idle rubber-hose figure | Closed | Off |
+| LISTENING | Idle rubber-hose figure | Closed | Off |
+| SPEAKING | Speaking rubber-hose figure | Open capsule | On |
+| ERROR | Idle rubber-hose figure | Closed | Off |
 
-**Eye Animation:**
-- Not speaking: Eyes display as semicircles (bottom half arc, 180°-360°)
-- Speaking: Eyes smoothly transition to full ellipses (0°-360°)
+The current UI intentionally keeps only two animation states: idle and speaking.
+Voice `SPEAKING` state and nonzero voice envelope both drive the speaking state.
 - Transition uses exponential smoothing (α≈0.25) for natural feel
 
 **Mouth Animation:**

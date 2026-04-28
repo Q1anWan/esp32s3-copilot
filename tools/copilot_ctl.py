@@ -5,7 +5,7 @@ Copilot Control Tool - Unified control for ESP32-S3 Copilot
 Combines MQTT device control with TTS/Voice backend integration.
 
 Features:
-- Expression control (happy, sad, angry, etc.)
+- Avatar state control (idle, speaking)
 - Motion control (drift, yaw)
 - Sound playback
 - Ring indicator
@@ -15,8 +15,8 @@ Features:
 
 Usage:
     python copilot_ctl.py                    # Interactive mode
-    python copilot_ctl.py --mqtt-host 192.168.1.100
-    python copilot_ctl.py --voice-server ws://192.168.1.100:8080
+    python copilot_ctl.py --mqtt-host <host-ip>
+    python copilot_ctl.py --voice-server ws://<host-ip>:8080
 """
 import argparse
 import asyncio
@@ -101,7 +101,7 @@ class CopilotController:
         print(f"  -> Sent: {data}")
         return True
 
-    # Expression commands
+    # Avatar state commands
     def set_expression(self, name: str, duration_ms: int = 400,
                        prelight_ms: int = 500, sound: str = None):
         payload = {
@@ -197,7 +197,7 @@ def show_menu(ctl: CopilotController):
     print(f"  Voice: {ctl.voice_server}")
     print("=" * 65)
     print("")
-    print("Expression:  1)Happy 2)Sad 3)Angry 4)Surprised 5)Sleepy 6)Dizzy 7)Neutral")
+    print("Avatar:      1)Idle  2)Speak 2s")
     print("Motion:      m1)Right m2)Left m3)Up m4)Down m0)Reset")
     print("Sound:       s1)beep_short s2)beep_long s3)chime s4)tap")
     print("Ring:        r1)ON r0)OFF")
@@ -208,22 +208,21 @@ def show_menu(ctl: CopilotController):
     print("TTS:         tts <text>  (e.g., 'tts Hello World')")
     print("")
     print("Calibration: cal)Gyro  Status: st)All")
-    print("Demo:        demo)Expression demo  vdemo)Voice-UI demo")
+    print("Demo:        demo)Avatar demo  vdemo)Voice-UI demo")
     print("")
     print("Other:       q)Quit  {json}Send raw JSON")
     print("")
 
 
 def run_expression_demo(ctl: CopilotController):
-    """Run expression demo sequence"""
-    print("Running expression demo...")
+    """Run simplified avatar demo sequence"""
+    print("Running avatar demo...")
     steps = [
-        ("happy", "happy", 420, 500, "chime"),
-        ("surprised", "surprised", 260, 400, "beep_short"),
-        ("sad", "sad", 780, 500, "beep_short"),
+        ("idle", "idle", 0, 0, None),
+        ("speaking", "speaking", 1200, 300, "chime"),
         ("motion right", None, 0, 0, None),
         ("motion left+up", None, 0, 0, None),
-        ("neutral", "neutral", 300, 0, None),
+        ("idle", "idle", 0, 0, None),
     ]
     for i, (name, expr, dur, pre, snd) in enumerate(steps, 1):
         print(f"  [{i}/{len(steps)}] {name}")
@@ -247,16 +246,16 @@ def run_voice_demo(ctl: CopilotController):
     ctl.voice_loopback()
     time.sleep(0.5)
 
-    print("  [2/5] Setting happy expression...")
-    ctl.set_expression("happy", 300)
+    print("  [2/5] Setting idle state...")
+    ctl.set_expression("idle", 0)
     time.sleep(0.3)
 
     print("  [3/5] Speak into the microphone now!")
     print("        (The mouth should animate with your voice)")
     time.sleep(5.0)
 
-    print("  [4/5] Setting neutral expression...")
-    ctl.set_expression("neutral", 300)
+    print("  [4/5] Setting idle state...")
+    ctl.set_expression("idle", 0)
     time.sleep(0.3)
 
     print("  [5/5] Stopping loopback...")
@@ -307,13 +306,8 @@ def main():
 
     # Command mapping
     commands = {
-        "1": lambda: ctl.set_expression("happy", 420, 500, "chime"),
-        "2": lambda: ctl.set_expression("sad", 600, 500, "beep_short"),
-        "3": lambda: ctl.set_expression("angry", 500, 400),
-        "4": lambda: ctl.set_expression("surprised", 300, 400, "beep_short"),
-        "5": lambda: ctl.set_expression("sleepy", 800, 500),
-        "6": lambda: ctl.set_expression("dizzy", 600, 400),
-        "7": lambda: ctl.set_expression("neutral", 300, 0),
+        "1": lambda: ctl.set_expression("idle", 0, 0),
+        "2": lambda: ctl.set_expression("speaking", 2000, 300, "chime"),
         "m1": lambda: ctl.set_motion(ax=0.5),
         "m2": lambda: ctl.set_motion(ax=-0.5),
         "m3": lambda: ctl.set_motion(ay=0.5),

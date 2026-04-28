@@ -3,7 +3,7 @@
 Copilot MQTT Demo - Interactive control tool for ESP32-S3 Copilot
 
 Supports:
-- Expression control (happy, sad, angry, etc.)
+- Avatar state control (idle, speaking)
 - Motion control (drift, yaw)
 - Sound playback
 - Ring indicator
@@ -70,10 +70,8 @@ def show_menu(host, topic):
     print(f"  Topic:  {topic}")
     print("=" * 60)
     print("")
-    print("Expression Commands:")
-    print("  1) Happy       2) Sad         3) Angry")
-    print("  4) Surprised   5) Sleepy      6) Dizzy")
-    print("  7) Neutral")
+    print("Avatar Commands:")
+    print("  1) Idle        2) Speak 2s")
     print("")
     print("Motion Commands:")
     print("  m1) Drift right    m2) Drift left")
@@ -97,7 +95,7 @@ def show_menu(host, topic):
     print("  st)  Query device status (IMU + Voice)")
     print("")
     print("Demos:")
-    print("  demo)  Run expression demo")
+    print("  demo)  Run avatar demo")
     print("  vdemo) Run voice-UI demo (shows mouth animation)")
     print("")
     print("Other:")
@@ -120,15 +118,14 @@ def publish_payload(client, topic, payload):
 
 
 def run_expression_demo(client, topic):
-    """Run classic expression demo sequence."""
-    print("Running expression demo...")
+    """Run simplified avatar demo sequence."""
+    print("Running avatar demo...")
     steps = [
-        ("happy", {"type": "emotion", "name": "happy", "duration_ms": 420, "prelight_ms": 500, "sound": "chime"}),
-        ("surprised", {"type": "emotion", "name": "surprised", "duration_ms": 260, "prelight_ms": 400, "sound": "beep_short"}),
-        ("sad", {"type": "emotion", "name": "sad", "duration_ms": 780, "prelight_ms": 500, "sound": "beep_short"}),
+        ("idle", {"type": "emotion", "name": "idle", "duration_ms": 0, "prelight_ms": 0}),
+        ("speaking", {"type": "emotion", "name": "speaking", "duration_ms": 1200, "prelight_ms": 300, "sound": "chime"}),
         ("motion right", {"type": "motion", "ax": 0.35, "ay": 0.0, "yaw": 8.0}),
         ("motion left+up", {"type": "motion", "ax": -0.25, "ay": 0.4, "yaw": -12.0}),
-        ("neutral", {"type": "emotion", "name": "neutral", "duration_ms": 300, "prelight_ms": 0}),
+        ("idle", {"type": "emotion", "name": "idle", "duration_ms": 0, "prelight_ms": 0}),
     ]
     for i, (name, payload) in enumerate(steps, 1):
         print(f"  [{i}/{len(steps)}] {name}")
@@ -149,16 +146,16 @@ def run_voice_demo(client, topic):
     publish_payload(client, topic, {"type": "voice", "action": "loopback"})
     time.sleep(0.5)
 
-    print("  [2/5] Setting happy expression...")
-    publish_payload(client, topic, {"type": "emotion", "name": "happy", "duration_ms": 300})
+    print("  [2/5] Setting idle state...")
+    publish_payload(client, topic, {"type": "emotion", "name": "idle", "duration_ms": 0})
     time.sleep(0.3)
 
     print("  [3/5] Speak into the microphone now!")
     print("        (The mouth should animate with your voice)")
     time.sleep(5.0)
 
-    print("  [4/5] Setting neutral expression...")
-    publish_payload(client, topic, {"type": "emotion", "name": "neutral", "duration_ms": 300})
+    print("  [4/5] Setting idle state...")
+    publish_payload(client, topic, {"type": "emotion", "name": "idle", "duration_ms": 0})
     time.sleep(0.3)
 
     print("  [5/5] Stopping loopback...")
@@ -193,14 +190,9 @@ def main():
 
     # Command mapping
     commands = {
-        # Expressions
-        "1": {"type": "emotion", "name": "happy", "duration_ms": 420, "prelight_ms": 500, "sound": "chime"},
-        "2": {"type": "emotion", "name": "sad", "duration_ms": 600, "prelight_ms": 500, "sound": "beep_short"},
-        "3": {"type": "emotion", "name": "angry", "duration_ms": 500, "prelight_ms": 400},
-        "4": {"type": "emotion", "name": "surprised", "duration_ms": 300, "prelight_ms": 400, "sound": "beep_short"},
-        "5": {"type": "emotion", "name": "sleepy", "duration_ms": 800, "prelight_ms": 500},
-        "6": {"type": "emotion", "name": "dizzy", "duration_ms": 600, "prelight_ms": 400},
-        "7": {"type": "emotion", "name": "neutral", "duration_ms": 300, "prelight_ms": 0},
+        # Avatar states
+        "1": {"type": "emotion", "name": "idle", "duration_ms": 0, "prelight_ms": 0},
+        "2": {"type": "emotion", "name": "speaking", "duration_ms": 2000, "prelight_ms": 300, "sound": "chime"},
         # Motion
         "m1": {"type": "motion", "ax": 0.5, "ay": 0.0, "yaw": 0.0},
         "m2": {"type": "motion", "ax": -0.5, "ay": 0.0, "yaw": 0.0},

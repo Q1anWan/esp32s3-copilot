@@ -12,8 +12,9 @@ config COPILOT_VOICE_SERVER_URL
     default "http://192.168.1.100:8080"
     depends on COPILOT_VOICE_ENABLE
     help
-        URL of the Python voice backend server for WebRTC signaling.
-        Example: http://192.168.1.100:8080
+        URL of the host-side Python voice backend reachable from the ESP32.
+        This must be the workstation LAN address on the same WiFi as the ESP32.
+        Example: http://192.168.31.12:8080
 
 choice COPILOT_VOICE_MODE
     prompt "Voice communication mode"

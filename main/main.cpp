@@ -9,6 +9,7 @@
 #include "esp_lvgl_port.h"
 
 #include "copilot_app.h"
+#include "copilot_audio.h"
 #include "copilot_ui.h"
 
 static const char *TAG = "main";
@@ -79,6 +80,12 @@ extern "C" void app_main(void) {
         lv_obj_clear_flag(touch_layer, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(touch_layer, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(touch_layer, copilot_touch_event_cb, LV_EVENT_PRESSED, nullptr);
+
+#if CONFIG_COPILOT_STARTUP_SELF_TEST
+        ESP_LOGI(TAG, "Startup self-test: speaking head + chime");
+        copilot_ui_set_expression(COPILOT_EXPR_SPEAKING, 1800);
+        copilot_audio_play("chime");
+#endif
 
         bsp_display_unlock();
     } else {

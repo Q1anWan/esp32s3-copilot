@@ -563,7 +563,7 @@ static bool start_streaming_session(void) {
     if (!s_voice.ws_client_inited) {
         copilot_ws_client_config_t ws_cfg = {};
         ws_cfg.server_url = server_url;
-        ws_cfg.device_id = "esp32_copilot";
+        ws_cfg.device_id = (CONFIG_COPILOT_DEVICE_ID[0] != '\0') ? CONFIG_COPILOT_DEVICE_ID : "esp32_copilot";
         ws_cfg.sample_rate = CONFIG_COPILOT_VOICE_SAMPLE_RATE;
         ws_cfg.on_audio = ws_audio_callback;
         ws_cfg.on_state = ws_state_callback;

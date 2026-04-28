@@ -5,7 +5,7 @@ ASR Test Client
 订阅 ASR 结果，接收 ESP32 麦克风识别的文本。
 
 用法:
-    python test_asr_client.py --server ws://192.168.31.98:8080
+    python test_asr_client.py --server ws://<host-ip>:8080
     python test_asr_client.py --server ws://localhost:8080 --verbose
 """
 
@@ -140,7 +140,7 @@ if __name__ == "__main__":
         epilog="""
 示例:
   # 连接到服务器接收 ASR 结果
-  python test_asr_client.py --server ws://192.168.31.98:8080
+  python test_asr_client.py --server ws://<host-ip>:8080
 
   # 详细模式（显示部分识别结果）
   python test_asr_client.py --server ws://localhost:8080 --verbose

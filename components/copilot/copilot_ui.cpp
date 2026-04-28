@@ -15,193 +15,114 @@
 
 static const char *TAG = "copilot_ui";
 
-// Conditional logging
 #if CONFIG_COPILOT_LOG_UI
 #define LOGI_UI(fmt, ...) ESP_LOGI(TAG, fmt, ##__VA_ARGS__)
 #else
-#define LOGI_UI(fmt, ...) do {} while(0)
+#define LOGI_UI(fmt, ...) do {} while (0)
 #endif
 
-#define UI_OFFSET_X (-10)
-#define UI_OFFSET_Y (-10)
-#define FACE_INNER_OFFSET_X (0)
-#define FACE_INNER_OFFSET_Y (0)
+#define UI_OFFSET_X (-8)
+#define UI_OFFSET_Y (-4)
 
-// Fixed-point constants for motion (avoid float on ESP32-C6)
-#define MOTION_SHIFT_X_SIGN (-1)
-#define MOTION_SHIFT_Y_SIGN (1)
-#define MOTION_YAW_SIGN     (-1)
-
-#define FACE_SIZE ((LCD_H_RES * 76) / 100)
-#define FACE_X (((LCD_H_RES - FACE_SIZE) / 2) + UI_OFFSET_X)
-#define FACE_Y (((LCD_V_RES - FACE_SIZE) / 2) + UI_OFFSET_Y)
-
-#define EYE_SIZE ((FACE_SIZE * 28) / 100)
-#define MOUTH_SIZE ((FACE_SIZE * 52) / 100)
-#define EYE_SPACING ((FACE_SIZE * 20) / 100)
-
-#define EYE_CENTER_Y ((FACE_SIZE * 35) / 100)
-#define MOUTH_CENTER_Y ((FACE_SIZE * 62) / 100)
-
-#define EYE_TOTAL_WIDTH ((EYE_SIZE * 2) + EYE_SPACING)
-#define EYE_X_L ((FACE_SIZE - EYE_TOTAL_WIDTH) / 2)
-#define EYE_X_R (EYE_X_L + EYE_SIZE + EYE_SPACING)
-#define MOUTH_X ((FACE_SIZE - MOUTH_SIZE) / 2)
+#define FACE_BOX_SIZE ((LCD_H_RES * 80) / 100)
+#define FACE_BOX_X (((LCD_H_RES - FACE_BOX_SIZE) / 2) + UI_OFFSET_X)
+#define FACE_BOX_Y (((LCD_V_RES - FACE_BOX_SIZE) / 2) + UI_OFFSET_Y)
 
 #define RING_SIZE ((LCD_H_RES * 94) / 100)
 #define RING_X (((LCD_H_RES - RING_SIZE) / 2) + UI_OFFSET_X)
 #define RING_Y (((LCD_V_RES - RING_SIZE) / 2) + UI_OFFSET_Y)
 #define RING_SEGMENTS 60
 #define RING_POINTS (RING_SEGMENTS + 1)
-
-#define EYE_LINE_WIDTH 6
-#define MOUTH_LINE_WIDTH 7
 #define RING_OUTER_WIDTH 14
 #define RING_INNER_WIDTH 7
 
-// Animation timing - optimized for smoothness
-#define ANIM_TIMER_MS 33          // ~30fps to match available CPU headroom
-#define BLINK_CLOSE_MS 100        // Slightly slower close for cute effect
-#define BLINK_OPEN_MS 140         // Slower open for natural feel
-#define BLINK_INTERVAL_MIN 2000   // More frequent blinking
-#define BLINK_INTERVAL_JITTER 2000
-#define BLINK_EYE_START 255
-#define BLINK_EYE_END 285
+#define ANIM_TIMER_MS 33
 #define TOUCH_FLASH_MS 180
+#define SPEAKING_HOLD_MS 120
 
-// Breathing animation for liveliness
-#define BREATH_CYCLE_MS 3000      // 3 second breathing cycle
-#define BREATH_AMPLITUDE 3        // Pixels of vertical movement
+#define INK_COLOR 0x000000
+#define PAPER_COLOR 0xF8FAFF
+
+#define HEAD_W ((FACE_BOX_SIZE * 70) / 100)
+#define HEAD_H ((FACE_BOX_SIZE * 74) / 100)
+#define HEAD_X ((FACE_BOX_SIZE - HEAD_W) / 2)
+#define HEAD_Y ((FACE_BOX_SIZE * 8) / 100)
+#define HEAD_BORDER ((FACE_BOX_SIZE * 3) / 100)
+
+#define CHEEK_W ((FACE_BOX_SIZE * 26) / 100)
+#define CHEEK_H ((FACE_BOX_SIZE * 28) / 100)
+#define FACE_PATCH_W ((FACE_BOX_SIZE * 48) / 100)
+#define FACE_PATCH_H ((FACE_BOX_SIZE * 45) / 100)
+
+#define EYE_W ((FACE_BOX_SIZE * 12) / 100)
+#define EYE_H ((FACE_BOX_SIZE * 21) / 100)
+#define EYE_CUT_W ((FACE_BOX_SIZE * 5) / 100)
+#define EYE_CUT_H ((FACE_BOX_SIZE * 12) / 100)
+#define EYE_SPARK_W ((FACE_BOX_SIZE * 3) / 100)
+#define EYE_SPARK_H ((FACE_BOX_SIZE * 5) / 100)
+
+#define NOSE_W ((FACE_BOX_SIZE * 7) / 100)
+#define NOSE_H ((FACE_BOX_SIZE * 5) / 100)
+
+#define MOUTH_IDLE_W ((FACE_BOX_SIZE * 24) / 100)
+#define MOUTH_IDLE_H ((FACE_BOX_SIZE * 5) / 100)
+#define MOUTH_OPEN_W ((FACE_BOX_SIZE * 23) / 100)
+#define MOUTH_OPEN_H ((FACE_BOX_SIZE * 24) / 100)
+
+#define MOTION_SHIFT_X_SIGN (-1)
+#define MOTION_SHIFT_Y_SIGN (1)
+#define MOTION_YAW_SIGN     (-1)
+#define MOTION_ALPHA 46
 
 struct copilot_ui_state_t {
     lv_obj_t *root;
     lv_obj_t *face_root;
     lv_obj_t *ring_outer;
     lv_obj_t *ring_inner;
+
+    lv_obj_t *head;
+    lv_obj_t *cheek_l;
+    lv_obj_t *cheek_r;
+    lv_obj_t *face_patch;
     lv_obj_t *eye_l;
     lv_obj_t *eye_r;
+    lv_obj_t *eye_l_cut;
+    lv_obj_t *eye_r_cut;
+    lv_obj_t *eye_l_spark;
+    lv_obj_t *eye_r_spark;
+    lv_obj_t *nose;
     lv_obj_t *mouth;
-
-    face_arc_keyframe_t expr_from;
-    face_arc_keyframe_t expr_to;
-    face_arc_keyframe_t expr_cur;
-    copilot_expr_t expr_current;
-    uint32_t expr_start_ms;
-    uint32_t expr_duration_ms;
-    bool expr_animating;
-    uint32_t expr_change_id;
+    lv_obj_t *mouth_inner;
+    lv_obj_t *tooth;
 
     copilot_motion_t motion_target;
     copilot_motion_t motion_current;
-    int16_t motion_roll;  // Q8.8 fixed-point
-    uint32_t uneasy_until_ms;
-    uint32_t uneasy_cooldown_ms;
-    copilot_expr_t uneasy_restore_expr;
-    uint32_t uneasy_restore_id;
+    int16_t motion_roll;
 
     lv_timer_t *anim_timer;
     bool ring_visible;
     bool ready;
     uint32_t last_touch_ms;
-
-    uint32_t next_blink_ms;
-    uint32_t blink_phase_start;
-    uint8_t blink_phase;
-
-    bool touch_pending;
-    uint32_t touch_flash_until_ms;
     bool touch_flash_active;
     bool touch_flash_owns_ring;
+    uint32_t touch_flash_until_ms;
 
-    bool face_applied;
-    int16_t last_eye_start;
-    int16_t last_eye_end;
-    int16_t last_eye_rotation;
-    int16_t last_mouth_start;
-    int16_t last_mouth_end;
-    int16_t last_mouth_rotation;
-    int16_t last_eye_l_x;
-    int16_t last_eye_r_x;
-    int16_t last_eye_l_y;
-    int16_t last_eye_r_y;
-    int16_t last_mouth_x;
-    int16_t last_mouth_y;
-    bool last_eye_rounded;
-    bool last_mouth_rounded;
-    bool last_mouth_visible;
-    int16_t last_mouth_size;    // Last mouth arc size for scaling animation
-
-    // Breathing animation state
-    uint32_t breath_start_ms;
-    int16_t breath_offset;      // Current breath offset in pixels
-
-    // Voice-UI state for mouth animation
-    uint8_t mouth_open_smooth;  // Smoothed mouth opening (0-255)
-    copilot_voice_state_t last_voice_state;
-    bool is_speaking;           // True when actively speaking (for eye/mouth animation)
-    uint8_t eye_open_smooth;    // Smoothed eye opening for speaking transition (0-255)
+    bool manual_speaking;
+    bool manual_speaking_latched;
+    uint32_t manual_speaking_until_ms;
+    uint32_t speaking_until_ms;
+    uint8_t mouth_progress;
+    bool last_speaking;
+    uint32_t last_idle_pose_bucket;
 };
 
 static copilot_ui_state_t s_ui = {};
-
-// Ease-in-out cubic function for smooth animations
-// Input: t in [0, t_max], Output: eased value in [0, t_max]
-static uint32_t copilot_ease_in_out(uint32_t t, uint32_t t_max) {
-    if (t_max == 0) return t_max;
-    if (t >= t_max) return t_max;
-
-    // Normalize to 0-256 range for fixed-point math
-    uint32_t x = (t * 256) / t_max;
-    uint32_t result;
-
-    if (x < 128) {
-        // Ease-in: 4 * x^3 (scaled)
-        result = (4 * x * x * x) >> 16;
-    } else {
-        // Ease-out: 1 - 4 * (1-x)^3
-        uint32_t inv = 256 - x;
-        result = 256 - ((4 * inv * inv * inv) >> 16);
-    }
-
-    return (result * t_max) >> 8;
-}
-
-// Sine approximation for breathing animation (input: 0-360 degrees, output: -256 to 256)
-static int16_t copilot_sin_approx(int16_t deg) {
-    // Normalize to 0-360
-    while (deg < 0) deg += 360;
-    while (deg >= 360) deg -= 360;
-
-    // Use symmetry: sin(180+x) = -sin(x)
-    bool neg = false;
-    if (deg >= 180) {
-        deg -= 180;
-        neg = true;
-    }
-    // sin(180-x) = sin(x)
-    if (deg > 90) {
-        deg = 180 - deg;
-    }
-
-    // Quadratic approximation for 0-90 degrees
-    // sin(x) ≈ x * (180-x) * 4 / 32400 (scaled to 256)
-    int32_t x = deg;
-    int32_t result = (x * (90 - x) * 256) / (90 * 45);
-
-    return neg ? (int16_t)(-result) : (int16_t)result;
-}
 static lv_point_precise_t s_ring_outer_pts[RING_POINTS];
 static lv_point_precise_t s_ring_inner_pts[RING_POINTS];
 
-static int16_t copilot_lerp_i16(int16_t a, int16_t b, uint32_t t, uint32_t t_max) {
-    if (t_max == 0) {
-        return b;
-    }
-    int32_t diff = (int32_t)b - (int32_t)a;
-    return (int16_t)(a + (diff * (int32_t)t) / (int32_t)t_max);
+static int16_t copilot_abs_i16(int16_t v) {
+    return v < 0 ? (int16_t)-v : v;
 }
-
-static void copilot_touch_trigger(int16_t x, int16_t y);
 
 static void copilot_build_ring_points(lv_point_precise_t *pts, int16_t radius) {
     if (!pts || radius <= 0) {
@@ -213,608 +134,202 @@ static void copilot_build_ring_points(lv_point_precise_t *pts, int16_t radius) {
         int16_t angle = (int16_t)((360 * i) / RING_SEGMENTS);
         int32_t cos_v = lv_trigo_cos(angle);
         int32_t sin_v = lv_trigo_sin(angle);
-        int32_t x = (int32_t)cx + (((int32_t)radius * cos_v) >> LV_TRIGO_SHIFT);
-        int32_t y = (int32_t)cy + (((int32_t)radius * sin_v) >> LV_TRIGO_SHIFT);
-        pts[i].x = (lv_coord_t)x;
-        pts[i].y = (lv_coord_t)y;
+        pts[i].x = (lv_coord_t)((int32_t)cx + (((int32_t)radius * cos_v) >> LV_TRIGO_SHIFT));
+        pts[i].y = (lv_coord_t)((int32_t)cy + (((int32_t)radius * sin_v) >> LV_TRIGO_SHIFT));
     }
 }
 
-static int16_t copilot_wrap_angle(int32_t angle) {
-    angle %= 360;
-    if (angle < 0) {
-        angle += 360;
-    }
-    return (int16_t)angle;
+static void copilot_line_style(lv_obj_t *line, lv_color_t color, uint8_t width) {
+    lv_obj_set_style_line_width(line, width, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_line_color(line, color, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_line_opa(line, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_line_rounded(line, false, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(line, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(line, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(line, LV_OBJ_FLAG_CLICKABLE);
 }
 
-static int16_t copilot_wrap_angle_full(int32_t angle) {
-    if (angle == 360) {
-        return 360;
-    }
-    return copilot_wrap_angle(angle);
-}
-
-static int16_t copilot_arc_span(int16_t start, int16_t end) {
-    if (start == 0 && end == 360) {
-        return 360;
-    }
-    int16_t span = (int16_t)(end - start);
-    if (span < 0) {
-        span = (int16_t)(span + 360);
-    }
-    return span;
-}
-
-static int16_t copilot_lerp_angle(int16_t a, int16_t b, uint32_t t, uint32_t t_max) {
-    if (t_max == 0) {
-        return copilot_wrap_angle(b);
-    }
-    int16_t diff = (int16_t)(b - a);
-    if (diff > 180) {
-        diff = (int16_t)(diff - 360);
-    } else if (diff < -180) {
-        diff = (int16_t)(diff + 360);
-    }
-    int32_t value = (int32_t)a + ((int32_t)diff * (int32_t)t) / (int32_t)t_max;
-    return copilot_wrap_angle(value);
-}
-
-static void copilot_lerp_frame(face_arc_keyframe_t *out, const face_arc_keyframe_t *a, const face_arc_keyframe_t *b,
-                               uint32_t t, uint32_t t_max) {
-    if (!out || !a || !b) {
-        return;
-    }
-    int16_t eye_span_a = copilot_arc_span(a->eye_start, a->eye_end);
-    int16_t eye_span_b = copilot_arc_span(b->eye_start, b->eye_end);
-    int16_t eye_center_a = copilot_wrap_angle((int32_t)a->eye_start + eye_span_a / 2);
-    int16_t eye_center_b = copilot_wrap_angle((int32_t)b->eye_start + eye_span_b / 2);
-
-    int16_t eye_span = copilot_lerp_i16(eye_span_a, eye_span_b, t, t_max);
-    int16_t eye_center = 0;
-    if (eye_span_b >= 359) {
-        eye_center = eye_center_a;
-    } else if (eye_span_a >= 359) {
-        eye_center = eye_center_b;
-    } else {
-        eye_center = copilot_lerp_angle(eye_center_a, eye_center_b, t, t_max);
-    }
-
-    if (eye_span >= 359) {
-        out->eye_start = 0;
-        out->eye_end = 360;
-    } else {
-        int16_t start = (int16_t)(eye_center - (eye_span / 2));
-        out->eye_start = copilot_wrap_angle(start);
-        out->eye_end = copilot_wrap_angle(start + eye_span);
-    }
-
-    out->eye_rotation = copilot_lerp_angle(a->eye_rotation, b->eye_rotation, t, t_max);
-    out->eye_offset_y = copilot_lerp_i16(a->eye_offset_y, b->eye_offset_y, t, t_max);
-
-    int16_t mouth_span_a = copilot_arc_span(a->mouth_start, a->mouth_end);
-    int16_t mouth_span_b = copilot_arc_span(b->mouth_start, b->mouth_end);
-    int16_t mouth_center_a = copilot_wrap_angle((int32_t)a->mouth_start + mouth_span_a / 2);
-    int16_t mouth_center_b = copilot_wrap_angle((int32_t)b->mouth_start + mouth_span_b / 2);
-
-    int16_t mouth_span = copilot_lerp_i16(mouth_span_a, mouth_span_b, t, t_max);
-    int16_t mouth_center = 0;
-    if (mouth_span_b >= 359) {
-        mouth_center = mouth_center_a;
-    } else if (mouth_span_a >= 359) {
-        mouth_center = mouth_center_b;
-    } else {
-        mouth_center = copilot_lerp_angle(mouth_center_a, mouth_center_b, t, t_max);
-    }
-
-    if (mouth_span >= 359) {
-        out->mouth_start = 0;
-        out->mouth_end = 360;
-    } else {
-        int16_t start = (int16_t)(mouth_center - (mouth_span / 2));
-        out->mouth_start = copilot_wrap_angle(start);
-        out->mouth_end = copilot_wrap_angle(start + mouth_span);
-    }
-
-    out->mouth_rotation = copilot_lerp_angle(a->mouth_rotation, b->mouth_rotation, t, t_max);
-    out->mouth_offset_y = copilot_lerp_i16(a->mouth_offset_y, b->mouth_offset_y, t, t_max);
-}
-
-static void copilot_apply_arc(lv_obj_t *arc, int16_t start, int16_t end, int16_t rotation) {
-    if (!arc) {
-        return;
-    }
-    start = copilot_wrap_angle_full(start);
-    end = copilot_wrap_angle_full(end);
-    lv_arc_set_angles(arc, (uint16_t)start, (uint16_t)end);
-    lv_arc_set_rotation(arc, (uint16_t)copilot_wrap_angle(rotation));
-}
-
-// blink_ratio is Q8.8 fixed-point (0=open, FP_ONE=closed)
-static void copilot_apply_face(const face_arc_keyframe_t *frame, int16_t blink_ratio) {
-    if (!frame) {
-        return;
-    }
-
-    // --- Eye Animation ---
-    // Not speaking: semicircle (180 degrees, bottom half like a smile)
-    // Speaking: ellipse/full circle (360 degrees) using eye_open_smooth for transition
-    int16_t eye_start, eye_end;
-
-    // Semicircle: 180-360 (bottom half arc, like relaxed/happy eyes)
-    // Full circle: 0-360 (wide open eyes during speech)
-    // Interpolate based on eye_open_smooth (0=semicircle, 255=full circle)
-    uint8_t eye_ratio = s_ui.eye_open_smooth;
-
-    // Base semicircle: 200-340 (140 deg) -> target: 180-360 (180 deg semicircle)
-    // When speaking: interpolate toward 0-360 (full ellipse)
-    if (eye_ratio < 10) {
-        // Not speaking: semicircle (180 degrees, centered at 270 = bottom)
-        eye_start = 180;
-        eye_end = 360;
-    } else if (eye_ratio > 245) {
-        // Fully speaking: complete ellipse
-        eye_start = 0;
-        eye_end = 360;
-    } else {
-        // Transition: expand from semicircle to full circle
-        // Start: 180 -> 0, End: 360 -> 360
-        // eye_start = 180 - (180 * eye_ratio / 255)
-        eye_start = 180 - (int16_t)((180 * eye_ratio) >> 8);
-        eye_end = 360;
-    }
-
-    // Apply blink animation (squeezes eyes closed)
-    if (blink_ratio > 0) {
-        int32_t diff_start = BLINK_EYE_START - eye_start;
-        int32_t diff_end = BLINK_EYE_END - eye_end;
-        eye_start = eye_start + (int16_t)((diff_start * blink_ratio) >> FP_SHIFT);
-        eye_end = eye_end + (int16_t)((diff_end * blink_ratio) >> FP_SHIFT);
-    }
-
-    int16_t eye_span = copilot_arc_span(eye_start, eye_end);
-    bool eye_rounded = eye_span < 350;
-
-    // --- Mouth Animation ---
-    // Not speaking: hidden (opacity 0 handled below)
-    // Speaking: ellipse that scales with audio envelope
-    int16_t mouth_start = 0;
-    int16_t mouth_end = 360;
-    int16_t mouth_span;
-    bool mouth_rounded;
-    bool mouth_visible = false;
-
-    if (s_ui.mouth_open_smooth > 15) {
-        // Speaking: show mouth as scaling ellipse
-        mouth_visible = true;
-
-        // Mouth is always a full ellipse (0-360) when visible
-        mouth_start = 0;
-        mouth_end = 360;
-        mouth_span = 360;
-        mouth_rounded = false;  // Full circle, no rounded caps needed
-    } else {
-        // Not speaking: hide mouth completely
-        mouth_visible = false;
-        mouth_span = 0;
-        mouth_rounded = true;
-    }
-
-    bool force = !s_ui.face_applied;
-    if (force || eye_rounded != s_ui.last_eye_rounded) {
-        lv_obj_set_style_arc_rounded(s_ui.eye_l, eye_rounded, LV_PART_INDICATOR | LV_STATE_DEFAULT);
-        lv_obj_set_style_arc_rounded(s_ui.eye_r, eye_rounded, LV_PART_INDICATOR | LV_STATE_DEFAULT);
-        s_ui.last_eye_rounded = eye_rounded;
-    }
-    if (force || mouth_rounded != s_ui.last_mouth_rounded) {
-        lv_obj_set_style_arc_rounded(s_ui.mouth, mouth_rounded, LV_PART_INDICATOR | LV_STATE_DEFAULT);
-        s_ui.last_mouth_rounded = mouth_rounded;
-    }
-
-    // roll_offset = motion_roll * 6, motion_roll is Q8.8, result in pixels
-    int16_t roll_offset = (int16_t)((s_ui.motion_roll * 6) >> FP_SHIFT);
-
-    // Add breathing animation offset for liveliness
-    int16_t breath = s_ui.breath_offset;
-
-    int16_t eye_center_y = (int16_t)EYE_CENTER_Y + frame->eye_offset_y + roll_offset + breath + FACE_INNER_OFFSET_Y;
-    int16_t mouth_center_y = (int16_t)MOUTH_CENTER_Y + frame->mouth_offset_y + (roll_offset / 2) + (breath / 2) + FACE_INNER_OFFSET_Y;
-
-    int16_t eye_l_x = (int16_t)(EYE_X_L + FACE_INNER_OFFSET_X);
-    int16_t eye_r_x = (int16_t)(EYE_X_R + FACE_INNER_OFFSET_X);
-    int16_t eye_l_y = (int16_t)(eye_center_y - (EYE_SIZE / 2));
-    int16_t eye_r_y = (int16_t)(eye_center_y - (EYE_SIZE / 2));
-
-    // --- Mouth size scaling based on audio envelope ---
-    // Mouth scales from 30% to 100% of MOUTH_SIZE based on envelope
-    // This creates a "talking" effect where mouth opens/closes with speech
-    int16_t mouth_size;
-    if (mouth_visible) {
-        // Scale: min 30% (when mouth_open_smooth ~15) to max 100% (when ~255)
-        // mouth_size = MOUTH_SIZE * (0.3 + 0.7 * (mouth_open_smooth - 15) / 240)
-        int16_t scale_factor = 77 + (int16_t)(((int32_t)(s_ui.mouth_open_smooth - 15) * 179) / 240);
-        if (scale_factor > 255) scale_factor = 255;
-        mouth_size = (int16_t)(((int32_t)MOUTH_SIZE * scale_factor) >> 8);
-        if (mouth_size < 20) mouth_size = 20;  // Minimum visible size
-    } else {
-        mouth_size = 0;
-    }
-
-    // Center mouth position based on scaled size
-    int16_t mouth_x = (int16_t)((FACE_SIZE - mouth_size) / 2 + FACE_INNER_OFFSET_X);
-    int16_t mouth_y = (int16_t)(mouth_center_y - (mouth_size / 2));
-
-    if (force || eye_l_x != s_ui.last_eye_l_x || eye_l_y != s_ui.last_eye_l_y) {
-        lv_obj_set_pos(s_ui.eye_l, eye_l_x, eye_l_y);
-        s_ui.last_eye_l_x = eye_l_x;
-        s_ui.last_eye_l_y = eye_l_y;
-    }
-    if (force || eye_r_x != s_ui.last_eye_r_x || eye_r_y != s_ui.last_eye_r_y) {
-        lv_obj_set_pos(s_ui.eye_r, eye_r_x, eye_r_y);
-        s_ui.last_eye_r_x = eye_r_x;
-        s_ui.last_eye_r_y = eye_r_y;
-    }
-
-    // Update mouth visibility
-    if (force || mouth_visible != s_ui.last_mouth_visible) {
-        if (mouth_visible) {
-            lv_obj_clear_flag(s_ui.mouth, LV_OBJ_FLAG_HIDDEN);
-        } else {
-            lv_obj_add_flag(s_ui.mouth, LV_OBJ_FLAG_HIDDEN);
-        }
-        s_ui.last_mouth_visible = mouth_visible;
-    }
-
-    // Update mouth size and position when visible
-    if (mouth_visible) {
-        if (force || mouth_size != s_ui.last_mouth_size) {
-            lv_obj_set_size(s_ui.mouth, mouth_size, mouth_size);
-            s_ui.last_mouth_size = mouth_size;
-        }
-        if (force || mouth_x != s_ui.last_mouth_x || mouth_y != s_ui.last_mouth_y) {
-            lv_obj_set_pos(s_ui.mouth, mouth_x, mouth_y);
-            s_ui.last_mouth_x = mouth_x;
-            s_ui.last_mouth_y = mouth_y;
-        }
-    }
-
-    if (force || eye_start != s_ui.last_eye_start || eye_end != s_ui.last_eye_end ||
-        frame->eye_rotation != s_ui.last_eye_rotation) {
-        copilot_apply_arc(s_ui.eye_l, eye_start, eye_end, frame->eye_rotation);
-        copilot_apply_arc(s_ui.eye_r, eye_start, eye_end, frame->eye_rotation);
-        s_ui.last_eye_start = eye_start;
-        s_ui.last_eye_end = eye_end;
-        s_ui.last_eye_rotation = frame->eye_rotation;
-    }
-
-    // Apply mouth arc angles (full ellipse when visible)
-    if (mouth_visible && (force || mouth_start != s_ui.last_mouth_start || mouth_end != s_ui.last_mouth_end ||
-        frame->mouth_rotation != s_ui.last_mouth_rotation)) {
-        copilot_apply_arc(s_ui.mouth, mouth_start, mouth_end, frame->mouth_rotation);
-        s_ui.last_mouth_start = mouth_start;
-        s_ui.last_mouth_end = mouth_end;
-        s_ui.last_mouth_rotation = frame->mouth_rotation;
-    }
-
-    s_ui.face_applied = true;
-}
-
-static void copilot_arc_style(lv_obj_t *arc, lv_color_t color, uint8_t width) {
-    lv_obj_set_style_arc_color(arc, color, LV_PART_INDICATOR | LV_STATE_DEFAULT);
-    lv_obj_set_style_arc_width(arc, width, LV_PART_INDICATOR | LV_STATE_DEFAULT);
-    lv_obj_set_style_arc_opa(arc, 255, LV_PART_INDICATOR | LV_STATE_DEFAULT);
-    lv_obj_set_style_arc_opa(arc, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(arc, 0, LV_PART_KNOB | LV_STATE_DEFAULT);
-    lv_obj_set_style_arc_rounded(arc, true, LV_PART_INDICATOR | LV_STATE_DEFAULT);
-    lv_obj_clear_flag(arc, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+static void copilot_blob_style(lv_obj_t *obj, lv_color_t fill, lv_color_t border, uint8_t border_w) {
+    lv_obj_set_style_bg_color(obj, fill, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(obj, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_color(obj, border, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_opa(obj, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_border_width(obj, border_w, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_CLICKABLE);
 }
 
 static void copilot_ring_set_opa(lv_obj_t *line, lv_opa_t opa) {
     lv_obj_set_style_line_opa(line, opa, LV_PART_MAIN | LV_STATE_DEFAULT);
 }
 
+static bool copilot_voice_speaking(uint32_t now) {
+    copilot_voice_state_t voice_state = copilot_voice_ui_get_state();
+    uint8_t mouth_open = copilot_voice_ui_get_mouth_open();
+    if (voice_state == VOICE_STATE_SPEAKING || mouth_open > 18) {
+        s_ui.speaking_until_ms = now + SPEAKING_HOLD_MS;
+        return true;
+    }
+    return now < s_ui.speaking_until_ms;
+}
+
+static bool copilot_manual_speaking(uint32_t now) {
+    if (!s_ui.manual_speaking) {
+        return false;
+    }
+    if (s_ui.manual_speaking_latched) {
+        return true;
+    }
+    if (now < s_ui.manual_speaking_until_ms) {
+        return true;
+    }
+    s_ui.manual_speaking = false;
+    return false;
+}
+
+static bool copilot_is_speaking(uint32_t now) {
+    return copilot_voice_speaking(now) || copilot_manual_speaking(now);
+}
+
+static int16_t copilot_wave_offset(uint32_t now, bool speaking) {
+    uint32_t phase = (now / (speaking ? 95 : 520)) & 3;
+    int16_t amp = speaking ? 9 : 2;
+    if (phase == 0) return amp;
+    if (phase == 1) return amp / 2;
+    if (phase == 2) return (int16_t)-amp;
+    return (int16_t)(-amp / 2);
+}
+
+static uint8_t copilot_speaking_pulse(uint32_t now) {
+    switch ((now / 85) & 3) {
+        case 0: return 255;
+        case 1: return 110;
+        case 2: return 215;
+        default: return 70;
+    }
+}
+
 static void copilot_apply_motion_transform(void) {
-#if CONFIG_COPILOT_USE_FLOAT_MOTION
-    float ax = (float)s_ui.motion_current.ax / (float)FP_ONE;
-    float ay = (float)s_ui.motion_current.ay / (float)FP_ONE;
-    float yaw = (float)s_ui.motion_current.yaw_deg / (float)FP_ONE;
-
-    if (ax > 1.0f) ax = 1.0f;
-    if (ax < -1.0f) ax = -1.0f;
-    if (ay > 1.0f) ay = 1.0f;
-    if (ay < -1.0f) ay = -1.0f;
-
-    float max_shift = (float)CONFIG_COPILOT_MOTION_MAX_SHIFT_PX;
-    int16_t shift_x = (int16_t)(ay * max_shift * (float)MOTION_SHIFT_X_SIGN);
-    int16_t shift_y = (int16_t)(ax * max_shift * (float)MOTION_SHIFT_Y_SIGN);
-
-    float max_angle = (float)CONFIG_COPILOT_MOTION_MAX_ANGLE_DEG;
-    if (max_angle < 1.0f) {
-        max_angle = 1.0f;
-    }
-    if (yaw > max_angle) yaw = max_angle;
-    if (yaw < -max_angle) yaw = -max_angle;
-
-    if (s_ui.uneasy_until_ms && lv_tick_get() < s_ui.uneasy_until_ms) {
-        float shake = ((lv_tick_get() / 90) % 2) ? 3.0f : -3.0f;
-        yaw += shake;
-    }
-
-    float yaw_norm = (yaw * (float)MOTION_YAW_SIGN) / max_angle;
-    if (yaw_norm > 1.0f) yaw_norm = 1.0f;
-    if (yaw_norm < -1.0f) yaw_norm = -1.0f;
-    s_ui.motion_roll = (int16_t)(yaw_norm * (float)FP_ONE);
-
-    lv_obj_set_pos(s_ui.face_root, FACE_X + shift_x, FACE_Y + shift_y);
-#else
     int16_t ax = s_ui.motion_current.ax;
     int16_t ay = s_ui.motion_current.ay;
     int16_t yaw = s_ui.motion_current.yaw_deg;
 
-    // Clamp to -1.0 to +1.0 (Q8.8: -256 to +256)
     if (ax > FP_ONE) ax = FP_ONE;
     if (ax < -FP_ONE) ax = -FP_ONE;
     if (ay > FP_ONE) ay = FP_ONE;
     if (ay < -FP_ONE) ay = -FP_ONE;
 
-    // max_shift in pixels, convert to Q8.8 for calculation
     int16_t max_shift = CONFIG_COPILOT_MOTION_MAX_SHIFT_PX;
-    // shift = ay * max_shift (ay is Q8.8, result in pixels)
     int16_t shift_x = (int16_t)(((int32_t)ay * max_shift * MOTION_SHIFT_X_SIGN) >> FP_SHIFT);
     int16_t shift_y = (int16_t)(((int32_t)ax * max_shift * MOTION_SHIFT_Y_SIGN) >> FP_SHIFT);
 
     int16_t max_angle = CONFIG_COPILOT_MOTION_MAX_ANGLE_DEG;
     if (max_angle < 1) max_angle = 1;
-    // yaw is in Q8.8 degrees, clamp to max_angle
     int16_t max_angle_fp = max_angle << FP_SHIFT;
     if (yaw > max_angle_fp) yaw = max_angle_fp;
     if (yaw < -max_angle_fp) yaw = -max_angle_fp;
 
-    if (s_ui.uneasy_until_ms && lv_tick_get() < s_ui.uneasy_until_ms) {
-        int16_t shake = ((lv_tick_get() / 90) % 2) ? (3 << FP_SHIFT) : (-3 << FP_SHIFT);
-        yaw += shake;
-    }
-
-    // motion_roll = (yaw * MOTION_YAW_SIGN) / max_angle, result is Q8.8
-    // = (yaw * MOTION_YAW_SIGN * FP_ONE) / max_angle_fp
     s_ui.motion_roll = (int16_t)(((int32_t)yaw * MOTION_YAW_SIGN * FP_ONE) / max_angle_fp);
     if (s_ui.motion_roll > FP_ONE) s_ui.motion_roll = FP_ONE;
     if (s_ui.motion_roll < -FP_ONE) s_ui.motion_roll = -FP_ONE;
 
-    lv_obj_set_pos(s_ui.face_root, FACE_X + shift_x, FACE_Y + shift_y);
-#endif
+    lv_obj_set_pos(s_ui.face_root, FACE_BOX_X + shift_x, FACE_BOX_Y + shift_y);
 }
 
-// Fixed-point smoothing alpha = 0.18 ≈ 46/256
-#define MOTION_ALPHA 46
-
-// Returns true if motion changed enough to warrant redraw
 static bool copilot_update_motion(void) {
     int16_t old_ax = s_ui.motion_current.ax;
     int16_t old_ay = s_ui.motion_current.ay;
     int16_t old_yaw = s_ui.motion_current.yaw_deg;
-    
-    // Exponential smoothing: current += (target - current) * alpha
-    // Using integer arithmetic: current += ((target - current) * ALPHA) >> 8
+
     s_ui.motion_current.ax += (int16_t)(((int32_t)(s_ui.motion_target.ax - s_ui.motion_current.ax) * MOTION_ALPHA) >> FP_SHIFT);
     s_ui.motion_current.ay += (int16_t)(((int32_t)(s_ui.motion_target.ay - s_ui.motion_current.ay) * MOTION_ALPHA) >> FP_SHIFT);
     s_ui.motion_current.yaw_deg += (int16_t)(((int32_t)(s_ui.motion_target.yaw_deg - s_ui.motion_current.yaw_deg) * MOTION_ALPHA) >> FP_SHIFT);
     s_ui.motion_current.speed += (int16_t)(((int32_t)(s_ui.motion_target.speed - s_ui.motion_current.speed) * MOTION_ALPHA) >> FP_SHIFT);
-    
-    // Check if changed significantly (threshold ~1% of range)
-    int16_t dx = s_ui.motion_current.ax - old_ax;
-    int16_t dy = s_ui.motion_current.ay - old_ay;
-    int16_t dyaw = s_ui.motion_current.yaw_deg - old_yaw;
-    if (dx < 0) dx = -dx;
-    if (dy < 0) dy = -dy;
-    if (dyaw < 0) dyaw = -dyaw;
-    
-    bool changed = (dx > 2 || dy > 2 || dyaw > 2);
+
+    bool changed = copilot_abs_i16((int16_t)(s_ui.motion_current.ax - old_ax)) > 2 ||
+                   copilot_abs_i16((int16_t)(s_ui.motion_current.ay - old_ay)) > 2 ||
+                   copilot_abs_i16((int16_t)(s_ui.motion_current.yaw_deg - old_yaw)) > 2;
     if (changed) {
         copilot_apply_motion_transform();
     }
     return changed;
 }
 
-static void copilot_trigger_uneasy(void) {
-    uint32_t now = lv_tick_get();
-    if (now < s_ui.uneasy_cooldown_ms) {
-        return;
-    }
+static void copilot_apply_head(uint32_t now, bool speaking) {
+    int16_t target = speaking ? 255 : 0;
+    int16_t delta = (int16_t)target - (int16_t)s_ui.mouth_progress;
+    uint8_t alpha = speaking ? 96 : 52;
+    s_ui.mouth_progress = (uint8_t)((int16_t)s_ui.mouth_progress + ((delta * alpha) >> 8));
 
-    s_ui.uneasy_cooldown_ms = now + 1200;
-    s_ui.uneasy_until_ms = now + 900;
-    s_ui.uneasy_restore_expr = s_ui.expr_current;
-    s_ui.uneasy_restore_id = s_ui.expr_change_id + 1;
+    uint8_t state_open = s_ui.mouth_progress;
+    uint8_t mouth_open = speaking ? (uint8_t)(((uint16_t)state_open * copilot_speaking_pulse(now)) / 255) : state_open;
+    int16_t wobble = copilot_wave_offset(now, speaking);
+    int16_t roll = (int16_t)((s_ui.motion_roll * 11) >> FP_SHIFT);
+    int16_t squash = speaking ? (mouth_open / 38) : 0;
 
-    copilot_ui_set_expression(COPILOT_EXPR_DIZZY, 220);
-}
+    int16_t head_w = HEAD_W + squash;
+    int16_t head_h = HEAD_H - (squash / 2);
+    int16_t head_x = HEAD_X + roll - (squash / 2);
+    int16_t head_y = HEAD_Y + (wobble / 2) + (squash / 3);
 
-// Returns Q8.8 fixed-point blink ratio (0=open, FP_ONE=closed)
-// Smooth continuous animation with easing for cute, natural blinks
-static int16_t copilot_update_blink(uint32_t now) {
-    if (s_ui.blink_phase == 0) {
-        // Waiting phase - eyes open
-        if (now >= s_ui.next_blink_ms) {
-            s_ui.blink_phase = 1;
-            s_ui.blink_phase_start = now;
-        }
-        return 0;
-    }
+    lv_obj_set_size(s_ui.cheek_l, CHEEK_W, CHEEK_H);
+    lv_obj_set_size(s_ui.cheek_r, CHEEK_W, CHEEK_H);
+    lv_obj_set_pos(s_ui.cheek_l, head_x - (CHEEK_W / 4), head_y + (HEAD_H * 42) / 100);
+    lv_obj_set_pos(s_ui.cheek_r, head_x + head_w - ((CHEEK_W * 3) / 4), head_y + (HEAD_H * 42) / 100);
 
-    if (s_ui.blink_phase == 1) {
-        // Closing phase - smooth ease-in
-        uint32_t elapsed = now - s_ui.blink_phase_start;
-        if (elapsed >= BLINK_CLOSE_MS) {
-            s_ui.blink_phase = 2;
-            s_ui.blink_phase_start = now;
-            return FP_ONE;  // Fully closed
-        }
-        // Smooth interpolation with ease-in (fast close)
-        uint32_t eased = copilot_ease_in_out(elapsed, BLINK_CLOSE_MS);
-        return (int16_t)((eased * FP_ONE) / BLINK_CLOSE_MS);
-    }
+    lv_obj_set_size(s_ui.head, head_w, head_h);
+    lv_obj_set_pos(s_ui.head, head_x, head_y);
 
-    if (s_ui.blink_phase == 2) {
-        // Opening phase - smooth ease-out (slow open for cute effect)
-        uint32_t elapsed = now - s_ui.blink_phase_start;
-        if (elapsed >= BLINK_OPEN_MS) {
-            s_ui.blink_phase = 0;
-            // Random interval with some variation
-            uint32_t jitter = (now * 7919) % BLINK_INTERVAL_JITTER;
-            s_ui.next_blink_ms = now + BLINK_INTERVAL_MIN + jitter;
-            return 0;  // Fully open
-        }
-        // Smooth interpolation with ease-out (slow open)
-        uint32_t eased = copilot_ease_in_out(elapsed, BLINK_OPEN_MS);
-        return FP_ONE - (int16_t)((eased * FP_ONE) / BLINK_OPEN_MS);
-    }
+    int16_t patch_w = FACE_PATCH_W + (squash / 2);
+    int16_t patch_h = FACE_PATCH_H - (squash / 3);
+    int16_t patch_x = head_x + (head_w - patch_w) / 2;
+    int16_t patch_y = head_y + (HEAD_H * 39) / 100 - (squash / 4);
+    lv_obj_set_size(s_ui.face_patch, patch_w, patch_h);
+    lv_obj_set_pos(s_ui.face_patch, patch_x, patch_y);
 
-    return 0;
-}
+    int16_t eye_y = head_y + (HEAD_H * 24) / 100 + (speaking ? wobble / 4 : 0);
+    int16_t eye_gap = (HEAD_W * 18) / 100;
+    int16_t eye_l_x = head_x + (head_w / 2) - eye_gap - EYE_W;
+    int16_t eye_r_x = head_x + (head_w / 2) + eye_gap;
+    lv_obj_set_size(s_ui.eye_l, EYE_W, EYE_H);
+    lv_obj_set_size(s_ui.eye_r, EYE_W, EYE_H);
+    lv_obj_set_pos(s_ui.eye_l, eye_l_x, eye_y);
+    lv_obj_set_pos(s_ui.eye_r, eye_r_x, eye_y + (speaking ? 2 : 0));
+    lv_obj_set_size(s_ui.eye_l_cut, EYE_CUT_W, EYE_CUT_H);
+    lv_obj_set_size(s_ui.eye_r_cut, EYE_CUT_W, EYE_CUT_H);
+    lv_obj_set_pos(s_ui.eye_l_cut, EYE_W - EYE_CUT_W + 1, (EYE_H - EYE_CUT_H) / 2);
+    lv_obj_set_pos(s_ui.eye_r_cut, -1, (EYE_H - EYE_CUT_H) / 2);
+    lv_obj_set_size(s_ui.eye_l_spark, EYE_SPARK_W, EYE_SPARK_H);
+    lv_obj_set_size(s_ui.eye_r_spark, EYE_SPARK_W, EYE_SPARK_H);
+    lv_obj_set_pos(s_ui.eye_l_spark, EYE_W / 4, EYE_H / 5);
+    lv_obj_set_pos(s_ui.eye_r_spark, EYE_W / 4, EYE_H / 5);
 
-// Update breathing animation - returns vertical offset in pixels
-static int16_t copilot_update_breath(uint32_t now) {
-    if (s_ui.breath_start_ms == 0) {
-        s_ui.breath_start_ms = now;
-    }
+    int16_t nose_x = patch_x + (patch_w - NOSE_W) / 2 + (roll / 4);
+    int16_t nose_y = patch_y + (patch_h * 40) / 100 + (speaking ? wobble / 5 : 0);
+    lv_obj_set_size(s_ui.nose, NOSE_W, NOSE_H);
+    lv_obj_set_pos(s_ui.nose, nose_x, nose_y);
 
-    uint32_t elapsed = (now - s_ui.breath_start_ms) % BREATH_CYCLE_MS;
-    int16_t angle = (int16_t)((elapsed * 360) / BREATH_CYCLE_MS);
+    int16_t mouth_w = MOUTH_IDLE_W + (int16_t)(((MOUTH_OPEN_W - MOUTH_IDLE_W) * mouth_open) >> 8);
+    int16_t mouth_h = MOUTH_IDLE_H + (int16_t)(((MOUTH_OPEN_H - MOUTH_IDLE_H) * mouth_open) >> 8);
+    int16_t mouth_x = patch_x + (patch_w - mouth_w) / 2;
+    int16_t mouth_y = patch_y + (patch_h * 64) / 100 - (mouth_h / 2);
+    lv_obj_set_size(s_ui.mouth, mouth_w, mouth_h);
+    lv_obj_set_pos(s_ui.mouth, mouth_x, mouth_y);
 
-    // Sine wave for smooth breathing
-    int16_t sin_val = copilot_sin_approx(angle);  // -256 to 256
-    return (int16_t)((sin_val * BREATH_AMPLITUDE) >> 8);
-}
+    if (mouth_open > 28) {
+        int16_t pad = 5 + ((int16_t)mouth_open / 44);
+        lv_obj_clear_flag(s_ui.mouth_inner, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_size(s_ui.mouth_inner, mouth_w - (pad * 2), mouth_h - (pad * 2));
+        lv_obj_set_pos(s_ui.mouth_inner, pad, pad);
 
-static void copilot_anim_timer(lv_timer_t *timer) {
-    (void)timer;
-    uint32_t now = lv_tick_get();
-    bool need_redraw = false;
-    static int16_t last_blink_ratio = -1;
-    static int16_t last_breath_offset = 0;
-
-    // Record frame for FPS calculation
-    copilot_perf_frame_tick();
-
-    // Expression transition with easing
-    if (s_ui.expr_animating) {
-        uint32_t elapsed = now - s_ui.expr_start_ms;
-        if (elapsed >= s_ui.expr_duration_ms) {
-            s_ui.expr_animating = false;
-            s_ui.expr_cur = s_ui.expr_to;
-        } else {
-            // Apply ease-in-out for smooth expression transitions
-            uint32_t eased_elapsed = copilot_ease_in_out(elapsed, s_ui.expr_duration_ms);
-            copilot_lerp_frame(&s_ui.expr_cur, &s_ui.expr_from, &s_ui.expr_to, eased_elapsed, s_ui.expr_duration_ms);
-        }
-        need_redraw = true;
-    }
-
-    if (s_ui.uneasy_until_ms && now >= s_ui.uneasy_until_ms) {
-        s_ui.uneasy_until_ms = 0;
-        if (s_ui.expr_change_id == s_ui.uneasy_restore_id) {
-            copilot_ui_set_expression(s_ui.uneasy_restore_expr, 300);  // Slightly longer recovery
-        }
-        need_redraw = true;
-    }
-
-    if (copilot_update_motion()) {
-        need_redraw = true;
-    }
-
-    if (s_ui.touch_pending) {
-        s_ui.touch_pending = false;
-        copilot_touch_trigger(0, 0);
-    }
-
-    if (s_ui.touch_flash_active && now >= s_ui.touch_flash_until_ms) {
-        s_ui.touch_flash_active = false;
-        if (s_ui.touch_flash_owns_ring) {
-            s_ui.touch_flash_owns_ring = false;
-            copilot_ui_ring_show(false);
-        }
-    }
-
-    // Smooth blink animation
-    int16_t blink_ratio = copilot_update_blink(now);
-    if (blink_ratio != last_blink_ratio) {
-        last_blink_ratio = blink_ratio;
-        need_redraw = true;
-    }
-
-    // Breathing animation for liveliness
-    int16_t breath_offset = copilot_update_breath(now);
-    if (breath_offset != last_breath_offset) {
-        last_breath_offset = breath_offset;
-        s_ui.breath_offset = breath_offset;
-        need_redraw = true;
-    }
-
-    // Voice-UI integration: update mouth opening (optimized to reduce overhead)
-    // Only check every 2 frames (~66ms) to reduce cross-module calls
-    static uint8_t voice_check_counter = 0;
-    static uint8_t cached_raw_mouth = 0;
-
-    voice_check_counter++;
-    if (voice_check_counter >= 2) {
-        voice_check_counter = 0;
-        cached_raw_mouth = copilot_voice_ui_get_mouth_open();
-
-        // Check for voice state changes (less frequent)
-        copilot_voice_state_t voice_state = copilot_voice_ui_get_state();
-        if (voice_state != s_ui.last_voice_state) {
-            s_ui.last_voice_state = voice_state;
-
-            // Update is_speaking flag for eye/mouth animation
-            bool was_speaking = s_ui.is_speaking;
-            s_ui.is_speaking = (voice_state == VOICE_STATE_SPEAKING);
-
-            // Ring only shows during SPEAKING state (not LISTENING/PROCESSING)
-            if (s_ui.is_speaking) {
-                copilot_ui_ring_show(true);
-            } else if (was_speaking && !s_ui.is_speaking) {
-                // Just stopped speaking - hide ring
-                if (!s_ui.touch_flash_active) {
-                    copilot_ui_ring_show(false);
-                }
-            }
-
-            need_redraw = true;
-        }
-    }
-
-    // Exponential smoothing for mouth animation (runs every frame for smooth animation)
-    // alpha ~0.3 for faster response: smooth = (smooth * 179 + raw * 77) >> 8
-    uint8_t old_mouth = s_ui.mouth_open_smooth;
-    s_ui.mouth_open_smooth = (uint8_t)(
-        ((uint16_t)s_ui.mouth_open_smooth * 179 + (uint16_t)cached_raw_mouth * 77) >> 8
-    );
-
-    // Eye smoothing: transition between semicircle (not speaking) and ellipse (speaking)
-    // Target: 0 when not speaking, 255 when speaking
-    uint8_t eye_target = s_ui.is_speaking ? 255 : 0;
-    uint8_t old_eye = s_ui.eye_open_smooth;
-    // Faster smoothing for snappy response (alpha ~0.25)
-    s_ui.eye_open_smooth = (uint8_t)(
-        ((uint16_t)s_ui.eye_open_smooth * 192 + (uint16_t)eye_target * 64) >> 8
-    );
-
-    // Eye animation triggers redraw when changed
-    if (s_ui.eye_open_smooth != old_eye) {
-        need_redraw = true;
-    }
-
-    // Mouth animation triggers redraw only when changed significantly
-    if (s_ui.mouth_open_smooth > 10 &&
-        (s_ui.mouth_open_smooth > old_mouth + 3 || old_mouth > s_ui.mouth_open_smooth + 3)) {
-        need_redraw = true;
-    }
-
-    // Always redraw during animations, skip only when truly idle
-    if (need_redraw || !s_ui.face_applied) {
-        copilot_apply_face(&s_ui.expr_cur, blink_ratio);
+        lv_obj_clear_flag(s_ui.tooth, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_size(s_ui.tooth, mouth_w - (pad * 3), 5);
+        lv_obj_set_pos(s_ui.tooth, (pad * 3) / 2, pad);
+    } else {
+        lv_obj_add_flag(s_ui.mouth_inner, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_ui.tooth, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -825,17 +340,41 @@ static bool copilot_inside_circle(lv_coord_t x, lv_coord_t y) {
     return (dx * dx + dy * dy) <= (r * r);
 }
 
-static void copilot_touch_trigger(int16_t x, int16_t y) {
-    (void)x;
-    (void)y;
+static void copilot_anim_timer(lv_timer_t *timer) {
+    (void)timer;
     uint32_t now = lv_tick_get();
-    s_ui.touch_flash_until_ms = now + TOUCH_FLASH_MS;
-    if (!s_ui.touch_flash_active) {
-        s_ui.touch_flash_active = true;
-        s_ui.touch_flash_owns_ring = !s_ui.ring_visible;
+    copilot_perf_frame_tick();
+
+    bool motion_changed = copilot_update_motion();
+
+    if (s_ui.touch_flash_active && now >= s_ui.touch_flash_until_ms) {
+        s_ui.touch_flash_active = false;
         if (s_ui.touch_flash_owns_ring) {
-            copilot_ui_ring_show(true);
+            s_ui.touch_flash_owns_ring = false;
+            copilot_ui_ring_show(false);
         }
+    }
+
+    bool speaking = copilot_is_speaking(now);
+    bool speaking_changed = speaking != s_ui.last_speaking;
+    if (speaking_changed) {
+        s_ui.last_speaking = speaking;
+        if (speaking) {
+            copilot_ui_ring_show(true);
+        } else if (!s_ui.touch_flash_active) {
+            copilot_ui_ring_show(false);
+        }
+    }
+
+    bool mouth_animating = (speaking && s_ui.mouth_progress < 250) ||
+                           (!speaking && s_ui.mouth_progress > 4);
+    uint32_t idle_pose_bucket = now / 390;
+    bool idle_pose_changed = !speaking && idle_pose_bucket != s_ui.last_idle_pose_bucket;
+    if (idle_pose_changed) {
+        s_ui.last_idle_pose_bucket = idle_pose_bucket;
+    }
+    if (speaking || speaking_changed || mouth_animating || motion_changed || idle_pose_changed) {
+        copilot_apply_head(now, speaking);
     }
 }
 
@@ -846,87 +385,86 @@ void copilot_ui_init(lv_obj_t *root) {
 
     memset(&s_ui, 0, sizeof(s_ui));
     lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_color_t ink = lv_color_hex(INK_COLOR);
+    lv_color_t paper = lv_color_hex(PAPER_COLOR);
+
     s_ui.root = lv_obj_create(root);
     lv_obj_set_size(s_ui.root, LCD_H_RES, LCD_V_RES);
     lv_obj_set_pos(s_ui.root, 0, 0);
     lv_obj_set_scrollbar_mode(s_ui.root, LV_SCROLLBAR_MODE_OFF);
     lv_obj_clear_flag(s_ui.root, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_set_style_bg_color(s_ui.root, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_grad_color(s_ui.root, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_grad_dir(s_ui.root, LV_GRAD_DIR_NONE, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(s_ui.root, ink, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(s_ui.root, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(s_ui.root, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
     int16_t outer_radius = (int16_t)((RING_SIZE / 2) - (RING_OUTER_WIDTH / 2));
-    int16_t inner_radius = outer_radius;
     copilot_build_ring_points(s_ring_outer_pts, outer_radius);
-    copilot_build_ring_points(s_ring_inner_pts, inner_radius);
+    copilot_build_ring_points(s_ring_inner_pts, outer_radius);
 
     s_ui.ring_outer = lv_line_create(s_ui.root);
     lv_obj_set_size(s_ui.ring_outer, RING_SIZE, RING_SIZE);
     lv_obj_set_pos(s_ui.ring_outer, RING_X, RING_Y);
     lv_line_set_points(s_ui.ring_outer, s_ring_outer_pts, RING_POINTS);
-    lv_obj_set_style_line_width(s_ui.ring_outer, RING_OUTER_WIDTH, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_line_color(s_ui.ring_outer, lv_color_hex(0x1AB5FF), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_line_rounded(s_ui.ring_outer, false, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_line_opa(s_ui.ring_outer, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(s_ui.ring_outer, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(s_ui.ring_outer, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_clear_flag(s_ui.ring_outer, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(s_ui.ring_outer, LV_OBJ_FLAG_CLICKABLE);
+    copilot_line_style(s_ui.ring_outer, lv_color_hex(0x1AB5FF), RING_OUTER_WIDTH);
     lv_obj_add_flag(s_ui.ring_outer, LV_OBJ_FLAG_HIDDEN);
+    copilot_ring_set_opa(s_ui.ring_outer, 0);
 
     s_ui.ring_inner = lv_line_create(s_ui.root);
     lv_obj_set_size(s_ui.ring_inner, RING_SIZE, RING_SIZE);
     lv_obj_set_pos(s_ui.ring_inner, RING_X, RING_Y);
     lv_line_set_points(s_ui.ring_inner, s_ring_inner_pts, RING_POINTS);
-    lv_obj_set_style_line_width(s_ui.ring_inner, RING_INNER_WIDTH, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_line_color(s_ui.ring_inner, lv_color_hex(0x61E6FF), LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_line_rounded(s_ui.ring_inner, false, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_line_opa(s_ui.ring_inner, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_bg_opa(s_ui.ring_inner, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_border_width(s_ui.ring_inner, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_clear_flag(s_ui.ring_inner, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(s_ui.ring_inner, LV_OBJ_FLAG_CLICKABLE);
+    copilot_line_style(s_ui.ring_inner, lv_color_hex(0x61E6FF), RING_INNER_WIDTH);
     lv_obj_add_flag(s_ui.ring_inner, LV_OBJ_FLAG_HIDDEN);
+    copilot_ring_set_opa(s_ui.ring_inner, 0);
 
     s_ui.face_root = lv_obj_create(s_ui.root);
-    lv_obj_set_size(s_ui.face_root, FACE_SIZE, FACE_SIZE);
-    lv_obj_set_pos(s_ui.face_root, FACE_X, FACE_Y);
+    lv_obj_set_size(s_ui.face_root, FACE_BOX_SIZE, FACE_BOX_SIZE);
+    lv_obj_set_pos(s_ui.face_root, FACE_BOX_X, FACE_BOX_Y);
     lv_obj_set_scrollbar_mode(s_ui.face_root, LV_SCROLLBAR_MODE_OFF);
     lv_obj_clear_flag(s_ui.face_root, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_bg_opa(s_ui.face_root, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(s_ui.face_root, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_pad_all(s_ui.face_root, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-    lv_color_t line_color = lv_color_hex(0xE6F2FF);
+    s_ui.cheek_l = lv_obj_create(s_ui.face_root);
+    s_ui.cheek_r = lv_obj_create(s_ui.face_root);
+    s_ui.head = lv_obj_create(s_ui.face_root);
+    s_ui.face_patch = lv_obj_create(s_ui.face_root);
+    s_ui.eye_l = lv_obj_create(s_ui.face_root);
+    s_ui.eye_r = lv_obj_create(s_ui.face_root);
+    s_ui.eye_l_cut = lv_obj_create(s_ui.eye_l);
+    s_ui.eye_r_cut = lv_obj_create(s_ui.eye_r);
+    s_ui.eye_l_spark = lv_obj_create(s_ui.eye_l);
+    s_ui.eye_r_spark = lv_obj_create(s_ui.eye_r);
+    s_ui.nose = lv_obj_create(s_ui.face_root);
+    s_ui.mouth = lv_obj_create(s_ui.face_root);
+    s_ui.mouth_inner = lv_obj_create(s_ui.mouth);
+    s_ui.tooth = lv_obj_create(s_ui.mouth);
 
-    s_ui.eye_l = lv_arc_create(s_ui.face_root);
-    s_ui.eye_r = lv_arc_create(s_ui.face_root);
-    s_ui.mouth = lv_arc_create(s_ui.face_root);
+    copilot_blob_style(s_ui.cheek_l, ink, paper, HEAD_BORDER);
+    copilot_blob_style(s_ui.cheek_r, ink, paper, HEAD_BORDER);
+    copilot_blob_style(s_ui.head, ink, paper, HEAD_BORDER);
+    copilot_blob_style(s_ui.face_patch, paper, ink, HEAD_BORDER / 2);
+    copilot_blob_style(s_ui.eye_l, ink, ink, 0);
+    copilot_blob_style(s_ui.eye_r, ink, ink, 0);
+    copilot_blob_style(s_ui.eye_l_cut, paper, paper, 0);
+    copilot_blob_style(s_ui.eye_r_cut, paper, paper, 0);
+    copilot_blob_style(s_ui.eye_l_spark, paper, paper, 0);
+    copilot_blob_style(s_ui.eye_r_spark, paper, paper, 0);
+    copilot_blob_style(s_ui.nose, ink, ink, 0);
+    copilot_blob_style(s_ui.mouth, ink, ink, 0);
+    copilot_blob_style(s_ui.mouth_inner, paper, paper, 0);
+    copilot_blob_style(s_ui.tooth, paper, paper, 0);
 
-    lv_obj_set_size(s_ui.eye_l, EYE_SIZE, EYE_SIZE);
-    lv_obj_set_size(s_ui.eye_r, EYE_SIZE, EYE_SIZE);
-    lv_obj_set_size(s_ui.mouth, MOUTH_SIZE, MOUTH_SIZE);
-    lv_arc_set_bg_angles(s_ui.eye_l, 0, 360);
-    lv_arc_set_bg_angles(s_ui.eye_r, 0, 360);
-    lv_arc_set_bg_angles(s_ui.mouth, 0, 360);
+    s_ui.motion_target.speed = FP_ONE;
+    s_ui.motion_current.speed = FP_ONE;
+    copilot_apply_head(lv_tick_get(), false);
 
-    copilot_arc_style(s_ui.eye_l, line_color, EYE_LINE_WIDTH);
-    copilot_arc_style(s_ui.eye_r, line_color, EYE_LINE_WIDTH);
-    copilot_arc_style(s_ui.mouth, line_color, MOUTH_LINE_WIDTH);
-
-    s_ui.expr_current = COPILOT_EXPR_NEUTRAL;
-    s_ui.expr_cur = kFaceKeyframes[s_ui.expr_current];
-    copilot_apply_face(&s_ui.expr_cur, 0);
-
-    // Animation timer at 40fps for smooth animations
     s_ui.anim_timer = lv_timer_create(copilot_anim_timer, ANIM_TIMER_MS, nullptr);
-    s_ui.next_blink_ms = lv_tick_get() + 1500;  // First blink sooner
-    s_ui.breath_start_ms = lv_tick_get();
     s_ui.ready = true;
 
-    LOGI_UI( "UI ready");
+    LOGI_UI("UI ready: rubber-hose head, states=idle/speaking");
 }
 
 bool copilot_ui_is_ready(void) {
@@ -938,26 +476,22 @@ void copilot_ui_set_expression(copilot_expr_t expr, uint32_t duration_ms) {
         return;
     }
 
-    if (expr == s_ui.expr_current && !s_ui.expr_animating) {
-        return;
+    uint32_t now = lv_tick_get();
+    if (expr == COPILOT_EXPR_SPEAKING) {
+        s_ui.manual_speaking = true;
+        if (duration_ms > 0) {
+            s_ui.manual_speaking_latched = false;
+            s_ui.manual_speaking_until_ms = now + duration_ms;
+        } else {
+            s_ui.manual_speaking_latched = true;
+        }
+        LOGI_UI("Expression speaking duration=%u", (unsigned)duration_ms);
+    } else {
+        s_ui.manual_speaking = false;
+        s_ui.manual_speaking_latched = false;
+        s_ui.manual_speaking_until_ms = 0;
+        LOGI_UI("Expression idle");
     }
-
-    LOGI_UI( "Expression change: %d -> %d (%u ms)", (int)s_ui.expr_current, (int)expr, (unsigned)duration_ms);
-    s_ui.expr_change_id++;
-    s_ui.expr_current = expr;
-
-    if (duration_ms == 0) {
-        s_ui.expr_animating = false;
-        s_ui.expr_cur = kFaceKeyframes[expr];
-        copilot_apply_face(&s_ui.expr_cur, 0);
-        return;
-    }
-
-    s_ui.expr_from = s_ui.expr_cur;
-    s_ui.expr_to = kFaceKeyframes[expr];
-    s_ui.expr_start_ms = lv_tick_get();
-    s_ui.expr_duration_ms = duration_ms;
-    s_ui.expr_animating = true;
 }
 
 void copilot_ui_set_motion(const copilot_motion_t *motion) {
@@ -966,29 +500,12 @@ void copilot_ui_set_motion(const copilot_motion_t *motion) {
     }
 
 #ifdef CONFIG_COPILOT_MOTION_SOURCE_DISABLED
-    // Motion disabled - ignore all input
     return;
 #endif
 
     s_ui.motion_target = *motion;
     ESP_LOGD(TAG, "Motion target ax=%d ay=%d yaw=%d speed=%d (Q8.8)",
              motion->ax, motion->ay, motion->yaw_deg, motion->speed);
-
-    // Check uneasy threshold using fixed-point
-    // acc = max(|ax|, |ay|), values are Q8.8
-    int16_t ax_abs = (motion->ax >= 0) ? motion->ax : -motion->ax;
-    int16_t ay_abs = (motion->ay >= 0) ? motion->ay : -motion->ay;
-    int16_t acc = (ax_abs > ay_abs) ? ax_abs : ay_abs;
-    
-    // acc_threshold = CONFIG_COPILOT_UNEASY_ACCEL_CG / 100.0, convert to Q8.8
-    int16_t acc_threshold = (CONFIG_COPILOT_UNEASY_ACCEL_CG * FP_ONE) / 100;
-    // yaw_threshold in degrees, convert to Q8.8
-    int16_t yaw_threshold = CONFIG_COPILOT_UNEASY_YAW_DEG << FP_SHIFT;
-    int16_t yaw_abs = (motion->yaw_deg >= 0) ? motion->yaw_deg : -motion->yaw_deg;
-
-    if (acc > acc_threshold || yaw_abs > yaw_threshold) {
-        copilot_trigger_uneasy();
-    }
 }
 
 void copilot_ui_ring_show(bool on) {
@@ -1002,7 +519,7 @@ void copilot_ui_ring_show(bool on) {
         return;
     }
     s_ui.ring_visible = on;
-    LOGI_UI( "Ring show=%s", on ? "on" : "off");
+    LOGI_UI("Ring show=%s", on ? "on" : "off");
 
     if (on) {
         copilot_ring_set_opa(s_ui.ring_outer, 150);
@@ -1020,15 +537,20 @@ void copilot_ui_on_touch(uint16_t x, uint16_t y) {
         return;
     }
     uint32_t now = lv_tick_get();
-    // Increase debounce to 300ms to reduce touch event frequency on single-core ESP32-C6
     if (now - s_ui.last_touch_ms < 300) {
         return;
     }
     s_ui.last_touch_ms = now;
-    LOGI_UI( "Touch x=%u y=%u", (unsigned)x, (unsigned)y);
-    // Disable ring flash animation - too heavy for single-core ESP32-C6
-    // The ring show/hide causes full screen redraws which starve WiFi
-    // s_ui.touch_pending = true;
+    LOGI_UI("Touch x=%u y=%u", (unsigned)x, (unsigned)y);
+
+    s_ui.touch_flash_until_ms = now + TOUCH_FLASH_MS;
+    if (!s_ui.touch_flash_active) {
+        s_ui.touch_flash_active = true;
+        s_ui.touch_flash_owns_ring = !s_ui.ring_visible;
+        if (s_ui.touch_flash_owns_ring) {
+            copilot_ui_ring_show(true);
+        }
+    }
 }
 
 void copilot_ui_set_expression_async(copilot_expr_t expr, uint32_t duration_ms) {
@@ -1056,8 +578,6 @@ void copilot_ui_set_motion_only_async(const copilot_motion_t *motion) {
         return;
     }
     if (bsp_display_lock(0)) {
-        // Only update motion target without checking uneasy threshold
-        // This is used by internal IMU to avoid expression changes
         s_ui.motion_target = *motion;
         ESP_LOGD(TAG, "Motion only ax=%d ay=%d yaw=%d (Q8.8)",
                  motion->ax, motion->ay, motion->yaw_deg);

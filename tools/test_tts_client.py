@@ -5,7 +5,7 @@ TTS Test Client
 发送文本到服务器，服务器合成语音后发送给 ESP32 播放。
 
 用法:
-    python test_tts_client.py --server ws://192.168.31.98:8080
+    python test_tts_client.py --server ws://<host-ip>:8080
     python test_tts_client.py --server ws://localhost:8080 --text "你好世界"
     python test_tts_client.py --server http://localhost:8080 --http --text "你好"
 """
@@ -101,7 +101,7 @@ def main():
         epilog="""
 示例:
   # WebSocket 交互模式
-  python test_tts_client.py --server ws://192.168.31.98:8080
+  python test_tts_client.py --server ws://<host-ip>:8080
 
   # WebSocket 单次发送
   python test_tts_client.py --server ws://localhost:8080 --text "你好世界"

@@ -8,15 +8,16 @@ Topic layout (default):
 
 ## Commands (JSON)
 
-### Expression
+### Avatar State
 ```json
-{"type":"emotion","name":"happy","duration_ms":420,"prelight_ms":500,"sound":"chime"}
+{"type":"emotion","name":"speaking","duration_ms":2000,"prelight_ms":500,"sound":"chime"}
 ```
 `type` can be `"emotion"` or `"expression"` (both accepted).
 Fields:
-- `name`: `neutral|happy|sad|angry|surprised|sleepy|dizzy`
-- `id`: numeric expression index (0..6), optional alternative to `name`
-- `duration_ms`: transition time (default `CONFIG_COPILOT_EXPR_TRANSITION_MS`)
+- `name`: `idle|neutral|speaking|talking|mouth_open|open_mouth`
+- Compatibility names `happy|sad|angry|sleepy|dizzy` map to idle; `surprised` maps to speaking.
+- `id`: numeric state index, `0=idle`, `1=speaking`
+- `duration_ms`: speaking hold time for state `speaking`; `0` latches until idle is sent
 - `prelight_ms`: ring prelight time (default `CONFIG_COPILOT_PRELIGHT_MS`)
 - `sound`: optional sound id or `true` to use a default beep
 
@@ -66,7 +67,7 @@ Disconnects from backend. Audio hardware remains initialized.
 {"type":"voice","action":"loopback"}
 ```
 Routes microphone input directly to speaker output for testing. Toggles on/off.
-Note: Loopback mode triggers `VOICE_STATE_SPEAKING`, enabling mouth animation.
+Note: Loopback mode triggers the speaking head state.
 
 **Set speaker volume:**
 ```json
@@ -117,12 +118,12 @@ Voice states: `IDLE|READY|CONNECTING|LISTENING|PROCESSING|SPEAKING|ERROR`
 ## Voice-UI Integration
 
 The UI automatically responds to voice states:
-- **LISTENING**: Ring indicator shows
-- **SPEAKING**: Ring indicator + mouth animation (driven by audio envelope)
-- **ERROR**: Ring indicator flashes
+- **LISTENING**: Idle avatar
+- **SPEAKING**: Speaking avatar + ring indicator
+- **ERROR**: Idle avatar
 
-Mouth animation is driven by audio envelope detection in the audio output path.
-The envelope is calculated from voice audio samples and smoothed for natural animation.
+The audio envelope is still read from the audio output path, but it is now used
+only to decide whether the avatar should be in the speaking state.
 
 ## Demo Script
 
@@ -142,15 +143,15 @@ python -m pip install paho-mqtt
 
 The demo includes a voice-UI test mode (`vdemo` command) that:
 1. Starts loopback mode
-2. Sets happy expression
+2. Sets idle state
 3. Waits 5 seconds for you to speak (mouth should animate)
-4. Returns to neutral and stops loopback
+4. Returns to idle and stops loopback
 
 ### Command Reference
 
 | Command | Description |
 |---------|-------------|
-| `1-7` | Expressions: happy, sad, angry, surprised, sleepy, dizzy, neutral |
+| `1-2` | Avatar states: idle, speaking |
 | `m0-m4` | Motion: reset, drift right/left/up/down |
 | `s1-s4` | Sounds: beep_short, beep_long, chime, tap |
 | `r0/r1` | Ring off/on |
@@ -161,7 +162,7 @@ The demo includes a voice-UI test mode (`vdemo` command) that:
 | `g+/g-` | Mic gain up/down |
 | `cal` | Start gyro calibration |
 | `st` | Query all status |
-| `demo` | Run expression demo |
+| `demo` | Run avatar demo |
 | `vdemo` | Run voice-UI demo |
 
 ### Environment Variables

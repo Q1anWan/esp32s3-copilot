@@ -11,6 +11,9 @@ config COPILOT_WIFI_PASSWORD
 config COPILOT_MQTT_BROKER_URI
     string "MQTT Broker URI"
     default "mqtt://192.168.1.10"
+    help
+        MQTT broker URI reachable from the ESP32 over the current LAN.
+        Example: mqtt://192.168.31.12:1883
 
 config COPILOT_MQTT_TOPIC_PREFIX
     string "MQTT Topic Prefix"
@@ -226,6 +229,15 @@ config COPILOT_PRELIGHT_MS
 config COPILOT_EXPR_TRANSITION_MS
     int "Expression transition time (ms)"
     default 400
+
+config COPILOT_STARTUP_SELF_TEST
+    bool "Run one-shot startup animation/audio self-test"
+    default n
+    help
+        When enabled, the device runs a short local self-test after UI init:
+        enter the speaking head state and play a chime tone. This is intended
+        for bench verification without WiFi/MQTT and should stay disabled in
+        normal builds.
 
 config COPILOT_UNEASY_ACCEL_CG
     int "Uneasy threshold (centi-g)"

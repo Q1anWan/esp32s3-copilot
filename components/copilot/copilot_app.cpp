@@ -86,6 +86,7 @@ static const struct {
     const char *name;
     copilot_expr_t expr;
 } kExprMap[] = {
+    {"idle", COPILOT_EXPR_IDLE},
     {"neutral", COPILOT_EXPR_NEUTRAL},
     {"happy", COPILOT_EXPR_HAPPY},
     {"sad", COPILOT_EXPR_SAD},
@@ -93,6 +94,10 @@ static const struct {
     {"surprised", COPILOT_EXPR_SURPRISED},
     {"sleepy", COPILOT_EXPR_SLEEPY},
     {"dizzy", COPILOT_EXPR_DIZZY},
+    {"speaking", COPILOT_EXPR_SPEAKING},
+    {"talking", COPILOT_EXPR_TALKING},
+    {"mouth_open", COPILOT_EXPR_SPEAKING},
+    {"open_mouth", COPILOT_EXPR_SPEAKING},
 };
 
 static copilot_expr_t copilot_expr_from_name(const char *name) {

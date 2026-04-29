@@ -12,3 +12,6 @@ idf_component_register(
   PRIV_REQUIRES lvgl esp_wifi esp_event esp_netif nvs_flash mqtt cjson esp_timer driver waveshare__qmi8658
   REQUIRES esp32_s3_touch_amoled_1_75 esp_codec_dev copilot_voice
 )
+
+target_compile_options(__idf_copilot PRIVATE
+  $<$<COMPILE_LANGUAGE:CXX>:-Wno-deprecated-enum-enum-conversion>)

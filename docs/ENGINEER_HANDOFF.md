@@ -1,6 +1,6 @@
 # Engineer Handoff
 
-Last verified: 2026-04-28, Asia/Shanghai.
+Last verified: 2026-04-30, Asia/Shanghai.
 
 This document is the handoff note for the next engineer. Treat it as the
 current operational state of the project. `README.md` contains the full command
@@ -14,10 +14,14 @@ display/audio endpoint.
 
 - Host controls animation state through MQTT JSON.
 - Host pushes speaker audio through WebSocket binary PCM frames.
-- ESP32 renders a rubber-hose style head on the round AMOLED display.
+- ESP32 renders a 3D rotating rubber-hose cartoon head on the round AMOLED.
 - ESP32 plays audio through ES8311 and can upload ES7210 microphone PCM.
-- Animation has intentionally been reduced to two public states: `idle` and
-  `speaking`.
+- Animation has two public states: `idle` and `speaking`.
+- IMU, voice, and performance profiling are **disabled** in the current build
+  to maximize animation frame rate (~60fps).
+- The face auto-cycles through 8 discrete viewing angles (front, 3/4 left,
+  full left, 3/4 left, front, 3/4 right, full right, 3/4 right) and runs an
+  auto-speaking demo cycle (~1.6s speak every 5.6s) for standalone testing.
 
 The target product flow is:
 
@@ -58,18 +62,34 @@ CONFIG_COPILOT_WIFI_PASSWORD="finnox666"
 CONFIG_COPILOT_MQTT_BROKER_URI="mqtt://192.168.31.12"
 CONFIG_COPILOT_MQTT_TOPIC_PREFIX="copilot"
 CONFIG_COPILOT_DEVICE_ID="s3_copilot"
-CONFIG_COPILOT_VOICE_ENABLE=y
-CONFIG_COPILOT_VOICE_SERVER_URL="http://192.168.31.12:8080"
-CONFIG_COPILOT_VOICE_MODE_FULL_DUPLEX=y
-CONFIG_COPILOT_VOICE_SAMPLE_RATE=16000
-CONFIG_COPILOT_VOICE_TASK_STACK=8192
-CONFIG_COPILOT_VOICE_TASK_CORE=1
-CONFIG_COPILOT_VOICE_MIC_GAIN=24
-CONFIG_COPILOT_VOICE_SPEAKER_VOLUME=80
+# CONFIG_COPILOT_VOICE_ENABLE is not set
+# CONFIG_COPILOT_VOICE_SERVER_URL is not set
+CONFIG_COPILOT_MOTION_SOURCE_DISABLED=y
+# CONFIG_COPILOT_PERF_ENABLE is not set
 # CONFIG_COPILOT_STARTUP_SELF_TEST is not set
-CONFIG_COPILOT_LOG_AUDIO=y
-CONFIG_COPILOT_LOG_MQTT=y
-CONFIG_COPILOT_LOG_VOICE=y
+# CONFIG_COPILOT_LOG_AUDIO is not set
+# CONFIG_COPILOT_LOG_MQTT is not set
+# CONFIG_COPILOT_LOG_VOICE is not set
+# CONFIG_COPILOT_LOG_UI is not set
+# CONFIG_COPILOT_LOG_APP is not set
+CONFIG_COPILOT_UI_CORE=0
+CONFIG_COPILOT_ACTION_CORE=1
+CONFIG_COPILOT_AUDIO_CORE=1
+```
+
+### Performance Tuning
+
+```text
+CONFIG_LV_DEF_REFR_PERIOD=16          # 60fps target (was 33/30fps)
+CONFIG_BSP_LCD_RGB_BOUNCE_BUFFER_HEIGHT=30  # 30-line strips (was 16)
+```
+
+### LVGL Task Priority
+
+Raised from 5 to 15 in `main/main.cpp` to reduce preemption jitter:
+
+```c
+disp_cfg.lvgl_port_cfg.task_priority = 15;
 ```
 
 Important: `192.168.31.12` is the workstation IP from the verified bench run.
@@ -300,20 +320,76 @@ Sending PUBLISH to s3_copilot ...
   logs are expected after the test server stops.
 - `192.168.31.98` is a stale historical address. Do not use it for current
   bench testing.
-- Internal RAM can get low during full-duplex audio. Watch `Min free` and
-  `DMA-capable` heap in performance logs if audio becomes unstable.
+- Internal DRAM is tight (168 KiB total). LVGL's pool takes 64 KiB, and the
+  display draw buffer takes ~27 KiB (466x30x2). Attempting double buffering
+  (`double_buffer=true`) with larger strips will fail with "Not enough memory
+  for LVGL buffer (buf2) allocation" and cause a boot loop.
+- Using PSRAM for display buffers (`buff_spiram=true`) causes a white screen
+  due to DMA cache coherency issues with the SH8601 SPI driver. Keep
+  `buff_spiram=false` unless the flush path is updated to handle cache
+  invalidation.
+- Display tearing may be visible due to partial refresh mode (no vsync on SPI
+  display). Reducing strip count (larger `BSP_LCD_RGB_BOUNCE_BUFFER_HEIGHT`)
+  helps, but full elimination requires full-frame buffer mode (434 KiB, PSRAM
+  with proper DMA bounce buffer) at the cost of ~23fps.
 - `CONFIG_COPILOT_STARTUP_SELF_TEST` should stay disabled for normal builds.
   Enable it only to verify local display/audio without WiFi/MQTT.
+- The LVGL 9.4.0 `LV_PART_MAIN | LV_STATE_DEFAULT` syntax triggers
+  `-Wdeprecated-enum-enum-conversion`. The copilot component CMakeLists.txt
+  suppresses this with `-Wno-deprecated-enum-enum-conversion`.
 - Build directories such as `build_codex_restore/` and `build_codex_test/` are
   local test artifacts, not source-of-truth documentation.
+
+## Face Animation Architecture
+
+The face is rendered in `components/copilot/copilot_ui.cpp` as a set of LVGL
+rounded-rectangle objects (head, eyes, pupils, catchlights, cheeks, nose,
+nose bridge, mouth, tooth). Styling is applied once at init via
+`copilot_blob_fill()` / `copilot_blob_outline()` helpers; per-frame animation
+only adjusts position, size, and visibility.
+
+### Color Palette
+
+Warm reddish-grayscale, optimized for OLED contrast and night visibility:
+
+| Role | Color | Hex |
+|---|---|---|
+| Background | Pure black (AMOLED off) | `0x000000` |
+| Head fill | Warm dark brown-gray | `0x4A2828` |
+| Head outline | Bright warm beige | `0xE0B8A8` |
+| Eye whites | Warm off-white | `0xFFF6EE` |
+| Catchlights/tooth | Pure white | `0xFFFFFF` |
+| Cheek blush | Rosy gray | `0xD09080` |
+| Nose tip | Warm light tan | `0xD4A898` |
+| Mouth | Warm medium shadow | `0x6A3838` |
+| Mouth inner | Deep warm shadow | `0x4A2020` |
+
+### Animation Parameters
+
+- Timer interval: 16ms (~62.5fps render rate)
+- Face angle: 8 discrete angles cycling every 1.4s in idle; forward + micro-wobble when speaking
+- Perspective: 24% head width reduction at full profile; far eye fully hidden at >92% profile
+- Mouth: 4-step rhythm pulse (255→90→210→55) at 80ms period; spring-blend smoothing
+- Squash: mouth_open/60 vertically compresses head when speaking
+- Overshoot: adds velocity/4 to angle force for cartoon springiness
+- Auto-speak demo: 1.6s ON every 5.6s cycle (active when no MQTT control)
 
 ## Next Engineering Steps
 
 - Decide whether the host should always send explicit MQTT `speaking/idle`, or
   rely on WebSocket PCM arrival to drive speaking automatically.
+- Re-enable voice/IMU subsystems after the animation design is finalized. Change
+  `sdkconfig` or `sdkconfig.defaults`:
+  - `CONFIG_COPILOT_VOICE_ENABLE=y`
+  - `CONFIG_COPILOT_MOTION_SOURCE_INTERNAL=y` (or `EXTERNAL`)
+  - Voice and motion were disabled to maximize frame rate; switching them on
+    will reduce effective FPS.
+- Eliminate display tearing: implement `buff_spiram=true` with a DMA bounce
+  buffer (`trans_size`) and proper cache flush/invalidate in the SH8601 flush
+  callback, or switch to full-frame buffer mode (434 KiB per buffer in PSRAM).
 - Consider making `tools/host_loopback_test.py` multi-session if repeated
   reconnect testing is needed.
-- If the rubber-hose visual style needs further improvement, change
+- If further visual style improvement is needed, change
   `components/copilot/copilot_ui.cpp` only after preserving the two-state public
   protocol.
 - If deploying beyond the bench network, replace fixed `sdkconfig` endpoints

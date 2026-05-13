@@ -12,6 +12,11 @@
 #include "copilot_audio.h"
 #include "copilot_ui.h"
 
+#if CONFIG_COPILOT_SERVO_ENABLE
+#include "copilot_servo.h"
+#endif
+#include "copilot_axp2101.h"
+
 static const char *TAG = "main";
 
 static int copilot_normalize_core(int core) {
@@ -50,7 +55,7 @@ extern "C" void app_main(void) {
         .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
         .buffer_size = BSP_LCD_DRAW_BUFF_SIZE,
         .trans_size = 0,
-        .double_buffer = BSP_LCD_DRAW_BUFF_DOUBLE,
+        .double_buffer = false,
         .flags = {
             .buff_dma = true,
             .buff_spiram = false,
@@ -67,7 +72,23 @@ extern "C" void app_main(void) {
         return;
     }
 
+#if CONFIG_COPILOT_DISPLAY_ROTATE_180
+    lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_180);
+    ESP_LOGI(TAG, "Display rotated 180 degrees");
+#endif
+
     copilot_app_init();
+
+#if CONFIG_COPILOT_SERVO_ENABLE
+    copilot_servo_init();
+#endif
+
+    // Init AXP2101 PMU for battery monitoring
+    if (copilot_axp2101_init() == ESP_OK) {
+        ESP_LOGI(TAG, "AXP2101 PMU initialized");
+    } else {
+        ESP_LOGW(TAG, "AXP2101 PMU not available (battery status disabled)");
+    }
 
     if (bsp_display_lock(0)) {
         copilot_ui_init(lv_scr_act());

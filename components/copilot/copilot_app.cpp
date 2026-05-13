@@ -17,6 +17,10 @@
 #include "copilot_ui.h"
 #include "copilot_voice.h"
 #include "copilot_voice_ui.h"
+#if CONFIG_COPILOT_SERVO_ENABLE
+#include "copilot_servo.h"
+#endif
+#include "copilot_axp2101.h"
 
 static const char *TAG = "copilot_app";
 
@@ -323,6 +327,27 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
                      ready ? 1 : 0, calibrating ? 1 : 0, bias);
 #endif
         }
+        if (strcmp(query_str, "power") == 0 || strcmp(query_str, "all") == 0) {
+            copilot_power_status_t ps;
+            if (copilot_axp2101_get_status(&ps)) {
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                    "{\"type\":\"status\",\"power\":{"
+                    "\"battery_pct\":%d,\"batt_mv\":%u,\"vbus_mv\":%u,\"sys_mv\":%u,"
+                    "\"temp_c\":%.1f,\"charging\":%s,\"vbus_in\":%s,\"batt_conn\":%s}}",
+                    ps.battery_percent, ps.batt_voltage_mv, ps.vbus_voltage_mv,
+                    ps.system_voltage_mv, ps.temperature_c,
+                    ps.is_charging ? "true" : "false",
+                    ps.is_vbus_in ? "true" : "false",
+                    ps.is_battery_connect ? "true" : "false");
+                copilot_mqtt_publish("status", buf);
+                ESP_LOGI(TAG, "Power status: bat=%d%% %umV vbus=%umV sys=%umV temp=%.1fC chg=%d",
+                         ps.battery_percent, ps.batt_voltage_mv, ps.vbus_voltage_mv,
+                         ps.system_voltage_mv, ps.temperature_c, ps.is_charging ? 1 : 0);
+            } else {
+                copilot_mqtt_publish("status", "{\"type\":\"status\",\"power\":{\"error\":\"pmu not ready\"}}");
+            }
+        }
         if (strcmp(query_str, "voice") == 0 || strcmp(query_str, "all") == 0) {
             copilot_voice_state_t state = copilot_voice_get_state();
             bool active = copilot_voice_is_active();
@@ -331,6 +356,105 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
             const char *state_name = (state < sizeof(state_names)/sizeof(state_names[0])) ? state_names[state] : "UNKNOWN";
             ESP_LOGI(TAG, "Voice status: state=%s active=%d loopback=%d", state_name, active ? 1 : 0, loopback ? 1 : 0);
         }
+    } else if (strcmp(type->valuestring, "servo") == 0) {
+#if CONFIG_COPILOT_SERVO_ENABLE
+        const cJSON *cmd_mode   = cJSON_GetObjectItemCaseSensitive(root, "mode");
+        const cJSON *cmd_calib  = cJSON_GetObjectItemCaseSensitive(root, "calibrate");
+        const cJSON *cmd_reset  = cJSON_GetObjectItemCaseSensitive(root, "reset");
+        const cJSON *cmd_query  = cJSON_GetObjectItemCaseSensitive(root, "query");
+        const cJSON *cmd_pitch  = cJSON_GetObjectItemCaseSensitive(root, "pitch");
+        const cJSON *cmd_yaw    = cJSON_GetObjectItemCaseSensitive(root, "yaw");
+        const cJSON *cmd_calib_obj = cJSON_GetObjectItemCaseSensitive(root, "calib");
+
+        // Mode switch: "auto" (animation drives servos) or "manual" (MQTT drives servos)
+        if (cJSON_IsString(cmd_mode)) {
+            if (strcmp(cmd_mode->valuestring, "auto") == 0) {
+                copilot_servo_set_manual(false);
+                ESP_LOGI(TAG, "Servo mode: AUTO (animation-driven)");
+            } else if (strcmp(cmd_mode->valuestring, "manual") == 0) {
+                copilot_servo_set_manual(true);
+                ESP_LOGI(TAG, "Servo mode: MANUAL (MQTT-driven)");
+            }
+        }
+
+        if (cJSON_IsBool(cmd_calib)) {
+            bool enable = cJSON_IsTrue(cmd_calib);
+            copilot_servo_set_calibration(enable);
+            ESP_LOGI(TAG, "Servo calibration mode: %s", enable ? "ON" : "OFF");
+        } else if (cJSON_IsTrue(cmd_reset)) {
+            copilot_servo_reset_calib_to_defaults();
+            ESP_LOGI(TAG, "Servo calibration reset to defaults");
+        } else if (cJSON_IsString(cmd_query)) {
+            const char *q = cmd_query->valuestring;
+            if (strcmp(q, "status") == 0 || strcmp(q, "all") == 0) {
+                float pitch_deg, yaw_deg;
+                copilot_servo_get_current_angle(&pitch_deg, &yaw_deg);
+                uint16_t pitch_us, yaw_us;
+                copilot_servo_get_pulse_us(&pitch_us, &yaw_us);
+                bool calib_mode = copilot_servo_get_calibration();
+                bool manual_mode = copilot_servo_get_manual();
+                copilot_servo_calib_t calib;
+                copilot_servo_get_calib(&calib);
+                ESP_LOGI(TAG, "Servo status: pitch=%.1fdeg/%uus yaw=%.1fdeg/%uus calib=%d manual=%d "
+                         "soft_p=[%.0f,%.0f] soft_y=[%.0f,%.0f]",
+                         pitch_deg, pitch_us, yaw_deg, yaw_us, calib_mode ? 1 : 0, manual_mode ? 1 : 0,
+                         calib.pitch.soft_limit_min, calib.pitch.soft_limit_max,
+                         calib.yaw.soft_limit_min, calib.yaw.soft_limit_max);
+                // Also publish status response
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                    "{\"type\":\"servo_status\","
+                    "\"pitch_deg\":%.1f,\"yaw_deg\":%.1f,"
+                    "\"pitch_us\":%u,\"yaw_us\":%u,"
+                    "\"calib\":%s,\"manual\":%s,"
+                    "\"limits_pitch\":[%.0f,%.0f],\"limits_yaw\":[%.0f,%.0f]}",
+                    pitch_deg, yaw_deg, pitch_us, yaw_us,
+                    calib_mode ? "true" : "false",
+                    manual_mode ? "true" : "false",
+                    calib.pitch.soft_limit_min, calib.pitch.soft_limit_max,
+                    calib.yaw.soft_limit_min, calib.yaw.soft_limit_max);
+                copilot_mqtt_publish("status", buf);
+            }
+        } else if (cJSON_IsObject(cmd_calib_obj)) {
+            copilot_servo_calib_t calib;
+            copilot_servo_get_calib(&calib);  // start from current, overlay what's provided
+            const cJSON *jp = cJSON_GetObjectItemCaseSensitive(cmd_calib_obj, "pitch");
+            const cJSON *jy = cJSON_GetObjectItemCaseSensitive(cmd_calib_obj, "yaw");
+            auto apply_ch = [](const cJSON *j, copilot_servo_ch_calib_t *ch) {
+                if (!cJSON_IsObject(j)) return;
+                const cJSON *v;
+                if ((v = cJSON_GetObjectItemCaseSensitive(j, "angle_min")) && cJSON_IsNumber(v))
+                    ch->angle_min = v->valuedouble;
+                if ((v = cJSON_GetObjectItemCaseSensitive(j, "angle_max")) && cJSON_IsNumber(v))
+                    ch->angle_max = v->valuedouble;
+                if ((v = cJSON_GetObjectItemCaseSensitive(j, "soft_limit_min")) && cJSON_IsNumber(v))
+                    ch->soft_limit_min = v->valuedouble;
+                if ((v = cJSON_GetObjectItemCaseSensitive(j, "soft_limit_max")) && cJSON_IsNumber(v))
+                    ch->soft_limit_max = v->valuedouble;
+                if ((v = cJSON_GetObjectItemCaseSensitive(j, "pulse_min")) && cJSON_IsNumber(v))
+                    ch->pulse_min_us = (uint16_t)v->valuedouble;
+                if ((v = cJSON_GetObjectItemCaseSensitive(j, "pulse_max")) && cJSON_IsNumber(v))
+                    ch->pulse_max_us = (uint16_t)v->valuedouble;
+                if ((v = cJSON_GetObjectItemCaseSensitive(j, "pulse_center")) && cJSON_IsNumber(v))
+                    ch->pulse_center_us = (uint16_t)v->valuedouble;
+            };
+            apply_ch(jp, &calib.pitch);
+            apply_ch(jy, &calib.yaw);
+            copilot_servo_set_calib(&calib);
+            ESP_LOGI(TAG, "Servo calibration updated");
+        } else if (cJSON_IsNumber(cmd_pitch) || cJSON_IsNumber(cmd_yaw)) {
+            float pitch = cJSON_IsNumber(cmd_pitch) ? (float)cmd_pitch->valuedouble : 0.0f;
+            float yaw   = cJSON_IsNumber(cmd_yaw)   ? (float)cmd_yaw->valuedouble   : 0.0f;
+            if (!copilot_servo_get_manual()) {
+                copilot_servo_set_manual(true);  // MQTT takes over from animation
+                ESP_LOGI(TAG, "Servo mode auto→manual (MQTT target received)");
+            }
+            copilot_servo_set_target(pitch, yaw);
+            ESP_LOGI(TAG, "Servo target: pitch=%.1f yaw=%.1f", pitch, yaw);
+        }
+#else
+        ESP_LOGW(TAG, "Servo command received but servo module is disabled");
+#endif
     } else if (strcmp(type->valuestring, "voice") == 0) {
         // Voice module control
         const cJSON *action = cJSON_GetObjectItemCaseSensitive(root, "action");

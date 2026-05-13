@@ -1,5 +1,10 @@
 # Build output
 build/
+build_codex_*/
+
+# Python cache
+__pycache__/
+**/__pycache__/
 
 # ESP-IDF managed components (downloaded automatically)
 managed_components/

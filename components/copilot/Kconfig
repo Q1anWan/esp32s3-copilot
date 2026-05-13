@@ -27,6 +27,14 @@ config COPILOT_UI_CORE
     int "UI/LVGL task core affinity (-1: no affinity, 0/1: core)"
     default 1
 
+config COPILOT_DISPLAY_ROTATE_180
+    bool "Rotate display 180 degrees"
+    default n
+    help
+        Enable when the AMOLED panel is mounted upside-down.
+        Rotates the LVGL display coordinate system by 180 degrees.
+        Touch coordinates are automatically transformed as well.
+
 config COPILOT_ACTION_CORE
     int "Action task core affinity (-1: no affinity, 0/1: core)"
     default 1
@@ -349,6 +357,71 @@ config COPILOT_PERF_HEAP
     depends on COPILOT_PERF_ENABLE
     help
         Enable heap and SPIRAM memory usage monitoring.
+
+endmenu
+
+menu "Servo Control"
+
+config COPILOT_SERVO_ENABLE
+    bool "Enable servo module"
+    default n
+    help
+        Enable dual servo control (Pitch + Yaw) via LEDC PWM.
+        Pitch servo on PWM channel 0, Yaw servo on channel 1,
+        both driven by LEDC Timer 1 at 50 Hz.
+
+config COPILOT_SERVO_PITCH_GPIO
+    int "Pitch servo GPIO"
+    default 17
+    range 0 48
+    depends on COPILOT_SERVO_ENABLE
+    help
+        GPIO pin for the pitch (head up/down) servo.
+
+config COPILOT_SERVO_YAW_GPIO
+    int "Yaw servo GPIO"
+    default 18
+    range 0 48
+    depends on COPILOT_SERVO_ENABLE
+    help
+        GPIO pin for the yaw (head left/right) servo.
+
+config COPILOT_SERVO_TASK_PRIORITY
+    int "Servo task priority"
+    default 10
+    range 1 24
+    depends on COPILOT_SERVO_ENABLE
+    help
+        FreeRTOS priority for the servo update task.
+        Runs at 50 Hz (every 20 ms). Default 10 is below LVGL (15)
+        but above most background tasks.
+
+config COPILOT_SERVO_TASK_CORE
+    int "Servo task CPU core (-1 for any)"
+    default 1
+    range -1 1
+    depends on COPILOT_SERVO_ENABLE
+    help
+        Pin servo task to specific CPU core.
+        Default 1 keeps it separate from LVGL (Core 0).
+
+config COPILOT_SERVO_PITCH_SCALE
+    int "Pitch servo scale (percent)"
+    default 100
+    range 0 200
+    depends on COPILOT_SERVO_ENABLE
+    help
+        Scale factor for pitch servo movement.
+        100 = 1:1 mapping of animation pitch to servo angle.
+
+config COPILOT_SERVO_YAW_SCALE
+    int "Yaw servo scale (percent)"
+    default 100
+    range 0 200
+    depends on COPILOT_SERVO_ENABLE
+    help
+        Scale factor for yaw servo movement.
+        100 = 1:1 mapping of animation yaw to servo angle.
 
 endmenu
 

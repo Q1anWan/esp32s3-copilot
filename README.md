@@ -48,8 +48,8 @@ If the existing `build/` directory was created with another CMake generator,
 use a separate build directory:
 
 ```bash
-idf.py -B build_codex build
-idf.py -B build_codex -p /dev/ttyACM0 flash
+idf.py -B build_alt build
+idf.py -B build_alt -p /dev/ttyACM0 flash
 ```
 
 ## Runtime Configuration
@@ -436,7 +436,7 @@ Monitor the ESP32:
 
 ```bash
 source /home/qianwan/esp/v5.5.2/esp-idf/export.sh
-idf.py -B build_codex_restore -p /dev/ttyACM0 monitor
+idf.py -p /dev/ttyACM0 monitor
 ```
 
 Expected successful loop:

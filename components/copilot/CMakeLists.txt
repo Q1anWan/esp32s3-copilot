@@ -8,9 +8,11 @@ idf_component_register(
     "copilot_mqtt.cpp"
     "copilot_perf.cpp"
     "copilot_imu.cpp"
-  INCLUDE_DIRS "."
+    "copilot_servo.cpp"
+    "copilot_axp2101.cpp"
+  INCLUDE_DIRS "." "../XPowersLib/src" "../XPowersLib/src/REG"
   PRIV_REQUIRES lvgl esp_wifi esp_event esp_netif nvs_flash mqtt cjson esp_timer driver waveshare__qmi8658
-  REQUIRES esp32_s3_touch_amoled_1_75 esp_codec_dev copilot_voice
+  REQUIRES esp32_s3_touch_amoled_1_75 esp_codec_dev copilot_voice XPowersLib
 )
 
 target_compile_options(__idf_copilot PRIVATE

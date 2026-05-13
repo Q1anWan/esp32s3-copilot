@@ -1,6 +1,7 @@
 #include "copilot_ui.h"
 
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -9,6 +10,10 @@
 #include "bsp/display.h"
 #include "copilot_perf.h"
 #include "copilot_voice_ui.h"
+
+#if CONFIG_COPILOT_SERVO_ENABLE
+#include "copilot_servo.h"
+#endif
 
 #define LCD_H_RES BSP_LCD_H_RES
 #define LCD_V_RES BSP_LCD_V_RES
@@ -486,6 +491,17 @@ static void copilot_apply_head(uint32_t now, bool speaking) {
         lv_obj_add_flag(s_ui.mouth_inner, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_ui.tooth, LV_OBJ_FLAG_HIDDEN);
     }
+
+#if CONFIG_COPILOT_SERVO_ENABLE
+    if (!copilot_servo_get_manual()) {
+        // Drive servos from face angle (front-left-up frame)
+        float face_deg = (float)s_ui.face_angle / 256.0f;  // Q8.8 → degrees
+        float wobble_deg = -(float)wobble / 4.0f;           // px → approx deg
+        float yaw_s   = face_deg   * (CONFIG_COPILOT_SERVO_YAW_SCALE   / 100.0f);
+        float pitch_s = wobble_deg * (CONFIG_COPILOT_SERVO_PITCH_SCALE / 100.0f);
+        copilot_servo_set_target(pitch_s, yaw_s);
+    }
+#endif
 }
 
 static bool copilot_inside_circle(lv_coord_t x, lv_coord_t y) {

@@ -4,6 +4,7 @@
 #include <math.h>
 
 #include "cJSON.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
@@ -14,6 +15,8 @@
 #include "copilot_imu.h"
 #include "copilot_mqtt.h"
 #include "copilot_perf.h"
+#include "copilot_serial_console.h"
+#include "copilot_tcp_host.h"
 #include "copilot_ui.h"
 #include "copilot_voice.h"
 #include "copilot_voice_ui.h"
@@ -57,7 +60,10 @@ struct copilot_action_t {
     uint32_t duration_ms;
     uint32_t prelight_ms;
     char sound_id[16];
+    char scene_id[32];
     char message_id[32];
+    uint16_t sequence_id;
+    bool use_scene_audio;
     bool calibration_content_present;
     bool visual_semantic_content_present;
 };
@@ -158,7 +164,17 @@ static void copilot_action_task(void *arg) {
                 copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_RETURN_NEUTRAL, 520);
             }
         } else if (action.type == ACTION_SOUND) {
-            if (action.prelight_ms > 0) {
+            if (action.use_scene_audio) {
+                if (action.prelight_ms > 0) {
+                    copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_PRE_MESSAGE_ORIENT, action.prelight_ms + 150);
+                    vTaskDelay(pdMS_TO_TICKS(action.prelight_ms));
+                }
+                copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_SPEAKING,
+                                            action.duration_ms > 0 ? action.duration_ms : 0);
+                LOGI_APP("Play scene audio scene=%s seq=%u", action.scene_id, (unsigned)action.sequence_id);
+                copilot_audio_play_scene(action.scene_id, action.sequence_id);
+                continue;
+            } else if (action.prelight_ms > 0) {
                 copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_PRE_MESSAGE_ORIENT, action.prelight_ms + 150);
                 vTaskDelay(pdMS_TO_TICKS(action.prelight_ms));
                 copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_RETURN_NEUTRAL, 520);
@@ -286,6 +302,26 @@ static void copilot_schedule_sound(const char *sound_id, uint32_t prelight_ms) {
     copilot_enqueue_action(&action);
 }
 
+static void copilot_schedule_scene_sound(const char *scene_id, uint16_t sequence_id,
+                                         uint32_t prelight_ms, uint32_t duration_ms,
+                                         copilot_screen_orientation_t orientation,
+                                         const char *message_id) {
+    copilot_action_t action = {};
+    action.type = ACTION_SOUND;
+    action.expr = COPILOT_EXPR_SPEAKING;
+    action.screen_state = COPILOT_SCREEN_STATE_SPEAKING;
+    action.orientation = orientation;
+    action.duration_ms = duration_ms;
+    action.prelight_ms = prelight_ms;
+    action.use_scene_audio = true;
+    action.sequence_id = sequence_id;
+    copilot_copy_action_text(action.scene_id, sizeof(action.scene_id), scene_id ? scene_id : "default");
+    copilot_copy_action_text(action.message_id, sizeof(action.message_id), message_id);
+    LOGI_APP("Schedule scene audio scene=%s seq=%u prelight=%u duration=%u",
+             action.scene_id, (unsigned)sequence_id, (unsigned)prelight_ms, (unsigned)duration_ms);
+    copilot_enqueue_action(&action);
+}
+
 static void copilot_schedule_screen_state(copilot_screen_state_t state, copilot_screen_orientation_t orientation,
                                           uint32_t duration_ms, const char *message_id,
                                           bool calibration_content_present,
@@ -365,6 +401,45 @@ static const char *copilot_get_string_any(const cJSON *obj, const char *key_a, c
     return def_value;
 }
 
+static bool copilot_get_scene_string(const cJSON *obj, char *out, size_t out_len) {
+    if (!out || out_len == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    const cJSON *scene = cJSON_GetObjectItemCaseSensitive(obj, "scene");
+    if (!scene) {
+        scene = cJSON_GetObjectItemCaseSensitive(obj, "scene_id");
+    }
+    if (!scene) {
+        scene = cJSON_GetObjectItemCaseSensitive(obj, "category");
+    }
+    if (cJSON_IsString(scene) && scene->valuestring) {
+        strncpy(out, scene->valuestring, out_len - 1);
+        out[out_len - 1] = '\0';
+        return true;
+    }
+    if (cJSON_IsNumber(scene)) {
+        snprintf(out, out_len, "%d", (int)scene->valuedouble);
+        return true;
+    }
+    return false;
+}
+
+static uint16_t copilot_get_sequence_id(const cJSON *obj, uint16_t def_value) {
+    const char *keys[] = {"seq", "sequence", "sequence_id", "index", "number"};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+        const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, keys[i]);
+        if (cJSON_IsNumber(item) && item->valuedouble >= 0 && item->valuedouble <= 65535) {
+            return (uint16_t)item->valuedouble;
+        }
+    }
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(obj, "id");
+    if (cJSON_IsNumber(id) && id->valuedouble >= 0 && id->valuedouble <= 65535) {
+        return (uint16_t)id->valuedouble;
+    }
+    return def_value;
+}
+
 static copilot_screen_orientation_t copilot_orientation_from_name(const char *name) {
     if (!name) {
         return COPILOT_SCREEN_ORIENT_FRONT;
@@ -409,7 +484,7 @@ static copilot_screen_state_t copilot_screen_state_from_name(const char *name) {
     return COPILOT_SCREEN_STATE_NEUTRAL_IDLE;
 }
 
-static void copilot_handle_payload(const char *payload, int payload_len) {
+void copilot_app_handle_command(const char *payload, int payload_len) {
     LOGI_APP( "MQTT payload: %.*s", payload_len, payload);
     cJSON *root = cJSON_ParseWithLength(payload, payload_len);
     if (!root) {
@@ -423,7 +498,12 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
         return;
     }
 
-    if (strcmp(type->valuestring, "screen") == 0 || strcmp(type->valuestring, "display") == 0) {
+    if (strcmp(type->valuestring, "wifi") == 0) {
+        const char *ssid = copilot_get_string_any(root, "ssid", nullptr, "");
+        const char *password = copilot_get_string_any(root, "password", "pass", "");
+        bool ok = copilot_mqtt_configure_wifi(ssid, password);
+        ESP_LOGI(TAG, "WiFi config command: ssid=%s result=%s", ssid, ok ? "ok" : "failed");
+    } else if (strcmp(type->valuestring, "screen") == 0 || strcmp(type->valuestring, "display") == 0) {
         const char *action = copilot_get_string_any(root, "action", nullptr, "");
         const char *state_name = copilot_get_string_any(root, "state", nullptr, "");
         const char *message_id = copilot_get_string_any(root, "message_id", "id", "");
@@ -549,7 +629,34 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
                  copilot_screen_orientation_name(orientation),
                  sound_id ? sound_id : "none");
         copilot_schedule_expression(expr, duration_ms, prelight_ms, sound_id, orientation, message_id);
-    } else if (strcmp(type->valuestring, "sound") == 0) {
+    } else if (strcmp(type->valuestring, "sound") == 0 ||
+               strcmp(type->valuestring, "audio") == 0 ||
+               strcmp(type->valuestring, "play") == 0) {
+        char scene_id[32];
+        bool has_scene = copilot_get_scene_string(root, scene_id, sizeof(scene_id));
+        const cJSON *seq_item = cJSON_GetObjectItemCaseSensitive(root, "seq");
+        if (!seq_item) {
+            seq_item = cJSON_GetObjectItemCaseSensitive(root, "sequence");
+        }
+        if (!seq_item) {
+            seq_item = cJSON_GetObjectItemCaseSensitive(root, "sequence_id");
+        }
+        bool has_sequence = cJSON_IsNumber(seq_item);
+        if (has_scene || has_sequence) {
+            if (scene_id[0] == '\0') {
+                strncpy(scene_id, "default", sizeof(scene_id) - 1);
+                scene_id[sizeof(scene_id) - 1] = '\0';
+            }
+            uint16_t sequence_id = copilot_get_sequence_id(root, 1);
+            uint32_t prelight_ms = copilot_get_u32(root, "prelight_ms", 0);
+            uint32_t duration_ms = copilot_get_u32(root, "duration_ms", 0);
+            copilot_screen_orientation_t orientation = copilot_get_orientation(root);
+            const char *message_id = copilot_get_string_any(root, "message_id", nullptr, "");
+            ESP_LOGI(TAG, "Scene audio cmd: scene=%s seq=%u", scene_id, (unsigned)sequence_id);
+            copilot_schedule_scene_sound(scene_id, sequence_id, prelight_ms, duration_ms, orientation, message_id);
+            cJSON_Delete(root);
+            return;
+        }
         const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
         const char *sound_id = cJSON_IsString(id) ? id->valuestring : "beep_short";
         uint32_t prelight_ms = copilot_get_u32(root, "prelight_ms", CONFIG_COPILOT_PRELIGHT_MS);
@@ -787,7 +894,45 @@ static void copilot_mqtt_cmd_handler(const char *topic, const char *payload, int
         return;
     }
     LOGI_APP( "MQTT cmd topic=%s len=%d", topic ? topic : "null", payload_len);
-    copilot_handle_payload(payload, payload_len);
+    copilot_app_handle_command(payload, payload_len);
+}
+
+bool copilot_app_format_status(char *out, unsigned out_len) {
+    if (!out || out_len == 0) {
+        return false;
+    }
+
+    copilot_network_status_t net = {};
+    copilot_audio_status_t audio = {};
+    copilot_mqtt_get_status(&net);
+    copilot_audio_get_status(&audio);
+
+    snprintf(out, out_len,
+             "{\"type\":\"status\","
+             "\"device_id\":\"%s\","
+             "\"wifi\":{\"started\":%s,\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\"},"
+             "\"mqtt\":{\"started\":%s,\"connected\":%s},"
+             "\"tcp_host\":\"%s\","
+             "\"audio\":{\"ready\":%s,\"sd_mounted\":%s,\"playing_file\":%s,"
+             "\"files_played\":%lu,\"current_path\":\"%s\",\"last_error\":\"%s\"},"
+             "\"heap\":{\"internal_free\":%lu,\"psram_free\":%lu}}",
+             net.device_id,
+             net.wifi_started ? "true" : "false",
+             net.wifi_connected ? "true" : "false",
+             net.ssid,
+             net.ip,
+             net.mqtt_started ? "true" : "false",
+             net.mqtt_connected ? "true" : "false",
+             net.tcp_host,
+             audio.ready ? "true" : "false",
+             audio.sd_mounted ? "true" : "false",
+             audio.playing_file ? "true" : "false",
+             (unsigned long)audio.files_played,
+             audio.current_path,
+             audio.last_error,
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    return true;
 }
 
 void copilot_app_init(void) {
@@ -813,6 +958,12 @@ void copilot_app_init(void) {
     copilot_ensure_action_task();
     copilot_mqtt_notify_voice_ready();
     copilot_app_network_start();
+#if CONFIG_COPILOT_TCP_HOST_ENABLE
+    copilot_tcp_host_start(copilot_app_handle_command);
+#endif
+#if CONFIG_COPILOT_SERIAL_CONSOLE_ENABLE
+    copilot_serial_console_start();
+#endif
 }
 
 void copilot_app_network_start(void) {

@@ -14,6 +14,7 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "mqtt_client.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
 
@@ -39,8 +40,14 @@ static bool s_voice_start_pending = false;
 static char s_device_id[32];
 static char s_topic_cmd[96];
 static char s_topic_status[96];
+static char s_wifi_ssid[33];
+static char s_wifi_password[65];
+static char s_ip_string[16];
 
 static const int kMaxRetry = 6;
+static const char *kWifiNvsNs = "copilot_wifi";
+static const char *kWifiNvsSsid = "ssid";
+static const char *kWifiNvsPass = "pass";
 
 static void copilot_mqtt_stop_client(const char *reason) {
     if (!s_mqtt || !s_mqtt_started) {
@@ -76,6 +83,56 @@ static void copilot_build_topics(void) {
     snprintf(s_topic_status, sizeof(s_topic_status), "%s/%s/status", prefix, s_device_id);
     LOGI_MQTT( "MQTT cmd topic: %s", s_topic_cmd);
     LOGI_MQTT( "MQTT status topic: %s", s_topic_status);
+}
+
+static void copilot_load_wifi_credentials(void) {
+    if (s_wifi_ssid[0] != '\0') {
+        return;
+    }
+
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open(kWifiNvsNs, NVS_READONLY, &handle);
+    if (err == ESP_OK) {
+        size_t ssid_len = sizeof(s_wifi_ssid);
+        size_t pass_len = sizeof(s_wifi_password);
+        esp_err_t ssid_err = nvs_get_str(handle, kWifiNvsSsid, s_wifi_ssid, &ssid_len);
+        esp_err_t pass_err = nvs_get_str(handle, kWifiNvsPass, s_wifi_password, &pass_len);
+        nvs_close(handle);
+        if (ssid_err == ESP_OK && s_wifi_ssid[0] != '\0') {
+            if (pass_err != ESP_OK) {
+                s_wifi_password[0] = '\0';
+            }
+            ESP_LOGI(TAG, "WiFi credentials loaded from NVS: %s", s_wifi_ssid);
+            return;
+        }
+    }
+
+    strncpy(s_wifi_ssid, CONFIG_COPILOT_WIFI_SSID, sizeof(s_wifi_ssid) - 1);
+    s_wifi_ssid[sizeof(s_wifi_ssid) - 1] = '\0';
+    strncpy(s_wifi_password, CONFIG_COPILOT_WIFI_PASSWORD, sizeof(s_wifi_password) - 1);
+    s_wifi_password[sizeof(s_wifi_password) - 1] = '\0';
+    if (s_wifi_ssid[0] != '\0') {
+        ESP_LOGI(TAG, "WiFi credentials loaded from sdkconfig: %s", s_wifi_ssid);
+    }
+}
+
+static void copilot_fill_wifi_config(wifi_config_t *wifi_config) {
+    if (!wifi_config) {
+        return;
+    }
+    memset(wifi_config, 0, sizeof(*wifi_config));
+    strncpy((char *)wifi_config->sta.ssid, s_wifi_ssid, sizeof(wifi_config->sta.ssid) - 1);
+    wifi_config->sta.ssid[sizeof(wifi_config->sta.ssid) - 1] = '\0';
+    strncpy((char *)wifi_config->sta.password, s_wifi_password, sizeof(wifi_config->sta.password) - 1);
+    wifi_config->sta.password[sizeof(wifi_config->sta.password) - 1] = '\0';
+
+    if (s_wifi_password[0] == '\0') {
+        wifi_config->sta.threshold.authmode = WIFI_AUTH_OPEN;
+    } else {
+        wifi_config->sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    }
+    wifi_config->sta.pmf_cfg.capable = true;
+    wifi_config->sta.pmf_cfg.required = false;
 }
 
 static void copilot_mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
@@ -231,6 +288,7 @@ static void copilot_ip_event_handler(void *arg, esp_event_base_t event_base, int
     s_retry_num = 0;
     s_wifi_connected = true;
     if (ip_event) {
+        esp_ip4addr_ntoa(&ip_event->ip_info.ip, s_ip_string, sizeof(s_ip_string));
         LOGI_MQTT( "Got IP: " IPSTR, IP2STR(&ip_event->ip_info.ip));
     }
     copilot_mqtt_start_client();
@@ -242,15 +300,16 @@ static void copilot_ip_event_handler(void *arg, esp_event_base_t event_base, int
 }
 
 static void copilot_wifi_init(void) {
-    if (CONFIG_COPILOT_WIFI_SSID[0] == '\0') {
-        ESP_LOGW(TAG, "WiFi SSID not set, skip WiFi/MQTT (set in menuconfig: Copilot -> WiFi SSID)");
+    copilot_load_wifi_credentials();
+    if (s_wifi_ssid[0] == '\0') {
+        ESP_LOGW(TAG, "WiFi SSID not set, skip WiFi/MQTT (use tools/copilot_usb_config.py wifi)");
         return;
     }
     if (s_wifi_started) {
         LOGI_MQTT( "WiFi already started");
         return;
     }
-    LOGI_MQTT( "WiFi SSID: %s", CONFIG_COPILOT_WIFI_SSID);
+    LOGI_MQTT( "WiFi SSID: %s", s_wifi_ssid);
 
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -284,18 +343,7 @@ static void copilot_wifi_init(void) {
     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &copilot_ip_event_handler, nullptr, nullptr));
 
     wifi_config_t wifi_config = {};
-    strncpy((char *)wifi_config.sta.ssid, CONFIG_COPILOT_WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
-    wifi_config.sta.ssid[sizeof(wifi_config.sta.ssid) - 1] = '\0';
-    strncpy((char *)wifi_config.sta.password, CONFIG_COPILOT_WIFI_PASSWORD, sizeof(wifi_config.sta.password) - 1);
-    wifi_config.sta.password[sizeof(wifi_config.sta.password) - 1] = '\0';
-
-    if (CONFIG_COPILOT_WIFI_PASSWORD[0] == '\0') {
-        wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    } else {
-        wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-    }
-    wifi_config.sta.pmf_cfg.capable = true;
-    wifi_config.sta.pmf_cfg.required = false;
+    copilot_fill_wifi_config(&wifi_config);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
@@ -339,6 +387,94 @@ void copilot_mqtt_publish(const char *topic_suffix, const char *payload) {
     snprintf(topic, sizeof(topic), "%s/%s/%s", prefix, s_device_id, topic_suffix);
     LOGI_MQTT( "MQTT publish: %s (%d bytes)", topic, (int)strlen(payload));
     esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 0);
+}
+
+bool copilot_mqtt_configure_wifi(const char *ssid, const char *password) {
+    if (!ssid || ssid[0] == '\0' || strlen(ssid) > 32) {
+        ESP_LOGW(TAG, "Invalid WiFi SSID");
+        return false;
+    }
+    if (password && strlen(password) > 64) {
+        ESP_LOGW(TAG, "Invalid WiFi password");
+        return false;
+    }
+
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open(kWifiNvsNs, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Open WiFi NVS failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    err = nvs_set_str(handle, kWifiNvsSsid, ssid);
+    if (err == ESP_OK) {
+        err = nvs_set_str(handle, kWifiNvsPass, password ? password : "");
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Save WiFi NVS failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    strncpy(s_wifi_ssid, ssid, sizeof(s_wifi_ssid) - 1);
+    s_wifi_ssid[sizeof(s_wifi_ssid) - 1] = '\0';
+    strncpy(s_wifi_password, password ? password : "", sizeof(s_wifi_password) - 1);
+    s_wifi_password[sizeof(s_wifi_password) - 1] = '\0';
+    s_retry_num = 0;
+    s_wifi_connected = false;
+    s_ip_string[0] = '\0';
+
+    if (!s_wifi_started) {
+        copilot_wifi_init();
+        return true;
+    }
+
+    wifi_config_t wifi_config = {};
+    copilot_fill_wifi_config(&wifi_config);
+    esp_wifi_disconnect();
+    esp_err_t cfg_err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    if (cfg_err != ESP_OK) {
+        ESP_LOGE(TAG, "Set WiFi config failed: %s", esp_err_to_name(cfg_err));
+        return false;
+    }
+    ESP_LOGI(TAG, "WiFi reconfigured, reconnecting to %s", s_wifi_ssid);
+    esp_wifi_connect();
+    return true;
+}
+
+bool copilot_mqtt_get_status(copilot_network_status_t *out_status) {
+    if (!out_status) {
+        return false;
+    }
+    copilot_load_wifi_credentials();
+    memset(out_status, 0, sizeof(*out_status));
+    out_status->wifi_started = s_wifi_started;
+    out_status->wifi_connected = s_wifi_connected;
+    out_status->mqtt_started = s_mqtt_started;
+    out_status->mqtt_connected = s_mqtt_connected;
+    strncpy(out_status->ssid, s_wifi_ssid, sizeof(out_status->ssid) - 1);
+    strncpy(out_status->ip, s_ip_string, sizeof(out_status->ip) - 1);
+    if (s_device_id[0] == '\0') {
+        copilot_build_device_id();
+    }
+    strncpy(out_status->device_id, s_device_id, sizeof(out_status->device_id) - 1);
+#if CONFIG_COPILOT_TCP_HOST_ENABLE
+    if (s_ip_string[0] != '\0') {
+        snprintf(out_status->tcp_host, sizeof(out_status->tcp_host), "%s:%d", s_ip_string,
+                 CONFIG_COPILOT_TCP_HOST_PORT);
+    }
+#endif
+    return true;
+}
+
+bool copilot_mqtt_wifi_is_connected(void) {
+    return s_wifi_connected;
+}
+
+const char *copilot_mqtt_ip_string(void) {
+    return s_ip_string;
 }
 
 const char *copilot_mqtt_cmd_topic(void) {

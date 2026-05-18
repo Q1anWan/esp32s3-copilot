@@ -54,8 +54,9 @@ uint8_t copilot_voice_ui_get_mouth_open(void) {
         return copilot_audio_out_get_envelope();
     }
 
-    // Check if voice source is currently active (handles TTS playback)
-    if (copilot_audio_out_get_active() == AUDIO_SRC_VOICE) {
+    // Check if a speaking audio source is currently active (TTS or SD-card file playback)
+    copilot_audio_src_t active_src = copilot_audio_out_get_active();
+    if (active_src == AUDIO_SRC_VOICE || active_src == AUDIO_SRC_FILE) {
         return copilot_audio_out_get_envelope();
     }
 

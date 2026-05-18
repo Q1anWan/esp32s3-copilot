@@ -159,6 +159,26 @@ esp_err_t bsp_spiffs_unmount(void)
 
 esp_err_t bsp_sdcard_mount(void)
 {
+    esp_io_expander_handle_t expander = bsp_io_expander_init();
+    if (expander) {
+        const uint32_t sd_power_pins = IO_EXPANDER_PIN_NUM_0 |
+                                       IO_EXPANDER_PIN_NUM_1 |
+                                       IO_EXPANDER_PIN_NUM_2 |
+                                       IO_EXPANDER_PIN_NUM_7;
+        esp_io_expander_set_dir(expander, sd_power_pins, IO_EXPANDER_OUTPUT);
+        esp_io_expander_set_level(expander, IO_EXPANDER_PIN_NUM_0, 0);
+        esp_io_expander_set_level(expander, IO_EXPANDER_PIN_NUM_1, 0);
+        esp_io_expander_set_level(expander, IO_EXPANDER_PIN_NUM_2, 0);
+        esp_io_expander_set_level(expander, IO_EXPANDER_PIN_NUM_7, 0);
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_io_expander_set_level(expander, IO_EXPANDER_PIN_NUM_0, 1);
+        esp_io_expander_set_level(expander, IO_EXPANDER_PIN_NUM_1, 1);
+        esp_io_expander_set_level(expander, IO_EXPANDER_PIN_NUM_2, 1);
+        esp_io_expander_set_level(expander, IO_EXPANDER_PIN_NUM_7, 1);
+    } else {
+        ESP_LOGW(TAG, "SD card IO expander init failed; continue with SDMMC mount");
+    }
+
     const esp_vfs_fat_sdmmc_mount_config_t mount_config = {
 #ifdef CONFIG_BSP_SD_FORMAT_ON_MOUNT_FAIL
         .format_if_mount_failed = true,

@@ -308,6 +308,31 @@ static portMUX_TYPE s_tone_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint8_t s_envelope = 0;
 static volatile uint32_t s_envelope_time_ms = 0;
 
+static bool audio_src_drives_mouth(copilot_audio_src_t src) {
+    return src == AUDIO_SRC_VOICE || src == AUDIO_SRC_FILE;
+}
+
+static void update_audio_envelope(const int16_t *samples, int num_i16_samples, int stride) {
+    if (!samples || num_i16_samples <= 0 || stride <= 0) {
+        return;
+    }
+
+    int32_t peak = 0;
+    for (int i = 0; i < num_i16_samples; i += stride * 4) {
+        int32_t abs_val = samples[i] > 0 ? samples[i] : -samples[i];
+        if (abs_val > peak) {
+            peak = abs_val;
+        }
+    }
+
+    int32_t env = (peak * 255) / 12000;
+    if (env > 255) {
+        env = 255;
+    }
+    s_envelope = (uint8_t)env;
+    s_envelope_time_ms = (uint32_t)(esp_timer_get_time() / 1000);
+}
+
 static void audio_out_force_power_amp_on(const char *reason) {
 #if defined(BSP_POWER_AMP_IO)
     if (BSP_POWER_AMP_IO == GPIO_NUM_NC) {
@@ -435,7 +460,7 @@ static void output_task_func(void *arg) {
             last_src = active_src;
         }
 
-        if (active_src == AUDIO_SRC_VOICE && !tone_active) {
+        if ((active_src == AUDIO_SRC_VOICE || active_src == AUDIO_SRC_FILE) && !tone_active) {
             int buffered = ring_used(&s_out.ring);
             if (!stream_prefilled) {
                 if (buffered < STREAM_PREFILL_BYTES) {
@@ -811,19 +836,9 @@ int copilot_audio_out_write(copilot_audio_src_t src,
         return 0;
     }
 
-    // Calculate envelope for voice source (for mouth animation)
-    if (src == AUDIO_SRC_VOICE && num_samples > 0) {
-        int32_t peak = 0;
-        // Fast peak detection: sample every 4th sample for speed
-        for (int i = 0; i < num_samples; i += 4) {
-            int32_t abs_val = samples[i] > 0 ? samples[i] : -samples[i];
-            if (abs_val > peak) peak = abs_val;
-        }
-        // Normalize: typical TTS peak ~8000-16000, map to 0-255
-        int32_t env = (peak * 255) / 12000;
-        if (env > 255) env = 255;
-        s_envelope = (uint8_t)env;
-        s_envelope_time_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    // Calculate envelope for speaking animation.
+    if (audio_src_drives_mouth(src) && num_samples > 0) {
+        update_audio_envelope(samples, num_samples, 1);
     }
 
     // Convert mono to stereo and write
@@ -841,7 +856,7 @@ int copilot_audio_out_write(copilot_audio_src_t src,
         // Mono to stereo conversion
         for (int i = 0; i < to_process; i++) {
             int16_t sample = samples[written + i];
-            if (src == AUDIO_SRC_VOICE) {
+            if (audio_src_drives_mouth(src)) {
                 sample = voice_scale_sample(sample);
             }
             stereo_chunk[i * 2] = sample;      // Left
@@ -872,6 +887,10 @@ int copilot_audio_out_write_stereo(copilot_audio_src_t src,
 
     if (s_out.active_src != src) {
         return 0;
+    }
+
+    if (audio_src_drives_mouth(src) && num_samples > 0) {
+        update_audio_envelope(samples, num_samples * 2, 2);
     }
 
     int bytes_to_write = num_samples * 2 * sizeof(int16_t);

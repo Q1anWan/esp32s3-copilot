@@ -10,7 +10,8 @@
  *
  * Audio Sources (by priority, highest first):
  * 1. VOICE - TTS/WebRTC audio (16kHz mono -> stereo)
- * 2. TONE  - Notification sounds (generated tones)
+ * 2. FILE  - Local SD-card audio playback
+ * 3. TONE  - Notification sounds (generated tones)
  */
 
 #pragma once
@@ -28,6 +29,7 @@ extern "C" {
 typedef enum {
     AUDIO_SRC_NONE = 0,     ///< No active source
     AUDIO_SRC_TONE,         ///< Low priority: notification tones
+    AUDIO_SRC_FILE,         ///< Local SD-card file playback
     AUDIO_SRC_VOICE,        ///< High priority: TTS/WebRTC voice
 } copilot_audio_src_t;
 

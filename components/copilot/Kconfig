@@ -23,6 +23,32 @@ config COPILOT_DEVICE_ID
     string "Device ID"
     default "s3_copilot"
 
+config COPILOT_SD_AUDIO_ENABLE
+    bool "Enable TF-card audio playback"
+    default y
+    help
+        Mount the FAT32 TF card and play 16 kHz 16-bit WAV/PCM files from
+        /sdcard/audio using scene and sequence IDs.
+
+config COPILOT_TCP_HOST_ENABLE
+    bool "Enable LAN TCP command host"
+    default y
+    help
+        Start a TCP server after WiFi connects. Slave devices can send
+        newline-delimited JSON or PLAY commands to trigger local audio files.
+
+config COPILOT_TCP_HOST_PORT
+    int "LAN TCP command host port"
+    default 7777
+    depends on COPILOT_TCP_HOST_ENABLE
+
+config COPILOT_SERIAL_CONSOLE_ENABLE
+    bool "Enable USB serial quick configuration console"
+    default y
+    help
+        Accept JSON-line and short text commands over the USB serial console
+        for WiFi setup, status queries, debug control, and local audio tests.
+
 config COPILOT_UI_CORE
     int "UI/LVGL task core affinity (-1: no affinity, 0/1: core)"
     default 1

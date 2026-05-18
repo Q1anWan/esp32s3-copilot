@@ -2,7 +2,8 @@
 """
 ESP32-S3 Copilot Dashboard — servo control, battery monitor, audio playback.
 
-Dependencies: paho-mqtt, numpy, scipy, websockets
+Dependencies: paho-mqtt, numpy, websockets
+Optional: scipy (higher-quality WAV resampling)
 System: ffmpeg (for audio file conversion)
 
 Usage:
@@ -28,9 +29,13 @@ from tkinter import ttk, filedialog, messagebox
 
 import numpy as np
 import paho.mqtt.client as mqtt
-from scipy import signal as scipy_signal
 from websockets.asyncio.server import serve as ws_serve
 from websockets.exceptions import ConnectionClosed
+
+try:
+    from scipy import signal as scipy_signal
+except ModuleNotFoundError:
+    scipy_signal = None
 
 
 # ── Defaults ────────────────────────────────────────────────────────────────
@@ -45,6 +50,44 @@ SAMPLE_RATE = 16000  # ESP32 expects 16kHz mono s16le PCM
 FRAME_MS   = 20
 FRAME_SAMPLES = int(SAMPLE_RATE * FRAME_MS / 1000)  # 320 samples per frame
 FRAME_BYTES   = FRAME_SAMPLES * 2  # 640 bytes per frame
+DEFAULT_PRE_CUE_MS = 500
+
+
+def build_screen_message(duration_ms: int, orientation: str = "front", message_id: str = "") -> dict:
+    """Participant-facing display timeline: cue first, then speaking."""
+    return {
+        "type": "screen",
+        "action": "message",
+        "orientation": orientation,
+        "pre_cue_ms": DEFAULT_PRE_CUE_MS,
+        "speech_ms": duration_ms,
+        "message_id": message_id,
+        "calibration_content_present": False,
+        "visual_semantic_content_present": False,
+    }
+
+
+def build_screen_state(state: str, duration_ms: int = 0, orientation: str = "front", message_id: str = "") -> dict:
+    """Single screen state command for tight dashboard/audio synchronization."""
+    return {
+        "type": "screen",
+        "state": state,
+        "orientation": orientation,
+        "duration_ms": duration_ms,
+        "message_id": message_id,
+        "calibration_content_present": False,
+        "visual_semantic_content_present": False,
+    }
+
+
+def wait_for_audio_client(server: "AudioServer", timeout_s: float = 10.0) -> bool:
+    """Wait until ESP32 has completed the WebSocket handshake."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if server.connected:
+            return True
+        time.sleep(0.1)
+    return server.connected
 
 
 # ── Audio conversion ────────────────────────────────────────────────────────
@@ -67,12 +110,27 @@ def convert_to_pcm16(file_path: str) -> bytes:
     return proc.stdout
 
 
+def _resample_i16(samples: np.ndarray, orig_rate: int) -> np.ndarray:
+    """Resample mono int16 samples to the dashboard sample rate."""
+    if orig_rate == SAMPLE_RATE or len(samples) == 0:
+        return samples.astype(np.int16, copy=False)
+
+    samples_f = samples.astype(np.float64)
+    target_len = max(1, int(len(samples_f) * SAMPLE_RATE / orig_rate))
+    if scipy_signal is not None:
+        resampled = scipy_signal.resample(samples_f, target_len)
+    else:
+        # Linear interpolation keeps the dashboard usable in minimal Python envs.
+        src_x = np.linspace(0.0, 1.0, len(samples_f), endpoint=False)
+        dst_x = np.linspace(0.0, 1.0, target_len, endpoint=False)
+        resampled = np.interp(dst_x, src_x, samples_f)
+    return np.clip(resampled, -32768, 32767).astype(np.int16)
+
+
 def resample_pcm(pcm: bytes, orig_rate: int) -> bytes:
-    """Resample raw s16le mono PCM to 16kHz using scipy."""
+    """Resample raw s16le mono PCM to 16kHz."""
     samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float64)
-    target_len = int(len(samples) * SAMPLE_RATE / orig_rate)
-    resampled = scipy_signal.resample(samples, target_len)
-    return resampled.astype(np.int16).tobytes()
+    return _resample_i16(samples, orig_rate).tobytes()
 
 
 def read_wav_pcm(file_path: str) -> bytes:
@@ -110,12 +168,24 @@ def read_wav_pcm(file_path: str) -> bytes:
 
     # Resample if needed
     if framerate != SAMPLE_RATE:
-        samples_f = samples.astype(np.float64)
-        target_len = int(len(samples_f) * SAMPLE_RATE / framerate)
-        samples_f = scipy_signal.resample(samples_f, target_len)
-        samples = samples_f.astype(np.int16)
+        samples = _resample_i16(samples, framerate)
 
     return samples.tobytes()
+
+
+def build_test_tone(duration_s: float = 2.0, freq_hz: float = 660.0, amplitude: float = 0.70) -> bytes:
+    """Generate a 16kHz mono s16le sine tone with short fades."""
+    total = max(1, int(SAMPLE_RATE * duration_s))
+    t = np.arange(total, dtype=np.float64) / SAMPLE_RATE
+    samples = np.sin(2.0 * np.pi * freq_hz * t) * amplitude
+
+    fade = min(total // 2, int(SAMPLE_RATE * 0.03))
+    if fade > 0:
+        ramp = np.linspace(0.0, 1.0, fade, endpoint=True)
+        samples[:fade] *= ramp
+        samples[-fade:] *= ramp[::-1]
+
+    return np.clip(samples * 32767.0, -32768, 32767).astype(np.int16).tobytes()
 
 
 # ── WebSocket audio server ──────────────────────────────────────────────────
@@ -127,23 +197,46 @@ class AudioServer:
         self.host = host
         self.port = port
         self.pcm_data: bytes = b""
+        self.label = ""
         self.playing = False
         self.stop_requested = False
+        self.connected = False
+        self.streaming = False
+        self.last_client = ""
+        self.last_frames_sent = 0
+        self.last_bytes_sent = 0
         self.server_task: asyncio.Task | None = None
         self._lock = threading.Lock()
 
     def load_file(self, file_path: str) -> float:
         """Load and convert an audio file. Returns duration in seconds."""
         ext = os.path.splitext(file_path)[1].lower()
-        if ext in (".wav", ".wave"):
+        if ext in (".pcm", ".s16le", ".raw"):
+            with open(file_path, "rb") as f:
+                pcm = f.read()
+        elif ext in (".wav", ".wave"):
             pcm = read_wav_pcm(file_path)
         else:
             pcm = convert_to_pcm16(file_path)
         with self._lock:
             self.pcm_data = pcm
+            self.label = os.path.basename(file_path)
             self.playing = False
             self.stop_requested = False
+            self.last_frames_sent = 0
+            self.last_bytes_sent = 0
         return len(pcm) / (2 * SAMPLE_RATE)  # duration in seconds
+
+    def load_pcm(self, pcm: bytes, label: str) -> float:
+        """Load already-converted 16kHz mono s16le PCM."""
+        with self._lock:
+            self.pcm_data = pcm
+            self.label = label
+            self.playing = False
+            self.stop_requested = False
+            self.last_frames_sent = 0
+            self.last_bytes_sent = 0
+        return len(pcm) / (2 * SAMPLE_RATE)
 
     def play(self):
         with self._lock:
@@ -174,6 +267,9 @@ class AudioServer:
         session_id = f"dashboard-{int(time.time() * 1000)}"
         await ws.send(json.dumps({"type": "started", "session_id": session_id}))
         print(f"[ws] Session started: {session_id}")
+        with self._lock:
+            self.connected = True
+            self.last_client = f"{device_id}@{ws.remote_address[0] if ws.remote_address else 'unknown'}"
 
         try:
             while True:
@@ -181,20 +277,30 @@ class AudioServer:
                     pcm = self.pcm_data
                     playing = self.playing
                     stop = self.stop_requested
+                    label = self.label
 
                 if not playing or len(pcm) == 0:
                     await asyncio.sleep(0.1)
                     continue
 
                 if stop:
-                    await ws.send(b"")  # Signal stop
                     with self._lock:
                         self.playing = False
                         self.stop_requested = False
+                        self.streaming = False
                     break
 
                 # Stream in frames
                 offset = 0
+                frames = 0
+                with self._lock:
+                    self.streaming = True
+                    self.last_frames_sent = 0
+                    self.last_bytes_sent = 0
+                print(f"[ws] Streaming '{label or 'audio'}' ({len(pcm)} bytes)")
+                loop = asyncio.get_running_loop()
+                next_send = loop.time()
+                frame_interval_s = FRAME_MS / 1000.0
                 while offset < len(pcm):
                     with self._lock:
                         if self.stop_requested:
@@ -204,19 +310,39 @@ class AudioServer:
                         break
                     await ws.send(chunk)
                     offset += len(chunk)
-                    await asyncio.sleep(FRAME_MS / 1000.0)
+                    frames += 1
+                    with self._lock:
+                        self.last_frames_sent = frames
+                        self.last_bytes_sent = offset
+                    next_send += frame_interval_s
+                    delay = next_send - loop.time()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    elif delay < -0.1:
+                        next_send = loop.time()
 
                 with self._lock:
                     self.playing = False
-                print(f"[ws] Stream finished ({len(pcm)} bytes)")
-                await ws.send(b"")  # Signal end
+                    self.stop_requested = False
+                    self.streaming = False
+                print(f"[ws] Stream finished ({offset}/{len(pcm)} bytes, {frames} frames)")
 
         except ConnectionClosed:
             print("[ws] ESP32 disconnected")
+        finally:
+            with self._lock:
+                self.connected = False
+                self.streaming = False
 
     async def _run_server(self):
         print(f"[ws] Audio server listening on ws://{self.host}:{self.port}/audio/stream")
-        async with ws_serve(self._handler, self.host, self.port) as server:
+        async with ws_serve(
+            self._handler,
+            self.host,
+            self.port,
+            compression=None,
+            ping_interval=None,
+        ) as server:
             await server.serve_forever()
 
     def start(self):
@@ -298,7 +424,7 @@ class Dashboard(tk.Tk):
     def __init__(self, broker: str, port: int, topic: str, ws_port: int):
         super().__init__()
         self.title("ESP32-S3 Copilot Dashboard")
-        self.geometry("680x620")
+        self.geometry("760x620")
         self.resizable(False, False)
         self.configure(bg="#1a1a2e")
 
@@ -325,6 +451,7 @@ class Dashboard(tk.Tk):
         # Audio server
         self.audio_server = AudioServer(port=ws_port)
         self.audio_server.start()
+        self._play_token = 0
 
         # Variables
         self.pitch_var = tk.DoubleVar(value=0.0)
@@ -469,6 +596,8 @@ class Dashboard(tk.Tk):
         ctrl_frame.pack(fill="x", pady=(6, 0))
         self.play_btn = ttk.Button(ctrl_frame, text="Play", command=self._toggle_play, width=10)
         self.play_btn.pack(side="left", padx=(0, 6))
+        ttk.Button(ctrl_frame, text="Speaker Test", command=self._speaker_test, width=13).pack(side="left", padx=(0, 6))
+        ttk.Button(ctrl_frame, text="Push WS Tone", command=self._push_test_tone, width=13).pack(side="left", padx=(0, 6))
         ttk.Label(ctrl_frame,
                   text=f"WS: :{self.audio_server.port}  |  Format: 16kHz mono s16le PCM  |  Frame: {FRAME_MS}ms/{FRAME_SAMPLES}samples",
                   font=("Segoe UI", 8), foreground="#666666").pack(side="left")
@@ -638,7 +767,7 @@ class Dashboard(tk.Tk):
     def _select_audio_file(self):
         path = filedialog.askopenfilename(
             title="Select Audio File",
-            filetypes=[("Audio files", "*.wav *.mp3 *.ogg *.flac *.m4a *.aac *.opus"),
+            filetypes=[("Audio files", "*.wav *.mp3 *.ogg *.flac *.m4a *.aac *.opus *.pcm *.s16le *.raw"),
                        ("All files", "*.*")])
         if not path:
             return
@@ -651,25 +780,69 @@ class Dashboard(tk.Tk):
         except Exception as e:
             messagebox.showerror("Audio Error", str(e))
 
+    def _start_audio_playback(self):
+        pcm_len = len(self.audio_server.pcm_data)
+        if pcm_len == 0:
+            messagebox.showinfo("No Audio", "Please select an audio file first.")
+            return
+
+        duration_ms = int((pcm_len / (2 * SAMPLE_RATE)) * 1000)
+        self._play_token += 1
+        token = self._play_token
+        self.play_var.set("Stop")
+        self.play_btn.configure(text="Stop")
+
+        def _begin_stream():
+            if token == self._play_token and self.play_var.get() == "Stop":
+                if self.mqtt.connected:
+                    self.mqtt.publish(build_screen_state("speaking", duration_ms + 500,
+                                                         message_id=self.audio_server.label))
+                self.audio_server.play()
+
+        def _arm_timeline(start_time: float):
+            if token != self._play_token or self.play_var.get() != "Stop":
+                return
+            waited_s = time.time() - start_time
+            if self.audio_server.connected or waited_s >= 10.0:
+                if self.mqtt.connected:
+                    self.mqtt.publish(build_screen_state("pre_message_orient", DEFAULT_PRE_CUE_MS + 150,
+                                                         message_id=self.audio_server.label))
+                    delay_ms = DEFAULT_PRE_CUE_MS
+                else:
+                    delay_ms = 0
+                self.after(delay_ms, _begin_stream)
+            else:
+                self.status_var.set("Waiting for ESP32 WebSocket...")
+                self.after(200, lambda: _arm_timeline(start_time))
+
+        self.after(0, lambda: _arm_timeline(time.time()))
+        ws_state = "connected" if self.audio_server.connected else "waiting for ESP32 WebSocket"
+        self.status_var.set(f"Playing {duration_ms / 1000:.1f}s audio ({ws_state})")
+
     def _toggle_play(self):
-        if self.audio_server.is_playing:
+        if self.play_var.get() == "Stop" or self.audio_server.is_playing:
+            self._play_token += 1
             self.audio_server.stop()
             self.play_var.set("Play")
             self.play_btn.configure(text="Play")
             if self.mqtt.connected:
-                self.mqtt.publish({"type": "emotion", "name": "idle"})
+                self.mqtt.publish({"type": "screen", "state": "return_neutral", "duration_ms": 500})
             self.status_var.set("Playback stopped")
         else:
-            if len(self.audio_server.pcm_data) == 0:
-                messagebox.showinfo("No Audio", "Please select an audio file first.")
-                return
-            self.audio_server.play()
-            self.play_var.set("Stop")
-            self.play_btn.configure(text="Stop")
-            if self.mqtt.connected:
-                # Send speaking emotion to animate mouth
-                self.mqtt.publish({"type": "emotion", "name": "speaking", "duration_ms": 0})
-            self.status_var.set("Playing (ESP32 will animate mouth)")
+            self._start_audio_playback()
+
+    def _speaker_test(self):
+        if not self.mqtt.connected:
+            messagebox.showinfo("MQTT Required", "Connect MQTT first, then run Speaker Test.")
+            return
+        self.mqtt.publish({"type": "sound", "id": "speaker_test", "prelight_ms": 0})
+        self.status_var.set("Speaker test tone sent via MQTT")
+
+    def _push_test_tone(self):
+        dur = self.audio_server.load_pcm(build_test_tone(2.0, 660.0, 0.45), "dashboard-test-tone")
+        self.audio_file_var.set("dashboard-test-tone")
+        self.audio_dur_var.set(f"{dur:.1f}s")
+        self._start_audio_playback()
 
     def _on_close(self):
         if self.mqtt.connected:
@@ -694,18 +867,76 @@ def main():
     parser.add_argument("--topic", default=DEF_TOPIC, help="MQTT command topic")
     parser.add_argument("--ws-port", type=int, default=DEF_WS_PORT, help="WebSocket audio server port")
     parser.add_argument("--no-gui", action="store_true", help="Headless mode (audio server only)")
+    parser.add_argument("--test-tone", action="store_true", help="Headless: stream a built-in WebSocket test tone")
+    parser.add_argument("--audio-file", help="Headless: convert and stream an audio file")
+    parser.add_argument("--exit-after-play", action="store_true", help="Headless: exit after queued audio finishes")
     args = parser.parse_args()
 
     if args.no_gui:
         srv = AudioServer(port=args.ws_port)
         srv.start()
         print(f"Audio server on ws://0.0.0.0:{args.ws_port}/audio/stream")
+
+        mqtt_client = None
+        queued_audio = False
+        queued_duration = 0.0
+        queued_bytes = 0
+        if args.audio_file:
+            queued_duration = srv.load_file(args.audio_file)
+            queued_bytes = len(srv.pcm_data)
+            queued_audio = True
+            print(f"Audio file queued: {args.audio_file} ({queued_duration:.1f}s, {queued_bytes} bytes)")
+        elif args.test_tone:
+            dur = srv.load_pcm(build_test_tone(2.0, 660.0, 0.45), "dashboard-test-tone")
+            queued_duration = dur
+            queued_bytes = len(srv.pcm_data)
+            queued_audio = True
+            print(f"Built-in test tone queued ({dur:.1f}s)")
+
+        if queued_audio:
+            mqtt_client = MqttClient(args.broker, args.port, args.topic, DEF_STATUS_TOPIC)
+            if wait_for_audio_client(srv, timeout_s=10.0):
+                print(f"ESP32 WebSocket ready: {srv.last_client}")
+            else:
+                print("ESP32 WebSocket not ready after 10s; starting timeline anyway")
+            cue_delay_s = 0.0
+            if mqtt_client.connect():
+                message_id = srv.label or "headless-audio"
+                mqtt_client.publish(build_screen_state("pre_message_orient", DEFAULT_PRE_CUE_MS + 150,
+                                                       message_id=message_id))
+                cue_delay_s = DEFAULT_PRE_CUE_MS / 1000.0
+                print(f"MQTT screen timeline sent to {args.broker}:{args.port}")
+            else:
+                print("MQTT connection failed; WebSocket audio will still stream when ESP32 connects")
+            if cue_delay_s > 0:
+                time.sleep(cue_delay_s)
+            if mqtt_client and mqtt_client.connected:
+                mqtt_client.publish(build_screen_state("speaking", int(queued_duration * 1000) + 500,
+                                                       message_id=srv.label or "headless-audio"))
+            srv.play()
+
         print("Press Ctrl+C to stop")
         try:
-            while True:
-                time.sleep(1)
+            if args.exit_after_play and queued_audio:
+                deadline = time.time() + max(30.0, queued_duration + 45.0)
+                while time.time() < deadline:
+                    time.sleep(0.25)
+                    if (not srv.is_playing and not srv.streaming and
+                            srv.last_bytes_sent >= queued_bytes > 0):
+                        break
+                if srv.last_bytes_sent < queued_bytes:
+                    print(f"Playback timed out/short: {srv.last_bytes_sent}/{queued_bytes} bytes")
+                else:
+                    print(f"Playback complete: {srv.last_bytes_sent}/{queued_bytes} bytes")
+            else:
+                while True:
+                    time.sleep(1)
         except KeyboardInterrupt:
             pass
+        finally:
+            if mqtt_client and mqtt_client.connected:
+                mqtt_client.publish({"type": "screen", "state": "return_neutral", "duration_ms": 500})
+                mqtt_client.disconnect()
         return
 
     app = Dashboard(args.broker, args.port, args.topic, args.ws_port)

@@ -11,6 +11,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -22,6 +23,7 @@ static const char *TAG = "ws_client";
 // ============================================================================
 
 #define WS_AUDIO_SEND_TIMEOUT_MS 1000
+#define WS_AUDIO_RX_FRAME_SAMPLES 320
 
 typedef struct {
     esp_websocket_client_handle_t client;
@@ -50,6 +52,16 @@ typedef struct {
 } ws_client_ctx_t;
 
 static ws_client_ctx_t s_ctx = {};
+
+static struct {
+    int16_t frame[WS_AUDIO_RX_FRAME_SAMPLES];
+    size_t frame_fill;
+    uint8_t carry_byte;
+    bool has_carry_byte;
+    uint32_t frames_out;
+    uint32_t odd_chunks;
+    uint32_t short_chunks;
+} s_audio_rx = {};
 
 // ============================================================================
 // Internal Functions
@@ -106,6 +118,10 @@ static void send_stop_message(void) {
     cJSON_Delete(root);
 }
 
+static void reset_audio_rx_stream(void) {
+    memset(&s_audio_rx, 0, sizeof(s_audio_rx));
+}
+
 static void handle_text_message(const char *data, int len) {
     cJSON *root = cJSON_ParseWithLength(data, len);
     if (!root) {
@@ -135,12 +151,52 @@ static void handle_text_message(const char *data, int len) {
     cJSON_Delete(root);
 }
 
+static void emit_audio_sample(int16_t sample) {
+    s_audio_rx.frame[s_audio_rx.frame_fill++] = sample;
+    if (s_audio_rx.frame_fill >= WS_AUDIO_RX_FRAME_SAMPLES) {
+        s_ctx.on_audio(s_audio_rx.frame, WS_AUDIO_RX_FRAME_SAMPLES, s_ctx.user_data);
+        s_audio_rx.frame_fill = 0;
+        s_audio_rx.frames_out++;
+    }
+}
+
 static void handle_binary_message(const uint8_t *data, int len) {
     // Binary data is PCM audio from server (TTS output)
-    if (s_ctx.on_audio && len > 0) {
-        // Data is int16_t samples
-        size_t samples = len / sizeof(int16_t);
-        s_ctx.on_audio((const int16_t *)data, samples, s_ctx.user_data);
+    if (!s_ctx.on_audio || !data || len <= 0) {
+        return;
+    }
+
+    if (len != WS_AUDIO_RX_FRAME_SAMPLES * (int)sizeof(int16_t)) {
+        s_audio_rx.short_chunks++;
+        if (s_audio_rx.short_chunks <= 3 || s_audio_rx.short_chunks % 100 == 0) {
+            ESP_LOGW(TAG, "Unexpected audio chunk len=%d (count=%lu)",
+                     len, (unsigned long)s_audio_rx.short_chunks);
+        }
+    }
+
+    int index = 0;
+    if (s_audio_rx.has_carry_byte) {
+        int16_t sample = (int16_t)((uint16_t)s_audio_rx.carry_byte |
+                                   ((uint16_t)data[0] << 8));
+        emit_audio_sample(sample);
+        s_audio_rx.has_carry_byte = false;
+        index = 1;
+    }
+
+    for (; index + 1 < len; index += 2) {
+        int16_t sample = (int16_t)((uint16_t)data[index] |
+                                   ((uint16_t)data[index + 1] << 8));
+        emit_audio_sample(sample);
+    }
+
+    if (index < len) {
+        s_audio_rx.carry_byte = data[index];
+        s_audio_rx.has_carry_byte = true;
+        s_audio_rx.odd_chunks++;
+        if (s_audio_rx.odd_chunks <= 3 || s_audio_rx.odd_chunks % 10 == 0) {
+            ESP_LOGW(TAG, "Odd audio byte carried (count=%lu)",
+                     (unsigned long)s_audio_rx.odd_chunks);
+        }
     }
 }
 
@@ -163,6 +219,7 @@ static void websocket_event_handler(void *arg, esp_event_base_t event_base,
             ESP_LOGI(TAG, "WebSocket connected after %lu attempts", (unsigned long)s_ctx.connect_attempts);
             s_ctx.connect_attempts = 0;  // Reset counter on success
             s_ctx.session_id[0] = '\0';  // Clear old session ID
+            reset_audio_rx_stream();
             set_state(WS_CLIENT_STATE_CONNECTED);
             // Send start message to initiate session
             send_start_message();
@@ -172,6 +229,7 @@ static void websocket_event_handler(void *arg, esp_event_base_t event_base,
             ESP_LOGI(TAG, "WebSocket disconnected (auto-reconnect enabled)");
             // Reset session and go back to CONNECTING for auto-reconnect
             s_ctx.session_id[0] = '\0';
+            reset_audio_rx_stream();
             if (s_ctx.state == WS_CLIENT_STATE_STREAMING ||
                 s_ctx.state == WS_CLIENT_STATE_CONNECTED) {
                 set_state(WS_CLIENT_STATE_CONNECTING);
@@ -209,6 +267,7 @@ static void websocket_event_handler(void *arg, esp_event_base_t event_base,
         case WEBSOCKET_EVENT_CLOSED:
             ESP_LOGI(TAG, "WebSocket closed by server");
             s_ctx.session_id[0] = '\0';
+            reset_audio_rx_stream();
             // Go to CONNECTING to allow auto-reconnect (not IDLE)
             set_state(WS_CLIENT_STATE_CONNECTING);
             break;
@@ -254,6 +313,7 @@ bool copilot_ws_client_init(const copilot_ws_client_config_t *config) {
 
     s_ctx.state = WS_CLIENT_STATE_IDLE;
     s_ctx.initialized = true;
+    reset_audio_rx_stream();
 
     ESP_LOGI(TAG, "Initialized (server=%s, device=%s, rate=%d)",
              s_ctx.server_url, s_ctx.device_id, s_ctx.sample_rate);
@@ -302,13 +362,20 @@ bool copilot_ws_client_connect(void) {
 
     esp_websocket_client_config_t ws_cfg = {};
     ws_cfg.uri = s_ctx.server_url;
-    ws_cfg.buffer_size = 2048;             // Buffer for 2-3 audio frames (640 bytes + overhead each)
+    ws_cfg.buffer_size = 1024;             // 640-byte PCM frame plus WebSocket frame overhead
     ws_cfg.reconnect_timeout_ms = 3000;    // Retry every 3s on failure
     ws_cfg.network_timeout_ms = 10000;     // Connection timeout 10s
-    ws_cfg.ping_interval_sec = 5;          // Keep-alive ping every 5s
-    ws_cfg.pingpong_timeout_sec = 10;      // Pong response timeout 10s
+    ws_cfg.ping_interval_sec = 30;         // Reduce control traffic during long audio RX
+    ws_cfg.pingpong_timeout_sec = 30;      // Pong response timeout 30s
     ws_cfg.disable_auto_reconnect = false; // Enable auto-reconnect (default)
-    ws_cfg.task_stack = 4096;              // WebSocket task stack size
+    ws_cfg.task_prio = 4;                  // Keep below audio output and WiFi driver tasks
+    ws_cfg.task_stack = 3072;              // Plain ws:// audio path is memory constrained on this UI build
+
+    ESP_LOGI(TAG, "Starting WebSocket client (stack=%d, buffer=%d, internal_free=%u, largest=%u)",
+             ws_cfg.task_stack,
+             ws_cfg.buffer_size,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
     s_ctx.client = esp_websocket_client_init(&ws_cfg);
     if (!s_ctx.client) {
@@ -324,7 +391,10 @@ bool copilot_ws_client_connect(void) {
 
     esp_err_t err = esp_websocket_client_start(s_ctx.client);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to start WebSocket client: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to start WebSocket client: %s (internal_free=%u, largest=%u)",
+                 esp_err_to_name(err),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         esp_websocket_client_destroy(s_ctx.client);
         s_ctx.client = NULL;
         set_state(WS_CLIENT_STATE_ERROR);

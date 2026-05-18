@@ -1,6 +1,7 @@
 #ifndef COPILOT_UI_H
 #define COPILOT_UI_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "lvgl.h"
 #include "copilot_face_data.h"
@@ -25,14 +26,41 @@ typedef struct {
     int16_t speed;   // Q8.8 fixed-point
 } copilot_motion_t;
 
+typedef enum {
+    COPILOT_SCREEN_STATE_NEUTRAL_IDLE = 0,
+    COPILOT_SCREEN_STATE_PRE_MESSAGE_ORIENT,
+    COPILOT_SCREEN_STATE_SPEAKING,
+    COPILOT_SCREEN_STATE_RETURN_NEUTRAL,
+    COPILOT_SCREEN_STATE_SILENT_NEUTRAL,
+    COPILOT_SCREEN_STATE_DEBUG,
+} copilot_screen_state_t;
+
+typedef enum {
+    COPILOT_SCREEN_ORIENT_FRONT = 0,
+    COPILOT_SCREEN_ORIENT_LEFT,
+    COPILOT_SCREEN_ORIENT_RIGHT,
+    COPILOT_SCREEN_ORIENT_CENTER = COPILOT_SCREEN_ORIENT_FRONT,
+} copilot_screen_orientation_t;
+
+typedef struct {
+    copilot_screen_state_t state;
+    copilot_screen_orientation_t orientation;
+    uint32_t duration_ms;
+    const char *message_id;
+    bool calibration_content_present;
+    bool visual_semantic_content_present;
+} copilot_screen_event_t;
+
 void copilot_ui_init(lv_obj_t *root);
 bool copilot_ui_is_ready(void);
 
+void copilot_ui_set_screen_event(const copilot_screen_event_t *event);
 void copilot_ui_set_expression(copilot_expr_t expr, uint32_t duration_ms);
 void copilot_ui_set_motion(const copilot_motion_t *motion);
 void copilot_ui_ring_show(bool on);
 void copilot_ui_on_touch(uint16_t x, uint16_t y);
 
+void copilot_ui_set_screen_event_async(const copilot_screen_event_t *event);
 void copilot_ui_set_expression_async(copilot_expr_t expr, uint32_t duration_ms);
 void copilot_ui_set_motion_async(const copilot_motion_t *motion);
 void copilot_ui_set_motion_only_async(const copilot_motion_t *motion);  // Motion only, no expression trigger

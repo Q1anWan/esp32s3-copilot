@@ -45,18 +45,90 @@ enum action_type_t {
     ACTION_NONE = 0,
     ACTION_EXPR,
     ACTION_SOUND,
+    ACTION_SCREEN_STATE,
+    ACTION_SCREEN_MESSAGE,
 };
 
 struct copilot_action_t {
     action_type_t type;
     copilot_expr_t expr;
+    copilot_screen_state_t screen_state;
+    copilot_screen_orientation_t orientation;
     uint32_t duration_ms;
     uint32_t prelight_ms;
     char sound_id[16];
+    char message_id[32];
+    bool calibration_content_present;
+    bool visual_semantic_content_present;
 };
 
 static QueueHandle_t s_action_queue = nullptr;
 static TaskHandle_t s_action_task = nullptr;
+static bool s_network_started = false;
+
+static const char *copilot_screen_state_name(copilot_screen_state_t state) {
+    switch (state) {
+        case COPILOT_SCREEN_STATE_NEUTRAL_IDLE: return "neutral_idle";
+        case COPILOT_SCREEN_STATE_PRE_MESSAGE_ORIENT: return "pre_message_orient";
+        case COPILOT_SCREEN_STATE_SPEAKING: return "speaking";
+        case COPILOT_SCREEN_STATE_RETURN_NEUTRAL: return "return_neutral";
+        case COPILOT_SCREEN_STATE_SILENT_NEUTRAL: return "silent_neutral";
+        case COPILOT_SCREEN_STATE_DEBUG: return "debug";
+        default: return "unknown";
+    }
+}
+
+static const char *copilot_screen_orientation_name(copilot_screen_orientation_t orientation) {
+    switch (orientation) {
+        case COPILOT_SCREEN_ORIENT_LEFT: return "left";
+        case COPILOT_SCREEN_ORIENT_RIGHT: return "right";
+        default: return "front";
+    }
+}
+
+static void copilot_publish_screen_event(const copilot_action_t *action, copilot_screen_state_t state) {
+    if (!action) {
+        return;
+    }
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "{\"type\":\"screen_event\","
+             "\"calibration_content_present\":%s,"
+             "\"visual_semantic_content_present\":%s,"
+             "\"screen_state\":\"%s\","
+             "\"screen_orientation\":\"%s\","
+             "\"screen_text\":\"\","
+             "\"screen_icon\":\"\","
+             "\"t_cue\":0,"
+             "\"t_speech_start\":0,"
+             "\"t_speech_end\":0,"
+             "\"sync_error_ms\":0,"
+             "\"asset_version_hash\":\"face_soft_neutral_20260514\","
+             "\"message_id\":\"%s\"}",
+             action->calibration_content_present ? "true" : "false",
+             action->visual_semantic_content_present ? "true" : "false",
+             copilot_screen_state_name(state),
+             copilot_screen_orientation_name(action->orientation),
+             action->message_id);
+    copilot_mqtt_publish("status", buf);
+}
+
+static void copilot_apply_screen_action(const copilot_action_t *action,
+                                        copilot_screen_state_t state,
+                                        uint32_t duration_ms) {
+    if (!action) {
+        return;
+    }
+    copilot_screen_event_t event = {};
+    event.state = state;
+    event.orientation = action->orientation;
+    event.duration_ms = duration_ms;
+    event.message_id = action->message_id;
+    event.calibration_content_present = action->calibration_content_present;
+    event.visual_semantic_content_present = action->visual_semantic_content_present;
+    copilot_ui_set_screen_event_async(&event);
+    copilot_publish_screen_event(action, state);
+}
 
 static void copilot_action_task(void *arg) {
     (void)arg;
@@ -66,17 +138,31 @@ static void copilot_action_task(void *arg) {
             continue;
         }
 
-        if (action.prelight_ms > 0) {
-            copilot_ui_ring_show_async(true);
-            vTaskDelay(pdMS_TO_TICKS(action.prelight_ms));
-        }
-        copilot_ui_ring_show_async(false);
-
-        if (action.type == ACTION_EXPR) {
+        if (action.type == ACTION_SCREEN_MESSAGE) {
+            uint32_t cue_ms = action.prelight_ms > 0 ? action.prelight_ms : CONFIG_COPILOT_PRELIGHT_MS;
+            copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_PRE_MESSAGE_ORIENT, cue_ms + 150);
+            vTaskDelay(pdMS_TO_TICKS(cue_ms));
+            copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_SPEAKING, action.duration_ms);
+        } else if (action.type == ACTION_SCREEN_STATE) {
+            copilot_apply_screen_action(&action, action.screen_state, action.duration_ms);
+        } else if (action.type == ACTION_EXPR) {
             LOGI_APP( "Apply expression=%d duration=%u sound=%s", (int)action.expr, (unsigned)action.duration_ms,
                      action.sound_id[0] ? action.sound_id : "none");
-            copilot_ui_set_expression_async(action.expr, action.duration_ms);
+            if (action.expr == COPILOT_EXPR_SPEAKING) {
+                if (action.prelight_ms > 0) {
+                    copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_PRE_MESSAGE_ORIENT, action.prelight_ms + 150);
+                    vTaskDelay(pdMS_TO_TICKS(action.prelight_ms));
+                }
+                copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_SPEAKING, action.duration_ms);
+            } else {
+                copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_RETURN_NEUTRAL, 520);
+            }
         } else if (action.type == ACTION_SOUND) {
+            if (action.prelight_ms > 0) {
+                copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_PRE_MESSAGE_ORIENT, action.prelight_ms + 150);
+                vTaskDelay(pdMS_TO_TICKS(action.prelight_ms));
+                copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_RETURN_NEUTRAL, 520);
+            }
             LOGI_APP( "Play sound=%s", action.sound_id[0] ? action.sound_id : "none");
         }
 
@@ -129,18 +215,61 @@ static void copilot_enqueue_action(const copilot_action_t *action) {
     }
 }
 
-static void copilot_schedule_expression(copilot_expr_t expr, uint32_t duration_ms, uint32_t prelight_ms, const char *sound_id) {
+static void copilot_ensure_action_task(void) {
+    if (s_action_queue) {
+        return;
+    }
+
+    s_action_queue = xQueueCreate(8, sizeof(copilot_action_t));
+    if (!s_action_queue) {
+        ESP_LOGE(TAG, "Failed to create action queue");
+        return;
+    }
+
+    int core = copilot_normalize_core(CONFIG_COPILOT_ACTION_CORE);
+    BaseType_t task_ok;
+    // Priority lowered from 4 to 3 to reduce UI impact during MQTT processing
+    // Keep 3KB stack - audio playback path needs more stack
+    if (core >= 0) {
+        task_ok = xTaskCreatePinnedToCore(copilot_action_task, "copilot_action", 3 * 1024, nullptr, 3,
+                                          &s_action_task, core);
+    } else {
+        task_ok = xTaskCreate(copilot_action_task, "copilot_action", 3 * 1024, nullptr, 3, &s_action_task);
+    }
+    if (task_ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create action task");
+    } else {
+        LOGI_APP( "Action task core=%d", core);
+    }
+}
+
+static void copilot_copy_action_text(char *dst, size_t dst_len, const char *src) {
+    if (!dst || dst_len == 0) {
+        return;
+    }
+    if (src && src[0] != '\0') {
+        strncpy(dst, src, dst_len - 1);
+        dst[dst_len - 1] = '\0';
+    } else {
+        dst[0] = '\0';
+    }
+}
+
+static void copilot_schedule_expression(copilot_expr_t expr, uint32_t duration_ms, uint32_t prelight_ms,
+                                        const char *sound_id, copilot_screen_orientation_t orientation,
+                                        const char *message_id) {
     copilot_action_t action = {};
     action.type = ACTION_EXPR;
     action.expr = expr;
+    action.screen_state = expr == COPILOT_EXPR_SPEAKING ? COPILOT_SCREEN_STATE_SPEAKING
+                                                        : COPILOT_SCREEN_STATE_RETURN_NEUTRAL;
+    action.orientation = orientation;
     action.duration_ms = duration_ms;
     action.prelight_ms = prelight_ms;
-    if (sound_id && sound_id[0] != '\0') {
-        strncpy(action.sound_id, sound_id, sizeof(action.sound_id) - 1);
-        action.sound_id[sizeof(action.sound_id) - 1] = '\0';
-    }
-    LOGI_APP( "Schedule expression=%d duration=%u prelight=%u sound=%s", (int)expr, (unsigned)duration_ms,
-             (unsigned)prelight_ms, sound_id ? sound_id : "none");
+    copilot_copy_action_text(action.sound_id, sizeof(action.sound_id), sound_id);
+    copilot_copy_action_text(action.message_id, sizeof(action.message_id), message_id);
+    LOGI_APP( "Schedule expression=%d duration=%u prelight=%u orient=%s sound=%s", (int)expr, (unsigned)duration_ms,
+             (unsigned)prelight_ms, copilot_screen_orientation_name(orientation), sound_id ? sound_id : "none");
     copilot_enqueue_action(&action);
 }
 
@@ -148,13 +277,51 @@ static void copilot_schedule_sound(const char *sound_id, uint32_t prelight_ms) {
     copilot_action_t action = {};
     action.type = ACTION_SOUND;
     action.expr = COPILOT_EXPR_NEUTRAL;
+    action.screen_state = COPILOT_SCREEN_STATE_RETURN_NEUTRAL;
+    action.orientation = COPILOT_SCREEN_ORIENT_FRONT;
     action.duration_ms = 0;
     action.prelight_ms = prelight_ms;
-    if (sound_id && sound_id[0] != '\0') {
-        strncpy(action.sound_id, sound_id, sizeof(action.sound_id) - 1);
-        action.sound_id[sizeof(action.sound_id) - 1] = '\0';
-    }
+    copilot_copy_action_text(action.sound_id, sizeof(action.sound_id), sound_id);
     LOGI_APP( "Schedule sound=%s prelight=%u", sound_id ? sound_id : "none", (unsigned)prelight_ms);
+    copilot_enqueue_action(&action);
+}
+
+static void copilot_schedule_screen_state(copilot_screen_state_t state, copilot_screen_orientation_t orientation,
+                                          uint32_t duration_ms, const char *message_id,
+                                          bool calibration_content_present,
+                                          bool visual_semantic_content_present) {
+    copilot_action_t action = {};
+    action.type = ACTION_SCREEN_STATE;
+    action.expr = state == COPILOT_SCREEN_STATE_SPEAKING ? COPILOT_EXPR_SPEAKING : COPILOT_EXPR_NEUTRAL;
+    action.screen_state = state;
+    action.orientation = orientation;
+    action.duration_ms = duration_ms;
+    action.calibration_content_present = calibration_content_present;
+    action.visual_semantic_content_present = visual_semantic_content_present;
+    copilot_copy_action_text(action.message_id, sizeof(action.message_id), message_id);
+    LOGI_APP("Schedule screen state=%s duration=%u orient=%s msg=%s",
+             copilot_screen_state_name(state), (unsigned)duration_ms,
+             copilot_screen_orientation_name(orientation), action.message_id);
+    copilot_enqueue_action(&action);
+}
+
+static void copilot_schedule_screen_message(copilot_screen_orientation_t orientation, uint32_t prelight_ms,
+                                            uint32_t speech_ms, const char *message_id,
+                                            bool calibration_content_present,
+                                            bool visual_semantic_content_present) {
+    copilot_action_t action = {};
+    action.type = ACTION_SCREEN_MESSAGE;
+    action.expr = COPILOT_EXPR_SPEAKING;
+    action.screen_state = COPILOT_SCREEN_STATE_SPEAKING;
+    action.orientation = orientation;
+    action.duration_ms = speech_ms;
+    action.prelight_ms = prelight_ms;
+    action.calibration_content_present = calibration_content_present;
+    action.visual_semantic_content_present = visual_semantic_content_present;
+    copilot_copy_action_text(action.message_id, sizeof(action.message_id), message_id);
+    LOGI_APP("Schedule screen message cue=%u speech=%u orient=%s msg=%s",
+             (unsigned)prelight_ms, (unsigned)speech_ms,
+             copilot_screen_orientation_name(orientation), action.message_id);
     copilot_enqueue_action(&action);
 }
 
@@ -176,6 +343,72 @@ static uint32_t copilot_get_u32(const cJSON *obj, const char *key, uint32_t def_
     return def_value;
 }
 
+static bool copilot_get_bool(const cJSON *obj, const char *key, bool def_value) {
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsBool(item)) {
+        return cJSON_IsTrue(item);
+    }
+    return def_value;
+}
+
+static const char *copilot_get_string_any(const cJSON *obj, const char *key_a, const char *key_b, const char *def_value) {
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key_a);
+    if (cJSON_IsString(item) && item->valuestring) {
+        return item->valuestring;
+    }
+    if (key_b) {
+        item = cJSON_GetObjectItemCaseSensitive(obj, key_b);
+        if (cJSON_IsString(item) && item->valuestring) {
+            return item->valuestring;
+        }
+    }
+    return def_value;
+}
+
+static copilot_screen_orientation_t copilot_orientation_from_name(const char *name) {
+    if (!name) {
+        return COPILOT_SCREEN_ORIENT_FRONT;
+    }
+    if (strcmp(name, "left") == 0 || strcmp(name, "l") == 0) {
+        return COPILOT_SCREEN_ORIENT_LEFT;
+    }
+    if (strcmp(name, "right") == 0 || strcmp(name, "r") == 0) {
+        return COPILOT_SCREEN_ORIENT_RIGHT;
+    }
+    return COPILOT_SCREEN_ORIENT_FRONT;
+}
+
+static copilot_screen_orientation_t copilot_get_orientation(const cJSON *obj) {
+    const char *name = copilot_get_string_any(obj, "orientation", "direction", nullptr);
+    if (!name) {
+        name = copilot_get_string_any(obj, "dir", nullptr, "front");
+    }
+    return copilot_orientation_from_name(name);
+}
+
+static copilot_screen_state_t copilot_screen_state_from_name(const char *name) {
+    if (!name) {
+        return COPILOT_SCREEN_STATE_NEUTRAL_IDLE;
+    }
+    if (strcmp(name, "pre_message_orient") == 0 || strcmp(name, "pre_message") == 0 ||
+        strcmp(name, "pre_cue") == 0 || strcmp(name, "cue") == 0) {
+        return COPILOT_SCREEN_STATE_PRE_MESSAGE_ORIENT;
+    }
+    if (strcmp(name, "speaking") == 0 || strcmp(name, "talking") == 0) {
+        return COPILOT_SCREEN_STATE_SPEAKING;
+    }
+    if (strcmp(name, "return_neutral") == 0 || strcmp(name, "return") == 0) {
+        return COPILOT_SCREEN_STATE_RETURN_NEUTRAL;
+    }
+    if (strcmp(name, "silent_neutral") == 0 || strcmp(name, "silent") == 0) {
+        return COPILOT_SCREEN_STATE_SILENT_NEUTRAL;
+    }
+    if (strcmp(name, "debug") == 0) {
+        return COPILOT_SCREEN_STATE_DEBUG;
+    }
+    return COPILOT_SCREEN_STATE_NEUTRAL_IDLE;
+}
+
 static void copilot_handle_payload(const char *payload, int payload_len) {
     LOGI_APP( "MQTT payload: %.*s", payload_len, payload);
     cJSON *root = cJSON_ParseWithLength(payload, payload_len);
@@ -190,7 +423,34 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
         return;
     }
 
-    if (strcmp(type->valuestring, "motion") == 0) {
+    if (strcmp(type->valuestring, "screen") == 0 || strcmp(type->valuestring, "display") == 0) {
+        const char *action = copilot_get_string_any(root, "action", nullptr, "");
+        const char *state_name = copilot_get_string_any(root, "state", nullptr, "");
+        const char *message_id = copilot_get_string_any(root, "message_id", "id", "");
+        copilot_screen_orientation_t orientation = copilot_get_orientation(root);
+        bool calibration_content_present = copilot_get_bool(root, "calibration_content_present", false);
+        bool visual_semantic_content_present = copilot_get_bool(root, "visual_semantic_content_present", false);
+
+        if (strcmp(action, "message") == 0 || strcmp(state_name, "message") == 0 ||
+            strcmp(action, "timeline") == 0) {
+            uint32_t pre_cue_ms = copilot_get_u32(root, "pre_cue_ms",
+                                      copilot_get_u32(root, "prelight_ms", CONFIG_COPILOT_PRELIGHT_MS));
+            uint32_t speech_ms = copilot_get_u32(root, "speech_ms",
+                                    copilot_get_u32(root, "duration_ms", CONFIG_COPILOT_EXPR_TRANSITION_MS));
+            copilot_schedule_screen_message(orientation, pre_cue_ms, speech_ms, message_id,
+                                            calibration_content_present,
+                                            visual_semantic_content_present);
+        } else {
+            copilot_screen_state_t state = copilot_screen_state_from_name(state_name);
+            uint32_t duration_ms = copilot_get_u32(root, "duration_ms", 0);
+            LOGI_APP("Screen cmd: state=%s duration=%u orient=%s msg=%s",
+                     copilot_screen_state_name(state), (unsigned)duration_ms,
+                     copilot_screen_orientation_name(orientation), message_id);
+            copilot_schedule_screen_state(state, orientation, duration_ms, message_id,
+                                          calibration_content_present,
+                                          visual_semantic_content_present);
+        }
+    } else if (strcmp(type->valuestring, "motion") == 0) {
         copilot_motion_t motion = {};
 
         // Check if quaternion is provided (external IMU with orientation)
@@ -271,6 +531,8 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
 
         uint32_t duration_ms = copilot_get_u32(root, "duration_ms", CONFIG_COPILOT_EXPR_TRANSITION_MS);
         uint32_t prelight_ms = copilot_get_u32(root, "prelight_ms", CONFIG_COPILOT_PRELIGHT_MS);
+        copilot_screen_orientation_t orientation = copilot_get_orientation(root);
+        const char *message_id = copilot_get_string_any(root, "message_id", nullptr, "");
 
         const char *sound_id = nullptr;
         const cJSON *sound = cJSON_GetObjectItemCaseSensitive(root, "sound");
@@ -280,12 +542,13 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
             sound_id = "beep_short";
         }
 
-        LOGI_APP( "Expression cmd: name=%s id=%s expr=%d duration=%u prelight=%u sound=%s",
+        LOGI_APP( "Expression cmd: name=%s id=%s expr=%d duration=%u prelight=%u orient=%s sound=%s",
                  cJSON_IsString(name) ? name->valuestring : "null",
                  cJSON_IsNumber(id) ? "num" : "null",
                  (int)expr, (unsigned)duration_ms, (unsigned)prelight_ms,
+                 copilot_screen_orientation_name(orientation),
                  sound_id ? sound_id : "none");
-        copilot_schedule_expression(expr, duration_ms, prelight_ms, sound_id);
+        copilot_schedule_expression(expr, duration_ms, prelight_ms, sound_id, orientation, message_id);
     } else if (strcmp(type->valuestring, "sound") == 0) {
         const cJSON *id = cJSON_GetObjectItemCaseSensitive(root, "id");
         const char *sound_id = cJSON_IsString(id) ? id->valuestring : "beep_short";
@@ -355,6 +618,15 @@ static void copilot_handle_payload(const char *payload, int payload_len) {
             const char *state_names[] = {"IDLE", "READY", "CONNECTING", "LISTENING", "PROCESSING", "SPEAKING", "ERROR"};
             const char *state_name = (state < sizeof(state_names)/sizeof(state_names[0])) ? state_names[state] : "UNKNOWN";
             ESP_LOGI(TAG, "Voice status: state=%s active=%d loopback=%d", state_name, active ? 1 : 0, loopback ? 1 : 0);
+        }
+        if (strcmp(query_str, "display") == 0 || strcmp(query_str, "screen") == 0 || strcmp(query_str, "all") == 0) {
+            copilot_mqtt_publish("status",
+                "{\"type\":\"display_status\","
+                "\"robot_display_version\":\"screen_copilot_v1.0\","
+                "\"asset_version_hash\":\"face_soft_neutral_20260514\","
+                "\"participant_facing_debug\":false,"
+                "\"screen_text\":\"\","
+                "\"screen_icon\":\"\"}");
         }
     } else if (strcmp(type->valuestring, "servo") == 0) {
 #if CONFIG_COPILOT_SERVO_ENABLE
@@ -538,29 +810,18 @@ void copilot_app_init(void) {
         LOGI_APP( "Voice streaming will start after WiFi connects");
 #endif
     }
-    if (!s_action_queue) {
-        s_action_queue = xQueueCreate(8, sizeof(copilot_action_t));
-        if (s_action_queue) {
-            int core = copilot_normalize_core(CONFIG_COPILOT_ACTION_CORE);
-            BaseType_t task_ok;
-            // Priority lowered from 4 to 3 to reduce UI impact during MQTT processing
-            // Keep 3KB stack - audio playback path needs more stack
-            if (core >= 0) {
-                task_ok = xTaskCreatePinnedToCore(copilot_action_task, "copilot_action", 3 * 1024, nullptr, 3,
-                                                  &s_action_task, core);
-            } else {
-                task_ok = xTaskCreate(copilot_action_task, "copilot_action", 3 * 1024, nullptr, 3, &s_action_task);
-            }
-            if (task_ok != pdPASS) {
-                ESP_LOGE(TAG, "Failed to create action task");
-            } else {
-                LOGI_APP( "Action task core=%d", core);
-            }
-        } else {
-            ESP_LOGE(TAG, "Failed to create action queue");
-        }
+    copilot_ensure_action_task();
+    copilot_mqtt_notify_voice_ready();
+    copilot_app_network_start();
+}
+
+void copilot_app_network_start(void) {
+    if (s_network_started) {
+        return;
     }
+    copilot_ensure_action_task();
     copilot_mqtt_start(copilot_mqtt_cmd_handler);
+    s_network_started = true;
 }
 
 void copilot_app_ui_init(lv_obj_t *root) {

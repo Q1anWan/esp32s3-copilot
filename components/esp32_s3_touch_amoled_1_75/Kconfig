@@ -67,6 +67,14 @@ menu "Board Support Package"
 
     endmenu
     menu "Display"
+        config BSP_DISPLAY_TOUCH_ENABLE
+            bool "Initialize CST9217 touch controller"
+            default y
+            help
+                Initialize the capacitive touch controller and register it as an
+                LVGL input device from bsp_display_start(). Disable this when
+                the application is display/audio only.
+
         config BSP_LCD_RGB_BOUNCE_BUFFER_HEIGHT
             int "RGB Bounce buffer height"
             default 20
@@ -118,4 +126,12 @@ menu "Board Support Package"
         range 0 1
         help
             ESP32S3 has two I2S peripherals, pick the one you want to use.
+
+    config BSP_ES7210_MIC_ENABLE
+        bool "Enable ES7210 microphone helper"
+        depends on CODEC_ES7210_SUPPORT
+        default y
+        help
+            Enable bsp_audio_codec_microphone_init() for the ES7210 ADC. Disable
+            this for RX-only speaker playback builds.
 endmenu

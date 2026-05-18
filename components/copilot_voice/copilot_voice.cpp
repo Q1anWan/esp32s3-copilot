@@ -67,6 +67,18 @@ static const char *TAG = "copilot_voice";
 #define CONFIG_COPILOT_VOICE_SPEAKER_VOLUME 80
 #endif
 
+#if CONFIG_COPILOT_VOICE_MODE_FULL_DUPLEX || CONFIG_COPILOT_VOICE_MODE_TX_ONLY
+#define COPILOT_VOICE_TX_ENABLED 1
+#else
+#define COPILOT_VOICE_TX_ENABLED 0
+#endif
+
+#if COPILOT_VOICE_TX_ENABLED || CONFIG_COPILOT_VOICE_MODE_LOOPBACK
+#define COPILOT_VOICE_MIC_REQUIRED 1
+#else
+#define COPILOT_VOICE_MIC_REQUIRED 0
+#endif
+
 // Audio buffer configuration
 // ES7210 microphone ADC outputs 2 channels (stereo), we convert to mono for processing
 #define MIC_AUDIO_CHANNELS          2       // ES7210 outputs stereo
@@ -118,12 +130,14 @@ static struct {
 // Internal helpers
 // ============================================================================
 
+#if COPILOT_VOICE_TX_ENABLED || CONFIG_COPILOT_VOICE_LOOPBACK_TEST
 static int normalize_core(int core) {
     if (core < 0 || core >= (int)configNUM_CORES) {
         return -1;  // No affinity
     }
     return core;
 }
+#endif
 
 static void notify_state_change(copilot_voice_state_t new_state) {
     if (s_voice.state != new_state) {
@@ -138,6 +152,7 @@ static void notify_state_change(copilot_voice_state_t new_state) {
 // Audio Hardware Initialization
 // ============================================================================
 
+#if COPILOT_VOICE_MIC_REQUIRED
 static bool init_microphone(void) {
     if (s_voice.mic_dev) {
         return true;  // Already initialized
@@ -172,6 +187,7 @@ static bool init_microphone(void) {
 
     return true;
 }
+#endif
 
 static bool init_audio_output(void) {
     // Use unified audio output manager (shared with copilot_audio)
@@ -320,6 +336,35 @@ static void loopback_task_func(void *arg) {
 // Track TTS audio reception for state management
 static volatile uint32_t s_last_tts_audio_ms = 0;
 static volatile uint32_t s_tts_frames_received = 0;
+static esp_timer_handle_t s_tts_idle_timer = nullptr;
+
+static void tts_idle_timer_cb(void *arg) {
+    (void)arg;
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t last_ms = s_last_tts_audio_ms;
+    if (s_voice.session_active && s_voice.state == VOICE_STATE_SPEAKING && last_ms > 0 &&
+        now_ms - last_ms >= 300) {
+        notify_state_change(VOICE_STATE_LISTENING);
+        LOGI_VOICE("TTS playback finished -> LISTENING");
+    }
+}
+
+static void schedule_tts_idle_timer(void) {
+    if (!s_tts_idle_timer) {
+        const esp_timer_create_args_t timer_args = {
+            .callback = tts_idle_timer_cb,
+            .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "tts_idle",
+            .skip_unhandled_events = true,
+        };
+        if (esp_timer_create(&timer_args, &s_tts_idle_timer) != ESP_OK) {
+            return;
+        }
+    }
+    esp_timer_stop(s_tts_idle_timer);
+    esp_timer_start_once(s_tts_idle_timer, 350 * 1000);
+}
 
 // Callback for receiving audio from WebSocket server
 static void ws_audio_callback(const int16_t *pcm_data, size_t samples, void *user_data) {
@@ -330,7 +375,7 @@ static void ws_audio_callback(const int16_t *pcm_data, size_t samples, void *use
         // Track TTS audio reception
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
         s_last_tts_audio_ms = now_ms;
-        s_tts_frames_received++;
+        s_tts_frames_received = s_tts_frames_received + 1;
 
         // Log first TTS audio reception
         static bool first_tts_logged = false;
@@ -346,8 +391,16 @@ static void ws_audio_callback(const int16_t *pcm_data, size_t samples, void *use
             LOGI_VOICE("TTS playback started -> SPEAKING");
         }
 
-        // The audio_out module handles mono-to-stereo conversion
-        copilot_audio_out_write(AUDIO_SRC_VOICE, pcm_data, (int)samples, 0);
+        // The audio_out module handles mono-to-stereo conversion.
+        int written = copilot_audio_out_write(AUDIO_SRC_VOICE, pcm_data, (int)samples, 5);
+        static bool first_tts_write_logged = false;
+        if (!first_tts_write_logged && written > 0) {
+            ESP_LOGI(TAG, "TTS audio queued to speaker: %d/%d samples", written, (int)samples);
+            first_tts_write_logged = true;
+        } else if (written != (int)samples) {
+            ESP_LOGW(TAG, "TTS audio write short: %d/%d samples", written, (int)samples);
+        }
+        schedule_tts_idle_timer();
     }
 }
 
@@ -380,10 +433,12 @@ static void ws_state_callback(copilot_ws_client_state_t state, void *user_data) 
 }
 
 // Streaming task: reads mic and sends to WebSocket
+#if COPILOT_VOICE_TX_ENABLED
 static void streaming_task_func(void *arg) {
     (void)arg;
     LOGI_VOICE("Streaming task started");
 
+#if COPILOT_VOICE_MIC_REQUIRED
     // Use pre-allocated DMA buffers (allocated in init to avoid fragmentation)
     int16_t *mic_stereo_buffer = s_voice.mic_dma_buffer;
     int16_t *mono_buffer = s_voice.mono_buffer;
@@ -398,6 +453,7 @@ static void streaming_task_func(void *arg) {
 
     ESP_LOGI(TAG, "Using pre-allocated buffers: mic=%p, mono=%p",
              mic_stereo_buffer, mono_buffer);
+#endif
 
     // Acquire audio output for receiving TTS
     if (!copilot_audio_out_acquire(AUDIO_SRC_VOICE)) {
@@ -412,8 +468,10 @@ static void streaming_task_func(void *arg) {
     uint32_t wait_count = 0;
     uint32_t read_fail_count = 0;
     uint32_t send_fail_count = 0;
+#if COPILOT_VOICE_TX_ENABLED
     const int64_t frame_interval_us = (int64_t)VOICE_AUDIO_FRAME_MS * 1000;
     int64_t last_frame_us = esp_timer_get_time();
+#endif
 
     ESP_LOGI(TAG, "Streaming loop starting, mic_dev=%p", s_voice.mic_dev);
 
@@ -427,19 +485,25 @@ static void streaming_task_func(void *arg) {
                          (unsigned long)copilot_ws_client_get_connect_attempts());
             }
             vTaskDelay(pdMS_TO_TICKS(50));
+#if COPILOT_VOICE_TX_ENABLED
             last_frame_us = esp_timer_get_time();  // Reset pacing when not streaming
+#endif
             continue;
         }
 
         // Log when streaming becomes active (first time)
         static bool streaming_active_logged = false;
         if (!streaming_active_logged) {
-            ESP_LOGI(TAG, "WebSocket now streaming, starting mic capture loop");
+            ESP_LOGI(TAG, "WebSocket now streaming, audio RX%s active",
+                     COPILOT_VOICE_TX_ENABLED ? "/TX" : "");
             streaming_active_logged = true;
+#if COPILOT_VOICE_TX_ENABLED
             last_frame_us = esp_timer_get_time();
+#endif
         }
         wait_count = 0;
 
+#if COPILOT_VOICE_TX_ENABLED
         // Debug: log before mic read (to detect if read is blocking)
         static bool first_read_logged = false;
         if (!first_read_logged) {
@@ -501,6 +565,9 @@ static void streaming_task_func(void *arg) {
 #endif
 
         frame_count++;
+#else
+        frame_count++;
+#endif
 
         // Log stats every 5 seconds
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
@@ -522,6 +589,7 @@ static void streaming_task_func(void *arg) {
             }
         }
 
+#if COPILOT_VOICE_TX_ENABLED
         // Pace sends to real-time to avoid bursting and TCP send buffer overflows
         int64_t now_us = esp_timer_get_time();
         int64_t elapsed_us = now_us - last_frame_us;
@@ -530,6 +598,9 @@ static void streaming_task_func(void *arg) {
             vTaskDelay(pdMS_TO_TICKS((wait_us + 999) / 1000));
         }
         last_frame_us = esp_timer_get_time();
+#else
+        vTaskDelay(pdMS_TO_TICKS(VOICE_AUDIO_FRAME_MS));
+#endif
     }
 
     // Cleanup (don't free pre-allocated buffers - they're owned by voice module)
@@ -538,6 +609,7 @@ static void streaming_task_func(void *arg) {
     LOGI_VOICE("Streaming task stopped (total frames: %lu)", (unsigned long)frame_count);
     vTaskDelete(NULL);
 }
+#endif
 
 static bool start_streaming_session(void) {
     // Build WebSocket URL from config
@@ -582,6 +654,17 @@ static bool start_streaming_session(void) {
         return false;
     }
 
+#if !COPILOT_VOICE_TX_ENABLED
+    if (!copilot_audio_out_acquire(AUDIO_SRC_VOICE)) {
+        ESP_LOGE(TAG, "Failed to acquire audio output");
+        copilot_ws_client_disconnect();
+        return false;
+    }
+    s_voice.session_active = true;
+    s_voice.streaming_running = false;
+    LOGI_VOICE("RX-only streaming session started");
+    return true;
+#else
     // Start streaming task (use PSRAM for stack since internal RAM is fragmented)
     s_voice.streaming_running = true;
 
@@ -620,10 +703,11 @@ static bool start_streaming_session(void) {
     s_voice.session_active = true;
     LOGI_VOICE("Streaming session started");
     return true;
+#endif
 }
 
 static void stop_streaming_session(void) {
-    if (!s_voice.streaming_running) {
+    if (!s_voice.streaming_running && !s_voice.session_active) {
         return;
     }
 
@@ -634,6 +718,11 @@ static void stop_streaming_session(void) {
     // Disconnect WebSocket
     copilot_ws_client_disconnect();
 
+#if !COPILOT_VOICE_TX_ENABLED
+    copilot_audio_out_release(AUDIO_SRC_VOICE);
+    s_voice.session_active = false;
+    return;
+#else
     // Wait for task to exit
     if (s_voice.streaming_task) {
         int timeout = 50;  // 500ms
@@ -645,6 +734,7 @@ static void stop_streaming_session(void) {
     }
 
     s_voice.session_active = false;
+#endif
 }
 
 #endif // !CONFIG_COPILOT_VOICE_MODE_LOOPBACK
@@ -664,6 +754,7 @@ bool copilot_voice_init(void) {
     LOGI_VOICE("  Frame size: %d samples (%d ms, %d bytes)",
              VOICE_AUDIO_FRAME_SAMPLES, VOICE_AUDIO_FRAME_MS, VOICE_AUDIO_FRAME_BYTES);
 
+#if COPILOT_VOICE_MIC_REQUIRED
     // Pre-allocate DMA buffers FIRST, before other allocations fragment memory
     // This is critical for the mic read which requires DMA-capable memory
     ESP_LOGI(TAG, "DMA memory before alloc: free=%u, largest=%u",
@@ -693,6 +784,9 @@ bool copilot_voice_init(void) {
     ESP_LOGI(TAG, "Pre-allocated DMA buffers: mic=%p (%d bytes), mono=%p (%d bytes)",
              s_voice.mic_dma_buffer, MIC_AUDIO_FRAME_BYTES,
              s_voice.mono_buffer, VOICE_AUDIO_FRAME_BYTES);
+#else
+    ESP_LOGI(TAG, "RX-only mode: skip microphone buffers and ES7210 init");
+#endif
 
     // Initialize default settings
     s_voice.mic_gain_db = CONFIG_COPILOT_VOICE_MIC_GAIN;
@@ -706,6 +800,7 @@ bool copilot_voice_init(void) {
         return false;
     }
 
+#if COPILOT_VOICE_MIC_REQUIRED
     // Initialize microphone (voice module owns this)
     // Must be after audio_out init since I2S needs stereo mode
     if (!init_microphone()) {
@@ -713,6 +808,7 @@ bool copilot_voice_init(void) {
         notify_state_change(VOICE_STATE_ERROR);
         return false;
     }
+#endif
 
     notify_state_change(VOICE_STATE_READY);
     LOGI_VOICE("Voice module initialized successfully");

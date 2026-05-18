@@ -34,6 +34,7 @@ static bool s_wifi_started = false;
 static int s_retry_num = 0;
 static copilot_mqtt_cmd_cb s_cmd_cb = nullptr;
 static esp_netif_t *s_netif_sta = nullptr;
+static bool s_voice_start_pending = false;
 
 static char s_device_id[32];
 static char s_topic_cmd[96];
@@ -194,6 +195,31 @@ static void voice_session_timer_cb(void *arg) {
         ESP_LOGW(TAG, "Voice streaming session failed to start");
     }
 }
+
+static void copilot_schedule_voice_session_start(uint32_t delay_ms) {
+    if (copilot_voice_is_active()) {
+        s_voice_start_pending = false;
+        return;
+    }
+    if (!copilot_voice_is_ready()) {
+        s_voice_start_pending = true;
+        ESP_LOGI(TAG, "Voice module not ready yet; defer streaming session");
+        return;
+    }
+
+    const esp_timer_create_args_t timer_args = {
+        .callback = voice_session_timer_cb,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "voice_start",
+        .skip_unhandled_events = false,
+    };
+    esp_timer_handle_t timer;
+    if (esp_timer_create(&timer_args, &timer) == ESP_OK) {
+        esp_timer_start_once(timer, delay_ms * 1000);
+        s_voice_start_pending = false;
+    }
+}
 #endif
 
 static void copilot_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
@@ -211,18 +237,7 @@ static void copilot_ip_event_handler(void *arg, esp_event_base_t event_base, int
 
     // Defer voice session start using timer (event handler stack too small)
 #if CONFIG_COPILOT_VOICE_ENABLE && !CONFIG_COPILOT_VOICE_MODE_LOOPBACK
-    const esp_timer_create_args_t timer_args = {
-        .callback = voice_session_timer_cb,
-        .arg = nullptr,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "voice_start",
-        .skip_unhandled_events = false,
-    };
-    esp_timer_handle_t timer;
-    if (esp_timer_create(&timer_args, &timer) == ESP_OK) {
-        // Start after 100ms delay
-        esp_timer_start_once(timer, 100 * 1000);
-    }
+    copilot_schedule_voice_session_start(100);
 #endif
 }
 
@@ -295,6 +310,14 @@ void copilot_mqtt_start(copilot_mqtt_cmd_cb cb) {
     s_cmd_cb = cb;
     LOGI_MQTT( "MQTT start (callback=%p)", cb);
     copilot_wifi_init();
+}
+
+void copilot_mqtt_notify_voice_ready(void) {
+#if CONFIG_COPILOT_VOICE_ENABLE && !CONFIG_COPILOT_VOICE_MODE_LOOPBACK
+    if (s_wifi_connected || s_voice_start_pending) {
+        copilot_schedule_voice_session_start(100);
+    }
+#endif
 }
 
 void copilot_mqtt_publish(const char *topic_suffix, const char *payload) {

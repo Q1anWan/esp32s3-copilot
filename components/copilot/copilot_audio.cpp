@@ -66,6 +66,7 @@ static const tone_desc_t kTones[] = {
     {"beep_long", 740, 420, 80},
     {"chime", 1200, 140, 75},
     {"tap", 1400, 60, 70},
+    {"speaker_test", 880, 1500, 95},
 };
 
 static bool copilot_audio_lookup(const char *id, audio_req_t *out) {

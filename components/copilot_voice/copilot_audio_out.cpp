@@ -24,6 +24,7 @@
 #include "freertos/semphr.h"
 #include "freertos/idf_additions.h"
 #include "driver/i2s_std.h"
+#include "driver/gpio.h"
 #include "bsp/esp-bsp.h"
 #include "sdkconfig.h"
 
@@ -58,14 +59,19 @@ static const char *TAG = "audio_out";
 // Default sample rate (WebRTC standard)
 #define DEFAULT_SAMPLE_RATE     16000
 
-// Ring buffer size: ~200ms of stereo audio at 16kHz
-// 16000 samples/sec * 0.2 sec * 2 channels * 2 bytes = 12800 bytes
-// Round up to 16KB for DMA alignment
-#define RING_BUFFER_SIZE        (16 * 1024)
+// Ring buffer size: ~1s of stereo audio at 16kHz.
+// The WebSocket path needs enough cushion for Python scheduling and WiFi jitter.
+#define RING_BUFFER_SIZE        (64 * 1024)
 
-// DMA transfer chunk size (must be power of 2 for efficiency)
-#define DMA_CHUNK_SAMPLES       256
+// DMA transfer chunk size. Keep this aligned with WebSocket audio frames
+// (20ms at 16kHz = 320 samples) to avoid periodic underruns/zero padding.
+#define DMA_CHUNK_SAMPLES       320
 #define DMA_CHUNK_BYTES         (DMA_CHUNK_SAMPLES * 2 * sizeof(int16_t))  // stereo
+#define STREAM_PREFILL_CHUNKS   25  // 500ms at 20ms/chunk
+#define STREAM_PREFILL_BYTES    (DMA_CHUNK_BYTES * STREAM_PREFILL_CHUNKS)
+
+// Leave headroom for streamed PCM, which is often mastered close to full scale.
+#define VOICE_RX_GAIN_Q15       24576  // 0.75 in Q15
 
 #ifndef CONFIG_COPILOT_AUDIO_CORE
 #define CONFIG_COPILOT_AUDIO_CORE 0
@@ -302,6 +308,35 @@ static portMUX_TYPE s_tone_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile uint8_t s_envelope = 0;
 static volatile uint32_t s_envelope_time_ms = 0;
 
+static void audio_out_force_power_amp_on(const char *reason) {
+#if defined(BSP_POWER_AMP_IO)
+    if (BSP_POWER_AMP_IO == GPIO_NUM_NC) {
+        return;
+    }
+
+    gpio_config_t io_conf = {};
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_INPUT_OUTPUT;
+    io_conf.pin_bit_mask = BIT64(BSP_POWER_AMP_IO);
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    esp_err_t err = gpio_config(&io_conf);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Power amp GPIO config failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    esp_err_t set_err = gpio_set_level(BSP_POWER_AMP_IO, 1);
+    ESP_LOGI(TAG, "Power amp GPIO%d forced ON (%s), set=%s read=%d",
+             (int)BSP_POWER_AMP_IO,
+             reason ? reason : "audio",
+             esp_err_to_name(set_err),
+             gpio_get_level(BSP_POWER_AMP_IO));
+#else
+    (void)reason;
+#endif
+}
+
 static inline int16_t copilot_clip_i16(int32_t value) {
     if (value > 32767) {
         return 32767;
@@ -310,6 +345,11 @@ static inline int16_t copilot_clip_i16(int32_t value) {
         return -32768;
     }
     return (int16_t)value;
+}
+
+static inline int16_t voice_scale_sample(int16_t sample) {
+    int32_t scaled = ((int32_t)sample * VOICE_RX_GAIN_Q15) >> 15;
+    return (int16_t)scaled;
 }
 
 static bool copilot_mix_tone(int16_t *buffer, int frames) {
@@ -378,13 +418,40 @@ static void output_task_func(void *arg) {
     LOGI_OUT("Output task started (rate=%d, chunk=%d samples)",
              s_out.sample_rate, DMA_CHUNK_SAMPLES);
 
+    bool stream_prefilled = false;
+    copilot_audio_src_t last_src = AUDIO_SRC_NONE;
+
     while (s_out.running) {
+        static bool first_non_silence_logged = false;
+
         // Read from ring buffer into DMA buffer
         bool tone_active = copilot_audio_out_is_tone_active();
-        bool source_active = (s_out.active_src != AUDIO_SRC_NONE);
+        copilot_audio_src_t active_src = s_out.active_src;
+        bool source_active = (active_src != AUDIO_SRC_NONE);
         bool need_warmup = tone_active || source_active;
 
-        int read_timeout = need_warmup ? 5 : 50;
+        if (active_src != last_src) {
+            stream_prefilled = false;
+            last_src = active_src;
+        }
+
+        if (active_src == AUDIO_SRC_VOICE && !tone_active) {
+            int buffered = ring_used(&s_out.ring);
+            if (!stream_prefilled) {
+                if (buffered < STREAM_PREFILL_BYTES) {
+                    vTaskDelay(pdMS_TO_TICKS(2));
+                    continue;
+                }
+                stream_prefilled = true;
+            } else if (buffered == 0) {
+                stream_prefilled = false;
+            }
+        }
+
+        int read_timeout = 50;
+        if (need_warmup) {
+            read_timeout = tone_active ? 5 : 30;
+        }
         int bytes_read = ring_read(&s_out.ring, (uint8_t *)s_out.dma_buffer,
                                    DMA_CHUNK_BYTES, read_timeout);
 
@@ -414,10 +481,33 @@ static void output_task_func(void *arg) {
         }
 
         if (bytes_to_write > 0) {
+            int32_t peak = 0;
+            bool non_silence = false;
+            if (!first_non_silence_logged) {
+                int samples = bytes_to_write / sizeof(int16_t);
+                for (int i = 0; i < samples; ++i) {
+                    int32_t v = s_out.dma_buffer[i];
+                    int32_t a = v >= 0 ? v : -v;
+                    if (a > peak) {
+                        peak = a;
+                    }
+                    if (a > 64) {
+                        non_silence = true;
+                    }
+                }
+            }
+
             // Write to codec (DMA transfer)
             int ret = esp_codec_dev_write(s_out.codec_dev, s_out.dma_buffer, bytes_to_write);
             if (ret < 0) {
                 ESP_LOGW(TAG, "Codec write failed: %d", ret);
+            } else if (non_silence && !first_non_silence_logged) {
+                first_non_silence_logged = true;
+                ESP_LOGI(TAG, "First non-silence codec write OK: bytes=%d peak=%ld active_src=%d ret=%d",
+                         bytes_to_write,
+                         (long)peak,
+                         (int)s_out.active_src,
+                         ret);
             }
         }
     }
@@ -488,6 +578,7 @@ bool copilot_audio_out_init(const copilot_audio_out_config_t *config) {
         .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = AUDIO_I2S_GPIO_CFG,
     };
+    i2s_config.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_384;
     esp_err_t i2s_err = bsp_audio_init(&i2s_config);
     if (i2s_err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to init I2S: %s", esp_err_to_name(i2s_err));
@@ -512,6 +603,7 @@ bool copilot_audio_out_init(const copilot_audio_out_config_t *config) {
     s_out.sample_info.sample_rate = s_out.sample_rate;
     s_out.sample_info.channel = 2;  // Stereo output
     s_out.sample_info.bits_per_sample = 16;
+    s_out.sample_info.mclk_multiple = I2S_MCLK_MULTIPLE_384;
 
     esp_err_t err = esp_codec_dev_open(s_out.codec_dev, &s_out.sample_info);
     if (err != ESP_OK) {
@@ -521,6 +613,7 @@ bool copilot_audio_out_init(const copilot_audio_out_config_t *config) {
         ring_deinit(&s_out.ring);
         return false;
     }
+    audio_out_force_power_amp_on("codec open");
 
     // Set initial volume
     err = esp_codec_dev_set_out_vol(s_out.codec_dev, s_out.volume);
@@ -529,6 +622,11 @@ bool copilot_audio_out_init(const copilot_audio_out_config_t *config) {
     } else {
         ESP_LOGI(TAG, "Initial volume set to %d%%", s_out.volume);
     }
+    err = esp_codec_dev_set_out_mute(s_out.codec_dev, false);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to unmute codec: %s", esp_err_to_name(err));
+    }
+    audio_out_force_power_amp_on("codec unmute");
 
     // Start output task
     s_out.running = true;
@@ -743,6 +841,9 @@ int copilot_audio_out_write(copilot_audio_src_t src,
         // Mono to stereo conversion
         for (int i = 0; i < to_process; i++) {
             int16_t sample = samples[written + i];
+            if (src == AUDIO_SRC_VOICE) {
+                sample = voice_scale_sample(sample);
+            }
             stereo_chunk[i * 2] = sample;      // Left
             stereo_chunk[i * 2 + 1] = sample;  // Right
         }
@@ -869,6 +970,11 @@ bool copilot_audio_out_play_tone(uint16_t freq_hz, uint16_t duration_ms, uint8_t
 
 #if CONFIG_COPILOT_LOG_AUDIO_OUT
     ESP_LOGI(TAG, "Tone start: %u Hz, %u ms, vol=%u%%",
+             (unsigned)freq_hz,
+             (unsigned)duration_ms,
+             (unsigned)volume);
+#else
+    ESP_LOGI(TAG, "Tone queued: %u Hz, %u ms, vol=%u%%",
              (unsigned)freq_hz,
              (unsigned)duration_ms,
              (unsigned)volume);

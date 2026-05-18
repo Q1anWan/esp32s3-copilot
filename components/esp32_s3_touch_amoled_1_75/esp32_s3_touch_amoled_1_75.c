@@ -12,6 +12,7 @@
 #include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
 
 #include "esp_lcd_sh8601.h"
 #include "esp_lcd_touch_cst9217.h"
@@ -27,10 +28,11 @@ static const char *TAG = "ESP32-S3-Touch-AMOLED-1.75";
 static i2c_master_bus_handle_t i2c_handle = NULL; // I2C Handle
 static bool i2c_initialized = false;
 static esp_io_expander_handle_t io_expander = NULL; // IO expander tca9554 handle
-static lv_display_t *disp;
 static lv_indev_t *disp_indev = NULL;
 sdmmc_card_t *bsp_sdcard = NULL; // Global uSD card handler
+#if CONFIG_BSP_DISPLAY_TOUCH_ENABLE
 static esp_lcd_touch_handle_t tp = NULL;
+#endif
 static esp_lcd_panel_handle_t panel_handle = NULL; // LCD panel handle
 static esp_lcd_panel_io_handle_t io_handle = NULL;
 uint8_t brightness;
@@ -38,7 +40,9 @@ static i2s_chan_handle_t i2s_tx_chan = NULL;
 static i2s_chan_handle_t i2s_rx_chan = NULL;
 static const audio_codec_data_if_t *i2s_data_if = NULL; /* Codec data interface */
 
+#if CONFIG_BSP_ES7210_MIC_ENABLE
 #define BSP_ES7210_CODEC_ADDR ES7210_CODEC_DEFAULT_ADDR
+#endif
 #define BSP_I2S_GPIO_CFG       \
     {                          \
         .mclk = BSP_I2S_MCLK,  \
@@ -300,6 +304,7 @@ esp_codec_dev_handle_t bsp_audio_codec_speaker_init(void)
 
 esp_codec_dev_handle_t bsp_audio_codec_microphone_init(void)
 {
+#if CONFIG_BSP_ES7210_MIC_ENABLE
     if (i2s_data_if == NULL) {
         /* Initilize I2C */
         BSP_ERROR_CHECK_RETURN_NULL(bsp_i2c_init());
@@ -328,6 +333,10 @@ esp_codec_dev_handle_t bsp_audio_codec_microphone_init(void)
         .data_if = i2s_data_if,
     };
     return esp_codec_dev_new(&codec_es7210_dev_cfg);
+#else
+    ESP_LOGW(TAG, "ES7210 microphone helper disabled");
+    return NULL;
+#endif
 }
 
 #define LCD_CMD_BITS (8)
@@ -593,6 +602,7 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
     return disp;
 }
 
+#if CONFIG_BSP_DISPLAY_TOUCH_ENABLE
 static lv_indev_t *bsp_display_indev_init(lv_display_t *disp)
 {
     BSP_ERROR_CHECK_RETURN_NULL(bsp_touch_new(NULL, &tp));
@@ -606,6 +616,7 @@ static lv_indev_t *bsp_display_indev_init(lv_display_t *disp)
 
     return lvgl_port_add_touch(&touch_cfg);
 }
+#endif
 
 /**********************************************************************************************************
  *
@@ -634,7 +645,12 @@ lv_display_t *bsp_display_start_with_config(const bsp_display_cfg_t *cfg)
 
     BSP_NULL_CHECK(disp = bsp_display_lcd_init(cfg), NULL);
 
+#if CONFIG_BSP_DISPLAY_TOUCH_ENABLE
     BSP_NULL_CHECK(disp_indev = bsp_display_indev_init(disp), NULL);
+#else
+    disp_indev = NULL;
+    ESP_LOGI(TAG, "Touch controller disabled");
+#endif
 
     BSP_ERROR_CHECK_RETURN_NULL(bsp_display_brightness_init());
 

@@ -4,7 +4,9 @@
 The simulator acts as the SILAB TCP client and connects to the experiment PC
 bridge GUI:
 
-  simulator --TCP--> tools/silab_mqtt_bridge_gui.py --MQTT--> ESP32
+  simulator --TCP--> tools/silab_mqtt_bridge_gui.py --direct TCP--> ESP32
+
+MQTT is still used by the GUI for ESP32 status and as a playback fallback.
 
 Default packet format, one line per fixed-rate sample:
 

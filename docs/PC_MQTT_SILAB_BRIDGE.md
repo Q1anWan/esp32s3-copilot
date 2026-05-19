@@ -1,17 +1,17 @@
-# PC MQTT SILAB Bridge
+# PC SILAB Bridge
 
 ## Target Topology
 
 ```text
-SILAB --Ethernet LAN A/TCP--> Experiment PC --WiFi LAN B/MQTT--> ESP32
+SILAB --Ethernet LAN A/TCP--> Experiment PC --WiFi LAN B/direct TCP play + MQTT status--> ESP32
 ```
 
 The experiment PC is the stable protocol boundary:
 
-- Mosquitto MQTT broker listens on `0.0.0.0:1883` and is reachable from WiFi LAN B.
+- Mosquitto MQTT broker listens on `0.0.0.0:1883` and is reachable from WiFi LAN B for status and fallback control.
 - `tools/silab_mqtt_bridge_gui.py` listens as the TCP host for SILAB on LAN A.
-- The GUI forwards only trigger rising edges to ESP32 by MQTT.
-- ESP32 only receives normal MQTT JSON commands, so SILAB protocol changes stay on the PC side.
+- The GUI forwards only trigger rising edges to ESP32, using ESP32 direct TCP first and MQTT only as fallback.
+- ESP32 still reports status over MQTT, so the GUI can discover the ESP32 IP and monitor TF/audio state.
 
 ## SILAB Packet
 
@@ -37,7 +37,7 @@ Example:
 1	1	1
 ```
 
-The GUI forwards this MQTT payload:
+The GUI forwards this play payload over ESP32 direct TCP by default:
 
 ```json
 {"type":"play","scene":"boot","seq":1,"message_id":"silab_..."}
@@ -78,8 +78,10 @@ In the GUI:
 3. Set `ESP32 USB Setup / Broker URI` to the experiment PC WiFi LAN B IP, for example `mqtt://192.168.0.10:1883`.
 4. Press `Save MQTT` with ESP32 connected over USB.
 5. Press `Connect` in the MQTT panel.
-6. Press `Start TCP Host` and set SILAB `Destination_IP` to the experiment PC Ethernet LAN A IP.
-7. Keep `Aliases = 1=boot` for the current TF-card test audio. For formal
+6. Wait for ESP32 status; the GUI auto-fills `ESP Host` from `tcp_host` or WiFi IP.
+7. Keep `Direct ESP TCP` enabled for low-latency playback.
+8. Press `Start TCP Host` and set SILAB `Destination_IP` to the experiment PC Ethernet LAN A IP.
+9. Keep `Aliases = 1=boot` for the current TF-card test audio. For formal
    multi-scene audio, copy files such as `/sdcard/audio/scene001/001.wav` and
    clear or edit the alias field.
 
@@ -95,7 +97,7 @@ status:  copilot/s3_copilot/status
 Manual status query:
 
 ```json
-{"type":"status","query":"all"}
+{"type":"status","query":"status"}
 ```
 
 Manual playback:

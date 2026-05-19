@@ -2,8 +2,9 @@
 
 The preferred production topology makes the experiment PC the TCP host/server.
 SILAB connects to the PC bridge GUI, and the PC forwards accepted trigger
-events to ESP32 over MQTT. This avoids routing problems when SILAB and ESP32
-are on different LANs.
+events to ESP32 over direct TCP on the WiFi LAN. MQTT remains the status path
+and fallback control channel. This avoids routing problems when SILAB and ESP32
+are on different LANs, while keeping playback latency low.
 
 SILAB sends one newline-delimited text packet per sample:
 
@@ -26,7 +27,7 @@ Field meaning:
 | `seq` | Audio sequence ID, 1..65535 |
 
 The PC bridge listens on TCP port `7777` by default. The ESP32 direct TCP host
-still exists for same-LAN debugging, but the PC MQTT bridge is the normal path.
+also listens on `7777`; the GUI auto-fills the ESP32 target from MQTT status.
 
 The firmware treats `trigger >= 0.5` as active. Playback is edge-triggered, so
 fixed-rate continuous `trigger=1` traffic does not repeatedly queue audio. The

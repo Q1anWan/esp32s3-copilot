@@ -2,7 +2,10 @@
 """PC-side SILAB TCP to ESP32 MQTT bridge GUI.
 
 Topology:
-  SILAB --LAN A/TCP--> experiment PC --LAN B/MQTT--> ESP32
+  SILAB --LAN A/TCP--> experiment PC --LAN B/direct TCP--> ESP32
+
+MQTT is still used for ESP32 status, and as a play-command fallback when the
+direct TCP host is unavailable.
 
 The PC listens for fixed-rate SILAB audio-ID packets:
   trigger<TAB>scene<TAB>seq<LF>
@@ -33,6 +36,8 @@ DEFAULT_CMD_TOPIC = os.environ.get("COPILOT_MQTT_TOPIC", "copilot/s3_copilot/cmd
 DEFAULT_STATUS_TOPIC = os.environ.get("COPILOT_STATUS_TOPIC", "copilot/s3_copilot/status")
 DEFAULT_TCP_HOST = os.environ.get("SILAB_TCP_HOST", "0.0.0.0")
 DEFAULT_TCP_PORT = int(os.environ.get("SILAB_TCP_PORT", "7777"))
+DEFAULT_ESP_TCP_HOST = os.environ.get("COPILOT_ESP_TCP_HOST", "")
+DEFAULT_ESP_TCP_PORT = int(os.environ.get("COPILOT_ESP_TCP_PORT", "7777"))
 DEFAULT_SCENE_PREFIX = os.environ.get("SILAB_SCENE_PREFIX", "scene")
 DEFAULT_SCENE_ALIASES = os.environ.get("SILAB_SCENE_ALIASES", "1=boot")
 
@@ -446,13 +451,20 @@ class BridgeGui(tk.Tk):
         self.args = args
         self.events: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self.mqtt = MqttController(self.events)
+        self._scene_prefix = args.scene_prefix.strip() or DEFAULT_SCENE_PREFIX
+        self._scene_aliases = args.scene_aliases.strip()
+        self._trigger_threshold = float(args.trigger_threshold)
+        self._tcp_ack = bool(args.tcp_ack)
+        self._direct_tcp_enabled = not args.no_direct_tcp
+        self._esp_tcp_host = args.esp_tcp_host.strip()
+        self._esp_tcp_port = int(args.esp_tcp_port)
         self.tcp_bridge = SilabTcpBridge(
             self.events,
-            publish_cb=self._publish_mqtt,
-            scene_prefix_cb=lambda: self.scene_prefix_var.get().strip() or DEFAULT_SCENE_PREFIX,
-            scene_aliases_cb=lambda: self.scene_aliases_var.get().strip(),
-            threshold_cb=lambda: self.threshold_var.get(),
-            ack_cb=lambda: self.tcp_ack_var.get(),
+            publish_cb=self._send_play_command,
+            scene_prefix_cb=lambda: self._scene_prefix,
+            scene_aliases_cb=lambda: self._scene_aliases,
+            threshold_cb=lambda: self._trigger_threshold,
+            ack_cb=lambda: self._tcp_ack,
         )
         self.port_map: dict[str, str] = {}
         self.broker_proc: subprocess.Popen | None = None
@@ -464,10 +476,12 @@ class BridgeGui(tk.Tk):
         self._last_mqtt_connected: bool | None = None
         self._last_sd_mounted: bool | None = None
         self._last_esp_status_at = 0.0
+        self._last_direct_host = ""
         self._pending_plays: dict[str, dict] = {}
         self._played_event_keys: set[tuple[int, str]] = set()
         self._build_style()
         self._build_ui()
+        self._sync_runtime_config()
         self.refresh_ports(initial=True)
         self.after(80, self._drain_events)
         self.after(1000, self._auto_status)
@@ -578,16 +592,26 @@ class BridgeGui(tk.Tk):
         self.tcp_btn.grid(row=6, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
 
     def _build_play(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text="Manual MQTT Play")
+        box = ttk.LabelFrame(parent, text="Manual Play")
         box.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         box.columnconfigure(1, weight=1)
         self.play_scene_var = tk.StringVar(value="boot")
         self.play_seq_var = tk.IntVar(value=1)
+        self.direct_tcp_var = tk.BooleanVar(value=not self.args.no_direct_tcp)
+        self.esp_tcp_host_var = tk.StringVar(value=self.args.esp_tcp_host)
+        self.esp_tcp_port_var = tk.IntVar(value=self.args.esp_tcp_port)
         ttk.Label(box, text="Scene").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
         ttk.Entry(box, textvariable=self.play_scene_var, width=18).grid(row=0, column=1, sticky="ew", padx=8, pady=(8, 4))
         ttk.Label(box, text="Seq").grid(row=1, column=0, sticky="w", padx=8, pady=4)
         ttk.Entry(box, textvariable=self.play_seq_var, width=10).grid(row=1, column=1, sticky="w", padx=8, pady=4)
-        ttk.Button(box, text="Play via MQTT", command=self.play_manual).grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
+        ttk.Checkbutton(box, text="Direct ESP TCP", variable=self.direct_tcp_var).grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=8, pady=4
+        )
+        ttk.Label(box, text="ESP Host").grid(row=3, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(box, textvariable=self.esp_tcp_host_var, width=18).grid(row=3, column=1, sticky="ew", padx=8, pady=4)
+        ttk.Label(box, text="ESP Port").grid(row=4, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(box, textvariable=self.esp_tcp_port_var, width=10).grid(row=4, column=1, sticky="w", padx=8, pady=4)
+        ttk.Button(box, text="Play", command=self.play_manual).grid(row=5, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
 
     def _build_status(self, parent: ttk.Frame) -> None:
         top = ttk.Frame(parent)
@@ -703,6 +727,7 @@ class BridgeGui(tk.Tk):
         if self.tcp_bridge.running:
             self.tcp_bridge.stop()
             return
+        self._sync_runtime_config()
         try:
             self.tcp_bridge.start(self.tcp_host_var.get().strip(), int(self.tcp_port_var.get()))
         except Exception as exc:
@@ -749,10 +774,81 @@ class BridgeGui(tk.Tk):
         for item in lines:
             self.events.put(("log", f"[usb] {item}"))
 
+    def _sync_runtime_config(self) -> None:
+        self._scene_prefix = self.scene_prefix_var.get().strip() or DEFAULT_SCENE_PREFIX
+        self._scene_aliases = self.scene_aliases_var.get().strip()
+        try:
+            self._trigger_threshold = float(self.threshold_var.get())
+        except (tk.TclError, ValueError):
+            self._trigger_threshold = 0.5
+        self._tcp_ack = bool(self.tcp_ack_var.get())
+        self._direct_tcp_enabled = bool(self.direct_tcp_var.get())
+        self._esp_tcp_host = self.esp_tcp_host_var.get().strip()
+        try:
+            self._esp_tcp_port = int(self.esp_tcp_port_var.get())
+        except (tk.TclError, ValueError):
+            self._esp_tcp_port = DEFAULT_ESP_TCP_PORT
+
+    def _direct_tcp_target(self) -> tuple[str, int] | None:
+        host = self._esp_tcp_host
+        if not host:
+            return None
+        port = self._esp_tcp_port
+        if port < 1 or port > 65535:
+            return None
+        return host, port
+
+    def _send_direct_tcp(self, payload: dict) -> tuple[bool, str]:
+        target = self._direct_tcp_target()
+        if target is None:
+            return False, "no ESP TCP target"
+        host, port = target
+        started = time.monotonic()
+        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+        try:
+            with socket.create_connection((host, port), timeout=0.35) as sock:
+                sock.settimeout(0.12)
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
+                sock.sendall(data)
+        except OSError as exc:
+            return False, str(exc)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        scene = payload.get("scene", "-")
+        seq = int(payload.get("seq", 0) or 0)
+        self.events.put(("log", f"[direct] play sent {scene}/{seq:03d} {host}:{port} {elapsed_ms}ms"))
+        return True, "sent"
+
+    def _track_play_request(self, payload: dict) -> None:
+        message_id = str(payload.get("message_id") or f"play_{int(time.time() * 1000)}")
+        self._pending_plays[message_id] = {
+            "scene": str(payload.get("scene") or "-"),
+            "seq": int(payload.get("seq", 0) or 0),
+            "files_before": self._last_files_played,
+            "t0": time.time(),
+        }
+        self.after(900, lambda: self.query_status(quiet=True))
+        self.after(2200, lambda: self.query_status(quiet=True))
+
     def _publish_mqtt(self, payload: dict) -> bool:
-        return self.mqtt.publish(payload)
+        ok = self.mqtt.publish(payload)
+        if ok and payload.get("type") == "play":
+            self.events.put(("track_play", dict(payload)))
+        return ok
+
+    def _send_play_command(self, payload: dict) -> bool:
+        if payload.get("type") == "play" and self._direct_tcp_enabled:
+            ok, reason = self._send_direct_tcp(payload)
+            if ok:
+                self.events.put(("track_play", dict(payload)))
+                return True
+            self.events.put(("log", f"[direct] failed {reason}; fallback MQTT"))
+        return self._publish_mqtt(payload)
 
     def play_manual(self) -> None:
+        self._sync_runtime_config()
         scene = self.play_scene_var.get().strip()
         seq = int(self.play_seq_var.get())
         if not scene or seq < 1 or seq > 65535:
@@ -762,26 +858,35 @@ class BridgeGui(tk.Tk):
                                 self.scene_aliases_var.get().strip())
         message_id = f"manual_{int(time.time() * 1000)}"
         payload = {"type": "play", "scene": scene, "seq": seq, "message_id": message_id}
-        if self.mqtt.publish(payload):
-            self._pending_plays[message_id] = {
-                "scene": scene,
-                "seq": seq,
-                "files_before": self._last_files_played,
-                "t0": time.time(),
-            }
+        if self._send_play_command(payload):
             self._log(f"[manual] play requested {scene}/{seq:03d}")
-            self.after(1200, lambda: self.query_status(quiet=True))
-            self.after(3500, lambda: self.query_status(quiet=True))
 
     def query_status(self, quiet: bool = False) -> None:
-        self.mqtt.publish({"type": "status", "query": "all"}, quiet=quiet)
+        self.mqtt.publish({"type": "status", "query": "status"}, quiet=quiet)
 
     def _auto_status(self) -> None:
-        if self.mqtt.connected:
+        now = time.time()
+        play_recent = any(now - item.get("t0", 0) < 4.0 for item in self._pending_plays.values())
+        if self.mqtt.connected and not play_recent:
             self.query_status(quiet=True)
-        self.auto_status_after = self.after(3000, self._auto_status)
+        self.auto_status_after = self.after(8000 if not play_recent else 1000, self._auto_status)
+
+    def _maybe_update_direct_target(self, host: str, port: int | None = None) -> None:
+        host = host.strip()
+        if not host:
+            return
+        current = self.esp_tcp_host_var.get().strip()
+        if current and current != self._last_direct_host:
+            return
+        self.esp_tcp_host_var.set(host)
+        self._last_direct_host = host
+        self._esp_tcp_host = host
+        if port is not None and 1 <= port <= 65535:
+            self.esp_tcp_port_var.set(port)
+            self._esp_tcp_port = port
 
     def _drain_events(self) -> None:
+        self._sync_runtime_config()
         try:
             while True:
                 kind, payload = self.events.get_nowait()
@@ -793,6 +898,8 @@ class BridgeGui(tk.Tk):
                     self._update_status(payload if isinstance(payload, dict) else {})
                 elif kind == "silab_packet":
                     self._update_silab(payload if isinstance(payload, dict) else {})
+                elif kind == "track_play":
+                    self._track_play_request(payload if isinstance(payload, dict) else {})
                 elif kind == "tcp_running":
                     running = bool(payload)
                     self.tcp_btn.configure(text="Stop TCP Host" if running else "Start TCP Host")
@@ -819,10 +926,23 @@ class BridgeGui(tk.Tk):
             wifi_text = "connected" if wifi_connected else "offline"
             if wifi.get("ip"):
                 wifi_text += f" {wifi.get('ip')}"
+                self._maybe_update_direct_target(str(wifi.get("ip")), DEFAULT_ESP_TCP_PORT)
             self.status_vars["wifi"].set(wifi_text)
             if self._last_wifi_connected is not None and self._last_wifi_connected != wifi_connected:
                 self._log(f"[esp32] WiFi {'connected' if wifi_connected else 'offline'}")
             self._last_wifi_connected = wifi_connected
+
+        tcp_host = str(payload.get("tcp_host") or "")
+        if tcp_host:
+            host, port = tcp_host, None
+            if ":" in tcp_host:
+                host_part, port_text = tcp_host.rsplit(":", 1)
+                try:
+                    port = int(port_text)
+                    host = host_part
+                except ValueError:
+                    port = None
+            self._maybe_update_direct_target(host, port)
 
         if "mqtt" in payload:
             mqtt_status = payload.get("mqtt") or {}
@@ -918,6 +1038,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--status-topic", default=DEFAULT_STATUS_TOPIC, help="ESP32 status topic")
     parser.add_argument("--tcp-host", default=DEFAULT_TCP_HOST, help="SILAB TCP bind host. Default: 0.0.0.0")
     parser.add_argument("--tcp-port", type=int, default=DEFAULT_TCP_PORT, help="SILAB TCP port. Default: 7777")
+    parser.add_argument("--esp-tcp-host", default=DEFAULT_ESP_TCP_HOST, help="ESP32 direct TCP host. Auto-filled from status when empty")
+    parser.add_argument("--esp-tcp-port", type=int, default=DEFAULT_ESP_TCP_PORT, help="ESP32 direct TCP port. Default: 7777")
+    parser.add_argument("--no-direct-tcp", action="store_true", help="Disable direct TCP play and use MQTT for play commands")
     parser.add_argument("--trigger-threshold", type=float, default=0.5, help="Trigger active threshold. Default: 0.5")
     parser.add_argument("--scene-prefix", default=DEFAULT_SCENE_PREFIX, help="Numeric scene prefix. Default: scene")
     parser.add_argument("--scene-aliases", default=DEFAULT_SCENE_ALIASES, help="Numeric scene aliases, for example 1=boot,2=scene002")

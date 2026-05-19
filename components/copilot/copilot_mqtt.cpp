@@ -42,12 +42,32 @@ static char s_topic_cmd[96];
 static char s_topic_status[96];
 static char s_wifi_ssid[33];
 static char s_wifi_password[65];
+static char s_mqtt_broker_uri[128];
 static char s_ip_string[16];
+static bool s_nvs_ready = false;
 
 static const int kMaxRetry = 6;
 static const char *kWifiNvsNs = "copilot_wifi";
 static const char *kWifiNvsSsid = "ssid";
 static const char *kWifiNvsPass = "pass";
+static const char *kWifiNvsBroker = "broker";
+
+static bool copilot_ensure_nvs(void) {
+    if (s_nvs_ready) {
+        return true;
+    }
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        err = nvs_flash_init();
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    s_nvs_ready = true;
+    return true;
+}
 
 static void copilot_mqtt_stop_client(const char *reason) {
     if (!s_mqtt || !s_mqtt_started) {
@@ -91,7 +111,7 @@ static void copilot_load_wifi_credentials(void) {
     }
 
     nvs_handle_t handle = 0;
-    esp_err_t err = nvs_open(kWifiNvsNs, NVS_READONLY, &handle);
+    esp_err_t err = copilot_ensure_nvs() ? nvs_open(kWifiNvsNs, NVS_READONLY, &handle) : ESP_FAIL;
     if (err == ESP_OK) {
         size_t ssid_len = sizeof(s_wifi_ssid);
         size_t pass_len = sizeof(s_wifi_password);
@@ -113,6 +133,47 @@ static void copilot_load_wifi_credentials(void) {
     s_wifi_password[sizeof(s_wifi_password) - 1] = '\0';
     if (s_wifi_ssid[0] != '\0') {
         ESP_LOGI(TAG, "WiFi credentials loaded from sdkconfig: %s", s_wifi_ssid);
+    }
+}
+
+static bool copilot_is_valid_broker_uri(const char *broker_uri) {
+    if (!broker_uri || broker_uri[0] == '\0' || strlen(broker_uri) >= sizeof(s_mqtt_broker_uri)) {
+        return false;
+    }
+    if (strncmp(broker_uri, "mqtt://", 7) != 0 && strncmp(broker_uri, "mqtts://", 8) != 0) {
+        return false;
+    }
+    for (size_t i = 0; broker_uri[i] != '\0'; ++i) {
+        unsigned char c = (unsigned char)broker_uri[i];
+        if (c < 0x21 || c == '"' || c == '\\') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void copilot_load_mqtt_broker_uri(void) {
+    if (s_mqtt_broker_uri[0] != '\0') {
+        return;
+    }
+
+    nvs_handle_t handle = 0;
+    esp_err_t err = copilot_ensure_nvs() ? nvs_open(kWifiNvsNs, NVS_READONLY, &handle) : ESP_FAIL;
+    if (err == ESP_OK) {
+        size_t uri_len = sizeof(s_mqtt_broker_uri);
+        esp_err_t uri_err = nvs_get_str(handle, kWifiNvsBroker, s_mqtt_broker_uri, &uri_len);
+        nvs_close(handle);
+        if (uri_err == ESP_OK && copilot_is_valid_broker_uri(s_mqtt_broker_uri)) {
+            ESP_LOGI(TAG, "MQTT broker URI loaded from NVS: %s", s_mqtt_broker_uri);
+            return;
+        }
+        s_mqtt_broker_uri[0] = '\0';
+    }
+
+    strncpy(s_mqtt_broker_uri, CONFIG_COPILOT_MQTT_BROKER_URI, sizeof(s_mqtt_broker_uri) - 1);
+    s_mqtt_broker_uri[sizeof(s_mqtt_broker_uri) - 1] = '\0';
+    if (s_mqtt_broker_uri[0] != '\0') {
+        ESP_LOGI(TAG, "MQTT broker URI loaded from sdkconfig: %s", s_mqtt_broker_uri);
     }
 }
 
@@ -181,7 +242,8 @@ static void copilot_mqtt_start_client(void) {
         return;
     }
 
-    if (CONFIG_COPILOT_MQTT_BROKER_URI[0] == '\0') {
+    copilot_load_mqtt_broker_uri();
+    if (s_mqtt_broker_uri[0] == '\0') {
         ESP_LOGW(TAG, "MQTT broker URI not set");
         return;
     }
@@ -190,20 +252,28 @@ static void copilot_mqtt_start_client(void) {
         return;
     }
 
-    LOGI_MQTT( "MQTT broker: %s", CONFIG_COPILOT_MQTT_BROKER_URI);
+    LOGI_MQTT( "MQTT broker: %s", s_mqtt_broker_uri);
     copilot_build_device_id();
     copilot_build_topics();
 
     if (s_mqtt) {
         LOGI_MQTT( "MQTT restart");
-        esp_mqtt_client_start(s_mqtt);
+        esp_mqtt_client_set_uri(s_mqtt, s_mqtt_broker_uri);
+        esp_err_t start_err = esp_mqtt_client_start(s_mqtt);
+        if (start_err != ESP_OK) {
+            ESP_LOGE(TAG, "MQTT restart failed: %s", esp_err_to_name(start_err));
+            s_mqtt_started = false;
+            return;
+        }
         s_mqtt_started = true;
         return;
     }
 
     esp_mqtt_client_config_t mqtt_cfg = {};
-    mqtt_cfg.broker.address.uri = CONFIG_COPILOT_MQTT_BROKER_URI;
+    mqtt_cfg.broker.address.uri = s_mqtt_broker_uri;
     mqtt_cfg.credentials.client_id = s_device_id;
+    mqtt_cfg.task.stack_size = 4096;
+    mqtt_cfg.network.timeout_ms = 5000;
 
     s_mqtt = esp_mqtt_client_init(&mqtt_cfg);
     if (!s_mqtt) {
@@ -212,7 +282,12 @@ static void copilot_mqtt_start_client(void) {
     }
 
     esp_mqtt_client_register_event(s_mqtt, (esp_mqtt_event_id_t)ESP_EVENT_ANY_ID, copilot_mqtt_event_handler, nullptr);
-    esp_mqtt_client_start(s_mqtt);
+    esp_err_t start_err = esp_mqtt_client_start(s_mqtt);
+    if (start_err != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT start failed: %s", esp_err_to_name(start_err));
+        s_mqtt_started = false;
+        return;
+    }
     s_mqtt_started = true;
 }
 
@@ -300,6 +375,7 @@ static void copilot_ip_event_handler(void *arg, esp_event_base_t event_base, int
 }
 
 static void copilot_wifi_init(void) {
+    copilot_ensure_nvs();
     copilot_load_wifi_credentials();
     if (s_wifi_ssid[0] == '\0') {
         ESP_LOGW(TAG, "WiFi SSID not set, skip WiFi/MQTT (use tools/copilot_usb_config.py wifi)");
@@ -311,13 +387,7 @@ static void copilot_wifi_init(void) {
     }
     LOGI_MQTT( "WiFi SSID: %s", s_wifi_ssid);
 
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ESP_ERROR_CHECK(nvs_flash_init());
-    }
-
-    err = esp_netif_init();
+    esp_err_t err = esp_netif_init();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "esp_netif_init failed: %d", err);
     }
@@ -400,7 +470,7 @@ bool copilot_mqtt_configure_wifi(const char *ssid, const char *password) {
     }
 
     nvs_handle_t handle = 0;
-    esp_err_t err = nvs_open(kWifiNvsNs, NVS_READWRITE, &handle);
+    esp_err_t err = copilot_ensure_nvs() ? nvs_open(kWifiNvsNs, NVS_READWRITE, &handle) : ESP_FAIL;
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Open WiFi NVS failed: %s", esp_err_to_name(err));
         return false;
@@ -444,11 +514,54 @@ bool copilot_mqtt_configure_wifi(const char *ssid, const char *password) {
     return true;
 }
 
+bool copilot_mqtt_configure_broker(const char *broker_uri) {
+    if (!copilot_is_valid_broker_uri(broker_uri)) {
+        ESP_LOGW(TAG, "Invalid MQTT broker URI");
+        return false;
+    }
+
+    nvs_handle_t handle = 0;
+    esp_err_t err = copilot_ensure_nvs() ? nvs_open(kWifiNvsNs, NVS_READWRITE, &handle) : ESP_FAIL;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Open MQTT NVS failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    err = nvs_set_str(handle, kWifiNvsBroker, broker_uri);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Save MQTT broker NVS failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    strncpy(s_mqtt_broker_uri, broker_uri, sizeof(s_mqtt_broker_uri) - 1);
+    s_mqtt_broker_uri[sizeof(s_mqtt_broker_uri) - 1] = '\0';
+    ESP_LOGI(TAG, "MQTT broker configured: %s", s_mqtt_broker_uri);
+
+    if (s_mqtt && s_mqtt_started) {
+        copilot_mqtt_stop_client("broker_changed");
+    }
+    if (s_mqtt) {
+        esp_err_t uri_err = esp_mqtt_client_set_uri(s_mqtt, s_mqtt_broker_uri);
+        if (uri_err != ESP_OK) {
+            ESP_LOGE(TAG, "Set MQTT URI failed: %s", esp_err_to_name(uri_err));
+            return false;
+        }
+    }
+    if (s_wifi_connected) {
+        copilot_mqtt_start_client();
+    }
+    return true;
+}
+
 bool copilot_mqtt_get_status(copilot_network_status_t *out_status) {
     if (!out_status) {
         return false;
     }
     copilot_load_wifi_credentials();
+    copilot_load_mqtt_broker_uri();
     memset(out_status, 0, sizeof(*out_status));
     out_status->wifi_started = s_wifi_started;
     out_status->wifi_connected = s_wifi_connected;
@@ -456,6 +569,7 @@ bool copilot_mqtt_get_status(copilot_network_status_t *out_status) {
     out_status->mqtt_connected = s_mqtt_connected;
     strncpy(out_status->ssid, s_wifi_ssid, sizeof(out_status->ssid) - 1);
     strncpy(out_status->ip, s_ip_string, sizeof(out_status->ip) - 1);
+    strncpy(out_status->mqtt_broker_uri, s_mqtt_broker_uri, sizeof(out_status->mqtt_broker_uri) - 1);
     if (s_device_id[0] == '\0') {
         copilot_build_device_id();
     }

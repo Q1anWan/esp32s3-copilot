@@ -42,6 +42,32 @@ config COPILOT_TCP_HOST_PORT
     default 7777
     depends on COPILOT_TCP_HOST_ENABLE
 
+config COPILOT_TCP_AUDIO_ID_ENABLE
+    bool "Accept compact scene/sequence audio ID packets on TCP host"
+    default y
+    depends on COPILOT_TCP_HOST_ENABLE
+    help
+        Accept newline-delimited packets:
+        trigger<TAB>scene<TAB>seq. Trigger rising edges play the target audio.
+        Numeric scene IDs are mapped to a folder name using the configured
+        prefix, for example 1<TAB>1<TAB>1 plays scene001/001.wav.
+
+config COPILOT_TCP_AUDIO_ID_NUMERIC_SCENE_PREFIX
+    string "Numeric audio scene prefix"
+    default "scene"
+    depends on COPILOT_TCP_AUDIO_ID_ENABLE
+    help
+        Prefix used when the compact packet scene field is numeric.
+        Example: prefix "scene" maps scene ID 1 to folder scene001.
+
+config COPILOT_TCP_AUDIO_ID_DEDUPE_MS
+    int "Compact audio ID duplicate suppression ms"
+    default 0
+    depends on COPILOT_TCP_AUDIO_ID_ENABLE
+    help
+        Suppress repeated identical scene/sequence packets within this window.
+        Set to 0 to rely only on trigger rising-edge detection.
+
 config COPILOT_SERIAL_CONSOLE_ENABLE
     bool "Enable USB serial quick configuration console"
     default y

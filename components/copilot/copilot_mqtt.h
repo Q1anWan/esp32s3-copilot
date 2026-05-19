@@ -17,6 +17,7 @@ typedef struct {
     bool mqtt_connected;
     char ssid[33];
     char ip[16];
+    char mqtt_broker_uri[128];
     char device_id[32];
     char tcp_host[32];
 } copilot_network_status_t;
@@ -24,6 +25,7 @@ typedef struct {
 void copilot_mqtt_start(copilot_mqtt_cmd_cb cb);
 void copilot_mqtt_notify_voice_ready(void);
 void copilot_mqtt_publish(const char *topic_suffix, const char *payload);
+bool copilot_mqtt_configure_broker(const char *broker_uri);
 bool copilot_mqtt_configure_wifi(const char *ssid, const char *password);
 bool copilot_mqtt_get_status(copilot_network_status_t *out_status);
 bool copilot_mqtt_wifi_is_connected(void);

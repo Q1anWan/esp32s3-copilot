@@ -57,6 +57,10 @@ extern "C" void app_main(void) {
     }
     ESP_ERROR_CHECK(err);
 
+#if CONFIG_COPILOT_SERIAL_CONSOLE_ENABLE
+    copilot_serial_console_start();
+#endif
+
     bsp_display_cfg_t disp_cfg = {
         .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
         .buffer_size = BSP_LCD_H_RES * kDisplayDrawBufferLines,
@@ -69,6 +73,7 @@ extern "C" void app_main(void) {
     };
     // Keep LVGL stack modest; touch is optional and disabled for display/audio builds.
     disp_cfg.lvgl_port_cfg.task_stack = 6144;
+    disp_cfg.lvgl_port_cfg.task_stack_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     disp_cfg.lvgl_port_cfg.task_priority = 15;
     disp_cfg.lvgl_port_cfg.task_affinity = copilot_normalize_core(CONFIG_COPILOT_UI_CORE);
     ESP_LOGI(TAG, "LVGL task affinity=%d", disp_cfg.lvgl_port_cfg.task_affinity);
@@ -123,7 +128,4 @@ extern "C" void app_main(void) {
         ESP_LOGE(TAG, "Failed to acquire LVGL lock");
     }
 
-#if CONFIG_COPILOT_SERIAL_CONSOLE_ENABLE
-    copilot_serial_console_start();
-#endif
 }

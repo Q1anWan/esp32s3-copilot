@@ -72,6 +72,7 @@ static QueueHandle_t s_action_queue = nullptr;
 static TaskHandle_t s_action_task = nullptr;
 static bool s_network_started = false;
 static char s_screen_event_publish_buf[512];
+static char s_status_publish_buf[1024];
 
 static const char *copilot_screen_state_name(copilot_screen_state_t state) {
     switch (state) {
@@ -501,6 +502,13 @@ void copilot_app_handle_command(const char *payload, int payload_len) {
         const char *password = copilot_get_string_any(root, "password", "pass", "");
         bool ok = copilot_mqtt_configure_wifi(ssid, password);
         ESP_LOGI(TAG, "WiFi config command: ssid=%s result=%s", ssid, ok ? "ok" : "failed");
+    } else if (strcmp(type->valuestring, "mqtt") == 0) {
+        const char *broker_uri = copilot_get_string_any(root, "broker", "broker_uri", "");
+        if (broker_uri[0] == '\0') {
+            broker_uri = copilot_get_string_any(root, "uri", nullptr, "");
+        }
+        bool ok = copilot_mqtt_configure_broker(broker_uri);
+        ESP_LOGI(TAG, "MQTT broker config command: uri=%s result=%s", broker_uri, ok ? "ok" : "failed");
     } else if (strcmp(type->valuestring, "screen") == 0 || strcmp(type->valuestring, "display") == 0) {
         const char *action = copilot_get_string_any(root, "action", nullptr, "");
         const char *state_name = copilot_get_string_any(root, "state", nullptr, "");
@@ -686,6 +694,11 @@ void copilot_app_handle_command(const char *payload, int payload_len) {
         const cJSON *query = cJSON_GetObjectItemCaseSensitive(root, "query");
         const char *query_str = cJSON_IsString(query) ? query->valuestring : "all";
 
+        if (strcmp(query_str, "system") == 0 || strcmp(query_str, "status") == 0 || strcmp(query_str, "all") == 0) {
+            if (copilot_app_format_status(s_status_publish_buf, sizeof(s_status_publish_buf))) {
+                copilot_mqtt_publish("status", s_status_publish_buf);
+            }
+        }
         if (strcmp(query_str, "imu") == 0 || strcmp(query_str, "all") == 0) {
 #if CONFIG_COPILOT_LOG_APP
             float bias = copilot_imu_get_gyro_bias();
@@ -909,7 +922,7 @@ bool copilot_app_format_status(char *out, unsigned out_len) {
              "{\"type\":\"status\","
              "\"device_id\":\"%s\","
              "\"wifi\":{\"started\":%s,\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\"},"
-             "\"mqtt\":{\"started\":%s,\"connected\":%s},"
+             "\"mqtt\":{\"started\":%s,\"connected\":%s,\"broker\":\"%s\"},"
              "\"tcp_host\":\"%s\","
              "\"audio\":{\"ready\":%s,\"sd_mounted\":%s,\"playing_file\":%s,"
              "\"files_played\":%lu,\"current_path\":\"%s\",\"last_error\":\"%s\"},"
@@ -921,6 +934,7 @@ bool copilot_app_format_status(char *out, unsigned out_len) {
              net.ip,
              net.mqtt_started ? "true" : "false",
              net.mqtt_connected ? "true" : "false",
+             net.mqtt_broker_uri,
              net.tcp_host,
              audio.ready ? "true" : "false",
              audio.sd_mounted ? "true" : "false",

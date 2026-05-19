@@ -3,6 +3,7 @@
 
 Works on Windows and Ubuntu with pyserial:
   python tools/copilot_usb_config.py wifi --ssid MyAP --password secret
+  python tools/copilot_usb_config.py mqtt --broker mqtt://192.168.0.10:1883
   python tools/copilot_usb_config.py status
   python tools/copilot_usb_config.py play --scene boot --seq 1
   python tools/copilot_usb_config.py monitor
@@ -179,6 +180,25 @@ def cmd_wifi(args) -> None:
         print(f"[status] connected={wifi.get('connected')} ip={wifi.get('ip')} tcp={status.get('tcp_host')}")
 
 
+def cmd_mqtt(args) -> None:
+    ser, port = open_serial(args)
+    print(f"[usb] opened {port} @ {args.baud}")
+    wait_ready(ser, args.ready_timeout)
+    broker = args.broker.strip()
+    if not broker.startswith(("mqtt://", "mqtts://")):
+        broker = "mqtt://" + broker
+    send_line(ser, f"mqtt {broker}")
+    read_lines(ser, args.wait)
+    status = poll_status(ser, args.wait, args.timeout, False)
+    if status:
+        mqtt_status = status.get("mqtt", {})
+        print(
+            f"[status] mqtt_started={mqtt_status.get('started')} "
+            f"mqtt_connected={mqtt_status.get('connected')} "
+            f"broker={mqtt_status.get('broker')}"
+        )
+
+
 def cmd_status(args) -> None:
     ser, port = open_serial(args)
     print(f"[usb] opened {port} @ {args.baud}")
@@ -230,6 +250,11 @@ def build_parser() -> argparse.ArgumentParser:
     wifi.add_argument("--password", default="")
     wifi.add_argument("--timeout", type=float, default=15.0, help="Seconds to wait for WiFi/TCP after configuring. Default: 15s")
     wifi.set_defaults(func=cmd_wifi)
+
+    mqtt = sub.add_parser("mqtt", help="Save MQTT broker URI to NVS and reconnect MQTT")
+    mqtt.add_argument("--broker", required=True, help="Broker URI or host[:port], for example mqtt://192.168.0.10:1883")
+    mqtt.add_argument("--timeout", type=float, default=8.0, help="Seconds to wait for status after configuring. Default: 8s")
+    mqtt.set_defaults(func=cmd_mqtt)
 
     status = sub.add_parser("status", help="Print system status JSON")
     status.add_argument("--timeout", type=float, default=15.0, help="Seconds to wait for WiFi/TCP readiness. Default: 15s")

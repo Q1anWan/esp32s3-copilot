@@ -5,9 +5,11 @@
 #include <fcntl.h>
 
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
 #include "driver/usb_serial_jtag.h"
@@ -21,7 +23,7 @@ static const char *TAG = "copilot_serial";
 static TaskHandle_t s_serial_task = nullptr;
 static bool s_stdio_prepared = false;
 static char s_line_buf[512];
-static char s_status_buf[768];
+static char s_status_buf[1024];
 
 void copilot_serial_console_prepare(void) {
     if (s_stdio_prepared) {
@@ -123,7 +125,7 @@ static void handle_text_command(char *line) {
     }
 
     if (starts_with_ci(line, "help")) {
-        printf("COPILOT_HELP commands: status | wifi <ssid> <password> | play <scene> <seq> | debug on/off | reboot | JSON-line\n");
+        printf("COPILOT_HELP commands: status | wifi <ssid> <password> | mqtt <mqtt://host:port> | play <scene> <seq> | debug on/off | reboot | JSON-line\n");
         fflush(stdout);
         return;
     }
@@ -152,6 +154,18 @@ static void handle_text_command(char *line) {
             printf("COPILOT_OK wifi ssid=%s\n", ssid);
         } else {
             printf("COPILOT_ERROR wifi_usage\n");
+        }
+        fflush(stdout);
+        return;
+    }
+
+    if (starts_with_ci(line, "mqtt ")) {
+        char broker_uri[128] = {};
+        int count = sscanf(line, "%*s %127s", broker_uri);
+        if (count == 1 && copilot_mqtt_configure_broker(broker_uri)) {
+            printf("COPILOT_OK mqtt broker=%s\n", broker_uri);
+        } else {
+            printf("COPILOT_ERROR mqtt_usage\n");
         }
         fflush(stdout);
         return;
@@ -201,7 +215,11 @@ void copilot_serial_console_start(void) {
     if (s_serial_task) {
         return;
     }
-    BaseType_t ok = xTaskCreate(serial_task, "copilot_serial", 4096, nullptr, 2, &s_serial_task);
+    BaseType_t ok = xTaskCreateWithCaps(serial_task, "copilot_serial", 4096, nullptr, 2,
+                                        &s_serial_task, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok != pdPASS) {
+        ok = xTaskCreate(serial_task, "copilot_serial", 4096, nullptr, 2, &s_serial_task);
+    }
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create serial console task");
     }

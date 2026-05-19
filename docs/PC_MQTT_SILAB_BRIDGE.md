@@ -106,6 +106,12 @@ Manual playback:
 {"type":"play","scene":"boot","seq":1}
 ```
 
+Manual stop:
+
+```json
+{"type":"audio","action":"stop"}
+```
+
 ## USB Quick Configuration
 
 The broker URI can also be set without the GUI:

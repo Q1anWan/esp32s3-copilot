@@ -611,7 +611,12 @@ class BridgeGui(tk.Tk):
         ttk.Entry(box, textvariable=self.esp_tcp_host_var, width=18).grid(row=3, column=1, sticky="ew", padx=8, pady=4)
         ttk.Label(box, text="ESP Port").grid(row=4, column=0, sticky="w", padx=8, pady=4)
         ttk.Entry(box, textvariable=self.esp_tcp_port_var, width=10).grid(row=4, column=1, sticky="w", padx=8, pady=4)
-        ttk.Button(box, text="Play", command=self.play_manual).grid(row=5, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
+        row = ttk.Frame(box)
+        row.grid(row=5, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
+        row.columnconfigure(0, weight=1)
+        row.columnconfigure(1, weight=1)
+        ttk.Button(row, text="Play", command=self.play_manual).grid(row=0, column=0, sticky="ew")
+        ttk.Button(row, text="Stop", command=self.stop_manual).grid(row=0, column=1, sticky="ew", padx=(4, 0))
 
     def _build_status(self, parent: ttk.Frame) -> None:
         top = ttk.Frame(parent)
@@ -816,9 +821,17 @@ class BridgeGui(tk.Tk):
         except OSError as exc:
             return False, str(exc)
         elapsed_ms = int((time.monotonic() - started) * 1000)
-        scene = payload.get("scene", "-")
-        seq = int(payload.get("seq", 0) or 0)
-        self.events.put(("log", f"[direct] play sent {scene}/{seq:03d} {host}:{port} {elapsed_ms}ms"))
+        msg_type = payload.get("type", "cmd")
+        action = payload.get("action", "")
+        if msg_type == "play" or (msg_type in ("audio", "sound") and action != "stop"):
+            scene = payload.get("scene", "-")
+            seq = int(payload.get("seq", 0) or 0)
+            summary = f"play {scene}/{seq:03d}"
+        elif action == "stop" or msg_type == "stop":
+            summary = "stop"
+        else:
+            summary = str(msg_type)
+        self.events.put(("log", f"[direct] {summary} sent {host}:{port} {elapsed_ms}ms"))
         return True, "sent"
 
     def _track_play_request(self, payload: dict) -> None:
@@ -838,14 +851,18 @@ class BridgeGui(tk.Tk):
             self.events.put(("track_play", dict(payload)))
         return ok
 
-    def _send_play_command(self, payload: dict) -> bool:
-        if payload.get("type") == "play" and self._direct_tcp_enabled:
+    def _send_control_command(self, payload: dict, track_play: bool = False) -> bool:
+        if self._direct_tcp_enabled:
             ok, reason = self._send_direct_tcp(payload)
             if ok:
-                self.events.put(("track_play", dict(payload)))
+                if track_play:
+                    self.events.put(("track_play", dict(payload)))
                 return True
             self.events.put(("log", f"[direct] failed {reason}; fallback MQTT"))
         return self._publish_mqtt(payload)
+
+    def _send_play_command(self, payload: dict) -> bool:
+        return self._send_control_command(payload, track_play=True)
 
     def play_manual(self) -> None:
         self._sync_runtime_config()
@@ -860,6 +877,16 @@ class BridgeGui(tk.Tk):
         payload = {"type": "play", "scene": scene, "seq": seq, "message_id": message_id}
         if self._send_play_command(payload):
             self._log(f"[manual] play requested {scene}/{seq:03d}")
+
+    def stop_manual(self) -> None:
+        self._sync_runtime_config()
+        message_id = f"stop_{int(time.time() * 1000)}"
+        payload = {"type": "audio", "action": "stop", "message_id": message_id}
+        if self._send_control_command(payload):
+            self._pending_plays.clear()
+            self._log("[manual] stop requested")
+            self.after(300, lambda: self.query_status(quiet=True))
+            self.after(1000, lambda: self.query_status(quiet=True))
 
     def query_status(self, quiet: bool = False) -> None:
         self.mqtt.publish({"type": "status", "query": "status"}, quiet=quiet)
@@ -1003,6 +1030,8 @@ class BridgeGui(tk.Tk):
             scene = payload.get("scene", "-")
             seq = int(payload.get("seq", 0) or 0)
             self._log(f"[mqtt] play {'sent' if ok else 'failed'} {scene}/{seq:03d} rc={rc}")
+        elif msg_type in ("audio", "stop") and payload.get("action", "stop") == "stop":
+            self._log(f"[mqtt] stop {'sent' if ok else 'failed'} rc={rc}")
         elif msg_type == "status":
             self._log(f"[mqtt] status query {'sent' if ok else 'failed'} rc={rc}")
         elif msg_type:

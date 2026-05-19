@@ -408,6 +408,23 @@ static void copilot_play_scene_sound_now(const char *scene_id, uint16_t sequence
 static void copilot_schedule_screen_state(copilot_screen_state_t state, copilot_screen_orientation_t orientation,
                                           uint32_t duration_ms, const char *message_id,
                                           bool calibration_content_present,
+                                          bool visual_semantic_content_present);
+
+static void copilot_stop_audio_now(const char *message_id) {
+    copilot_cancel_pending_actions();
+    copilot_audio_stop();
+    copilot_schedule_screen_state(COPILOT_SCREEN_STATE_RETURN_NEUTRAL,
+                                  COPILOT_SCREEN_ORIENT_FRONT,
+                                  520,
+                                  message_id,
+                                  false,
+                                  false);
+    ESP_LOGI(TAG, "Audio stop command applied");
+}
+
+static void copilot_schedule_screen_state(copilot_screen_state_t state, copilot_screen_orientation_t orientation,
+                                          uint32_t duration_ms, const char *message_id,
+                                          bool calibration_content_present,
                                           bool visual_semantic_content_present) {
     copilot_action_t action = {};
     action.type = ACTION_SCREEN_STATE;
@@ -593,6 +610,14 @@ void copilot_app_handle_command(const char *payload, int payload_len) {
         }
         bool ok = copilot_mqtt_configure_broker(broker_uri);
         ESP_LOGI(TAG, "MQTT broker config command: uri=%s result=%s", broker_uri, ok ? "ok" : "failed");
+    } else if (strcmp(type->valuestring, "stop") == 0) {
+        const char *target = copilot_get_string_any(root, "target", nullptr, "audio");
+        const char *message_id = copilot_get_string_any(root, "message_id", "id", "");
+        if (target[0] == '\0' || strcmp(target, "audio") == 0 ||
+            strcmp(target, "sound") == 0 || strcmp(target, "play") == 0 ||
+            strcmp(target, "all") == 0) {
+            copilot_stop_audio_now(message_id);
+        }
     } else if (strcmp(type->valuestring, "screen") == 0 || strcmp(type->valuestring, "display") == 0) {
         const char *action = copilot_get_string_any(root, "action", nullptr, "");
         const char *state_name = copilot_get_string_any(root, "state", nullptr, "");
@@ -722,6 +747,13 @@ void copilot_app_handle_command(const char *payload, int payload_len) {
     } else if (strcmp(type->valuestring, "sound") == 0 ||
                strcmp(type->valuestring, "audio") == 0 ||
                strcmp(type->valuestring, "play") == 0) {
+        const char *action = copilot_get_string_any(root, "action", nullptr, "");
+        if (strcmp(action, "stop") == 0 || strcmp(action, "cancel") == 0) {
+            const char *message_id = copilot_get_string_any(root, "message_id", "id", "");
+            copilot_stop_audio_now(message_id);
+            cJSON_Delete(root);
+            return;
+        }
         char scene_id[32];
         bool has_scene = copilot_get_scene_string(root, scene_id, sizeof(scene_id));
         const cJSON *seq_item = cJSON_GetObjectItemCaseSensitive(root, "seq");

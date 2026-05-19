@@ -73,3 +73,9 @@ Debug flow:
 
 4. Change `Destination_IP` to the experiment PC Ethernet LAN A IP and keep
    `Destination_Port = 7777`.
+
+Manual stop command, sent from the GUI or any TCP/MQTT test client:
+
+```json
+{"type":"audio","action":"stop"}
+```

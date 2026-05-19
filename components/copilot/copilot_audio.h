@@ -19,6 +19,7 @@ void copilot_audio_init(void);
 void copilot_audio_play(const char *sound_id);
 bool copilot_audio_play_scene(const char *scene_id, uint16_t sequence_id);
 bool copilot_audio_play_path(const char *path);
+void copilot_audio_stop(void);
 bool copilot_audio_is_ready(void);
 bool copilot_audio_get_status(copilot_audio_status_t *out_status);
 

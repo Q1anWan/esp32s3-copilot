@@ -295,6 +295,14 @@ static void handle_play_text(int fd, const char *line) {
     tcp_send_line(fd, s_tcp_ack_buf);
 }
 
+static void handle_stop_text(int fd) {
+    const char *payload = "{\"type\":\"audio\",\"action\":\"stop\",\"message_id\":\"tcp_stop\"}";
+    if (s_cmd_cb) {
+        s_cmd_cb(payload, (int)strlen(payload));
+    }
+    tcp_send_line(fd, "{\"ok\":true,\"cmd\":\"stop\"}");
+}
+
 static void handle_tcp_line(int fd, char *line) {
     trim_line(line);
     if (line[0] == '\0') {
@@ -320,6 +328,11 @@ static void handle_tcp_line(int fd, char *line) {
         return;
     }
 
+    if (starts_with_ci(line, "STOP")) {
+        handle_stop_text(fd);
+        return;
+    }
+
     if (line[0] == '{') {
         if (s_cmd_cb) {
             s_cmd_cb(line, (int)strlen(line));
@@ -340,7 +353,7 @@ static void handle_tcp_line(int fd, char *line) {
 }
 
 static void handle_client(int fd) {
-    tcp_send_line(fd, "{\"ok\":true,\"device\":\"s3_copilot\",\"commands\":[\"PLAY scene seq\",\"trigger scene seq\",\"STATUS\",\"PING\",\"json\"]}");
+    tcp_send_line(fd, "{\"ok\":true,\"device\":\"s3_copilot\",\"commands\":[\"PLAY scene seq\",\"STOP\",\"trigger scene seq\",\"STATUS\",\"PING\",\"json\"]}");
 
     size_t line_len = 0;
     while (true) {

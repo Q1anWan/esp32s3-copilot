@@ -796,6 +796,20 @@ bool copilot_audio_play_scene(const char *scene_id, uint16_t sequence_id) {
     return copilot_audio_enqueue_file(&req);
 }
 
+void copilot_audio_stop(void) {
+    if (!s_audio_queue) {
+        return;
+    }
+
+    copilot_audio_next_generation();
+    copilot_audio_drop_pending();
+    copilot_audio_out_abort(AUDIO_SRC_FILE);
+    copilot_audio_out_abort(AUDIO_SRC_TONE);
+    s_status.playing_file = false;
+    copilot_audio_set_error("");
+    ESP_LOGI(TAG, "Audio playback stopped");
+}
+
 bool copilot_audio_is_ready(void) {
     return s_audio_queue && copilot_audio_out_is_ready();
 }

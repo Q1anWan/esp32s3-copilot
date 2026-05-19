@@ -51,6 +51,9 @@ ESP32 then plays:
 
 ## Run On Experiment PC
 
+For a step-by-step Windows handover guide, see
+`docs/WINDOWS_SILAB_BRIDGE_DEPLOYMENT.md`.
+
 Install dependencies:
 
 ```bash
@@ -73,7 +76,8 @@ python3 tools/silab_mqtt_bridge_gui.py
 
 In the GUI:
 
-1. Press `Start Broker`.
+1. Use an external Mosquitto service for formal tests. The GUI `Start Dev Broker`
+   button is only for local developer checks.
 2. Set the broker host/port used by the GUI. `127.0.0.1:1883` is fine for the GUI itself.
 3. Set `ESP32 USB Setup / Broker URI` to the experiment PC WiFi LAN B IP, for example `mqtt://192.168.0.10:1883`.
 4. Press `Save MQTT` with ESP32 connected over USB.

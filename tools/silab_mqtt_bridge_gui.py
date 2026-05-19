@@ -535,7 +535,7 @@ class BridgeGui(tk.Tk):
         row.grid(row=4, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
         for col in range(3):
             row.columnconfigure(col, weight=1)
-        ttk.Button(row, text="Start Broker", command=self.start_broker).grid(row=0, column=0, sticky="ew")
+        ttk.Button(row, text="Start Dev Broker", command=self.start_broker).grid(row=0, column=0, sticky="ew")
         self.mqtt_btn = ttk.Button(row, text="Connect", command=self.toggle_mqtt)
         self.mqtt_btn.grid(row=0, column=1, sticky="ew", padx=4)
         ttk.Button(row, text="Query", command=self.query_status).grid(row=0, column=2, sticky="ew")

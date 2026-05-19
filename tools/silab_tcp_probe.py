@@ -7,7 +7,7 @@ Expected packet, one UTF-8/ASCII line per SILAB sample:
 
 Examples:
   0<TAB>1<TAB>1
-  1<TAB>1<TAB>1      -> ESP32 maps scene 1 to /sdcard/audio/scene001/001.wav
+  1<TAB>1<TAB>1      -> Bridge default alias maps scene 1 to /sdcard/audio/boot/001.wav
   1<TAB>nomi<TAB>2   -> ESP32 maps scene "nomi" to /sdcard/audio/nomi/002.wav
 
 The ESP32 plays only on the trigger rising edge. Repeated trigger=1 packets from
@@ -24,6 +24,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+DEFAULT_SCENE_PREFIX = "scene"
+DEFAULT_SCENE_ALIASES = "1=boot"
+
 
 @dataclass
 class AudioIdPacket:
@@ -31,13 +34,6 @@ class AudioIdPacket:
     trigger: float
     scene: str
     seq: int
-
-    @property
-    def esp32_scene(self) -> str:
-        numeric = parse_integer_like(self.scene)
-        if numeric is not None:
-            return f"scene{numeric:03d}"
-        return self.scene
 
 
 def hex_with_spaces(data: bytes) -> str:
@@ -60,6 +56,31 @@ def scene_token_is_valid(scene: str) -> bool:
     if parse_integer_like(scene) is not None:
         return True
     return bool(scene) and all(c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in scene)
+
+
+def parse_scene_aliases(text: str) -> dict[int, str]:
+    aliases: dict[int, str] = {}
+    for item in text.replace(";", ",").split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        numeric = parse_integer_like(key.strip())
+        value = value.strip()
+        if numeric is None or numeric < 0 or not scene_token_is_valid(value):
+            continue
+        aliases[numeric] = value
+    return aliases
+
+
+def normalize_scene(scene: str, prefix: str, aliases: str) -> str:
+    numeric = parse_integer_like(scene)
+    if numeric is not None:
+        alias = parse_scene_aliases(aliases).get(numeric)
+        if alias:
+            return alias
+        return f"{prefix}{numeric:03d}"
+    return scene
 
 
 def parse_packet(data: bytes) -> AudioIdPacket | None:
@@ -107,6 +128,7 @@ def handle_data(data: bytes, packet_no: int, args: argparse.Namespace, state: di
     if packet is None:
         print("format: BAD expected trigger<TAB>scene<TAB>seq")
     else:
+        bridge_scene = normalize_scene(packet.scene, args.scene_prefix, args.scene_aliases)
         active = packet.trigger >= args.trigger_threshold
         rising = active and not state["latched"]
         state["latched"] = active
@@ -114,7 +136,7 @@ def handle_data(data: bytes, packet_no: int, args: argparse.Namespace, state: di
             {
                 "trigger": packet.trigger,
                 "scene": packet.scene,
-                "esp32_scene": packet.esp32_scene,
+                "bridge_scene": bridge_scene,
                 "seq": packet.seq,
                 "active": active,
                 "rising": rising,
@@ -122,10 +144,10 @@ def handle_data(data: bytes, packet_no: int, args: argparse.Namespace, state: di
         )
         print("format: OK")
         print(f"parsed: trigger={packet.trigger} scene={packet.scene} seq={packet.seq}")
-        print(f"esp32_audio_id: scene={packet.esp32_scene} seq={packet.seq}")
+        print(f"bridge_audio_id: scene={bridge_scene} seq={packet.seq}")
         print(f"trigger_active={active} rising_edge={rising}")
         if rising:
-            print(f"would_play: /sdcard/audio/{packet.esp32_scene}/{packet.seq:03d}.wav")
+            print(f"would_play: /sdcard/audio/{bridge_scene}/{packet.seq:03d}.wav")
 
     if args.jsonl:
         append_jsonl(Path(args.jsonl), record)
@@ -173,6 +195,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=7777, help="Listen TCP port. Default: 7777")
     parser.add_argument("--once", action="store_true", help="Exit after the first client disconnects")
     parser.add_argument("--trigger-threshold", type=float, default=0.5, help="Trigger threshold. Default: 0.5")
+    parser.add_argument("--scene-prefix", default=DEFAULT_SCENE_PREFIX, help="Numeric scene prefix. Default: scene")
+    parser.add_argument("--scene-aliases", default=DEFAULT_SCENE_ALIASES, help="Numeric scene aliases. Default: 1=boot")
     parser.add_argument("--jsonl", default="", help="Optional path to append machine-readable packet logs")
     return parser
 

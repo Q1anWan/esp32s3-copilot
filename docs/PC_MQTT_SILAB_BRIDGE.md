@@ -127,3 +127,34 @@ python3 tools/silab_tcp_probe.py --host 0.0.0.0 --port 7777
 ```
 
 The probe should print `format: OK` and `rising_edge=True` when the trigger changes from `0` to `1`.
+
+## SILAB Simulator
+
+To test the full bridge without SILAB hardware, start the GUI TCP host and run:
+
+```bash
+python3 tools/silab_tcp_simulator.py --host 127.0.0.1 --port 7777 --scene 1 --seq 1 --read-ack --verbose
+```
+
+The default simulation sends one pulse:
+
+```text
+0<TAB>1<TAB>1
+...
+1<TAB>1<TAB>1
+...
+0<TAB>1<TAB>1
+```
+
+Useful options:
+
+```bash
+# Repeat three trigger cycles at 20 Hz
+python3 tools/silab_tcp_simulator.py --host <PC_LAN_A_IP> --cycles 3 --rate-hz 20
+
+# Custom fixed-rate pattern: idle 1s, active 3s, idle 1s
+python3 tools/silab_tcp_simulator.py --pattern "0:1,1:3,0:1"
+
+# Check generated packets without connecting
+python3 tools/silab_tcp_simulator.py --dry-run --rate-hz 5
+```

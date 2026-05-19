@@ -59,6 +59,7 @@ struct copilot_action_t {
     copilot_screen_orientation_t orientation;
     uint32_t duration_ms;
     uint32_t prelight_ms;
+    uint32_t generation;
     char sound_id[16];
     char scene_id[32];
     char message_id[32];
@@ -70,6 +71,7 @@ struct copilot_action_t {
 
 static QueueHandle_t s_action_queue = nullptr;
 static TaskHandle_t s_action_task = nullptr;
+static volatile uint32_t s_action_generation = 1;
 static bool s_network_started = false;
 static char s_screen_event_publish_buf[512];
 static char s_status_publish_buf[1024];
@@ -137,6 +139,29 @@ static void copilot_apply_screen_action(const copilot_action_t *action,
     copilot_publish_screen_event(action, state);
 }
 
+static uint32_t copilot_next_action_generation(void) {
+    uint32_t next = s_action_generation + 1;
+    if (next == 0) {
+        next = 1;
+    }
+    s_action_generation = next;
+    return next;
+}
+
+static bool copilot_action_cancelled(const copilot_action_t *action) {
+    return action && action->generation != 0 && action->generation != s_action_generation;
+}
+
+static void copilot_cancel_pending_actions(void) {
+    copilot_next_action_generation();
+    if (!s_action_queue) {
+        return;
+    }
+    copilot_action_t dropped = {};
+    while (xQueueReceive(s_action_queue, &dropped, 0) == pdTRUE) {
+    }
+}
+
 static void copilot_action_task(void *arg) {
     (void)arg;
     copilot_action_t action = {};
@@ -144,11 +169,17 @@ static void copilot_action_task(void *arg) {
         if (xQueueReceive(s_action_queue, &action, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+        if (copilot_action_cancelled(&action)) {
+            continue;
+        }
 
         if (action.type == ACTION_SCREEN_MESSAGE) {
             uint32_t cue_ms = action.prelight_ms > 0 ? action.prelight_ms : CONFIG_COPILOT_PRELIGHT_MS;
             copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_PRE_MESSAGE_ORIENT, cue_ms + 150);
             vTaskDelay(pdMS_TO_TICKS(cue_ms));
+            if (copilot_action_cancelled(&action)) {
+                continue;
+            }
             copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_SPEAKING, action.duration_ms);
         } else if (action.type == ACTION_SCREEN_STATE) {
             copilot_apply_screen_action(&action, action.screen_state, action.duration_ms);
@@ -159,6 +190,9 @@ static void copilot_action_task(void *arg) {
                 if (action.prelight_ms > 0) {
                     copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_PRE_MESSAGE_ORIENT, action.prelight_ms + 150);
                     vTaskDelay(pdMS_TO_TICKS(action.prelight_ms));
+                    if (copilot_action_cancelled(&action)) {
+                        continue;
+                    }
                 }
                 copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_SPEAKING, action.duration_ms);
             } else {
@@ -169,6 +203,9 @@ static void copilot_action_task(void *arg) {
                 if (action.prelight_ms > 0) {
                     copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_PRE_MESSAGE_ORIENT, action.prelight_ms + 150);
                     vTaskDelay(pdMS_TO_TICKS(action.prelight_ms));
+                    if (copilot_action_cancelled(&action)) {
+                        continue;
+                    }
                 }
                 copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_SPEAKING,
                                             action.duration_ms > 0 ? action.duration_ms : 0);
@@ -178,6 +215,9 @@ static void copilot_action_task(void *arg) {
             } else if (action.prelight_ms > 0) {
                 copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_PRE_MESSAGE_ORIENT, action.prelight_ms + 150);
                 vTaskDelay(pdMS_TO_TICKS(action.prelight_ms));
+                if (copilot_action_cancelled(&action)) {
+                    continue;
+                }
                 copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_RETURN_NEUTRAL, 520);
             }
             LOGI_APP( "Play sound=%s", action.sound_id[0] ? action.sound_id : "none");
@@ -223,12 +263,29 @@ static void copilot_enqueue_action(const copilot_action_t *action) {
     if (!s_action_queue || !action) {
         return;
     }
-    if (xQueueSend(s_action_queue, action, 0) != pdTRUE) {
+    copilot_action_t queued = *action;
+    if (queued.generation == 0) {
+        queued.generation = s_action_generation;
+    }
+    if (xQueueSend(s_action_queue, &queued, 0) != pdTRUE) {
         copilot_action_t dropped = {};
         xQueueReceive(s_action_queue, &dropped, 0);
-        if (xQueueSend(s_action_queue, action, 0) != pdTRUE) {
+        if (xQueueSend(s_action_queue, &queued, 0) != pdTRUE) {
             ESP_LOGW(TAG, "Action queue full, drop command");
         }
+    }
+}
+
+static void copilot_enqueue_action_front(const copilot_action_t *action) {
+    if (!s_action_queue || !action) {
+        return;
+    }
+    copilot_action_t queued = *action;
+    if (queued.generation == 0) {
+        queued.generation = s_action_generation;
+    }
+    if (xQueueSendToFront(s_action_queue, &queued, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "Action queue full, drop front command");
     }
 }
 
@@ -319,6 +376,33 @@ static void copilot_schedule_scene_sound(const char *scene_id, uint16_t sequence
     LOGI_APP("Schedule scene audio scene=%s seq=%u prelight=%u duration=%u",
              action.scene_id, (unsigned)sequence_id, (unsigned)prelight_ms, (unsigned)duration_ms);
     copilot_enqueue_action(&action);
+}
+
+static void copilot_play_scene_sound_now(const char *scene_id, uint16_t sequence_id,
+                                         uint32_t duration_ms,
+                                         copilot_screen_orientation_t orientation,
+                                         const char *message_id) {
+    copilot_cancel_pending_actions();
+
+    copilot_action_t action = {};
+    action.type = ACTION_SOUND;
+    action.expr = COPILOT_EXPR_SPEAKING;
+    action.screen_state = COPILOT_SCREEN_STATE_SPEAKING;
+    action.orientation = orientation;
+    action.duration_ms = duration_ms;
+    action.prelight_ms = 0;
+    action.use_scene_audio = true;
+    action.sequence_id = sequence_id;
+    action.generation = s_action_generation;
+    copilot_copy_action_text(action.scene_id, sizeof(action.scene_id), scene_id ? scene_id : "default");
+    copilot_copy_action_text(action.message_id, sizeof(action.message_id), message_id);
+
+    action.type = ACTION_SCREEN_STATE;
+    if (!copilot_audio_play_scene(action.scene_id, sequence_id)) {
+        ESP_LOGW(TAG, "Scene audio immediate queue failed: scene=%s seq=%u",
+                 action.scene_id, (unsigned)sequence_id);
+    }
+    copilot_enqueue_action_front(&action);
 }
 
 static void copilot_schedule_screen_state(copilot_screen_state_t state, copilot_screen_orientation_t orientation,
@@ -659,7 +743,11 @@ void copilot_app_handle_command(const char *payload, int payload_len) {
             copilot_screen_orientation_t orientation = copilot_get_orientation(root);
             const char *message_id = copilot_get_string_any(root, "message_id", nullptr, "");
             ESP_LOGI(TAG, "Scene audio cmd: scene=%s seq=%u", scene_id, (unsigned)sequence_id);
-            copilot_schedule_scene_sound(scene_id, sequence_id, prelight_ms, duration_ms, orientation, message_id);
+            if (prelight_ms == 0) {
+                copilot_play_scene_sound_now(scene_id, sequence_id, duration_ms, orientation, message_id);
+            } else {
+                copilot_schedule_scene_sound(scene_id, sequence_id, prelight_ms, duration_ms, orientation, message_id);
+            }
             cJSON_Delete(root);
             return;
         }

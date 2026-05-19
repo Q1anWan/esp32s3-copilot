@@ -69,6 +69,8 @@ static const char *TAG = "audio_out";
 #define DMA_CHUNK_BYTES         (DMA_CHUNK_SAMPLES * 2 * sizeof(int16_t))  // stereo
 #define STREAM_PREFILL_CHUNKS   25  // 500ms at 20ms/chunk
 #define STREAM_PREFILL_BYTES    (DMA_CHUNK_BYTES * STREAM_PREFILL_CHUNKS)
+#define FILE_PREFILL_CHUNKS     3   // 60ms: TF-card files do not need WiFi jitter cushion
+#define FILE_PREFILL_BYTES      (DMA_CHUNK_BYTES * FILE_PREFILL_CHUNKS)
 
 // Leave headroom for streamed PCM, which is often mastered close to full scale.
 #define VOICE_RX_GAIN_Q15       24576  // 0.75 in Q15
@@ -462,8 +464,9 @@ static void output_task_func(void *arg) {
 
         if ((active_src == AUDIO_SRC_VOICE || active_src == AUDIO_SRC_FILE) && !tone_active) {
             int buffered = ring_used(&s_out.ring);
+            int prefill_bytes = (active_src == AUDIO_SRC_FILE) ? FILE_PREFILL_BYTES : STREAM_PREFILL_BYTES;
             if (!stream_prefilled) {
-                if (buffered < STREAM_PREFILL_BYTES) {
+                if (buffered < prefill_bytes) {
                     vTaskDelay(pdMS_TO_TICKS(2));
                     continue;
                 }
@@ -919,6 +922,24 @@ bool copilot_audio_out_flush(copilot_audio_src_t src, int timeout_ms) {
     }
 
     return true;
+}
+
+void copilot_audio_out_abort(copilot_audio_src_t src) {
+    if (!s_out.src_mutex || src == AUDIO_SRC_NONE) {
+        return;
+    }
+
+    xSemaphoreTake(s_out.src_mutex, portMAX_DELAY);
+
+    if (s_out.active_src == src) {
+        ring_clear(&s_out.ring);
+        if (s_out.dma_buffer) {
+            memset(s_out.dma_buffer, 0, DMA_CHUNK_BYTES);
+        }
+        s_out.active_src = AUDIO_SRC_NONE;
+    }
+
+    xSemaphoreGive(s_out.src_mutex);
 }
 
 void copilot_audio_out_set_volume(int volume) {

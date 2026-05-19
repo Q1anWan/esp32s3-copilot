@@ -130,6 +130,16 @@ int copilot_audio_out_write_stereo(copilot_audio_src_t src,
 bool copilot_audio_out_flush(copilot_audio_src_t src, int timeout_ms);
 
 /**
+ * @brief Abort a source immediately and clear pending output samples
+ *
+ * This is intended for low-latency trigger playback where a newer file should
+ * replace the currently buffered file without waiting for FIFO drain.
+ *
+ * @param src Source to abort
+ */
+void copilot_audio_out_abort(copilot_audio_src_t src);
+
+/**
  * @brief Set speaker volume
  *
  * @param volume Volume level 0-100

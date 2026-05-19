@@ -276,7 +276,7 @@ class MqttController:
             return False
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         info = self.client.publish(self.cmd_topic, data, qos=1)
-        info.wait_for_publish(timeout=3)
+        info.wait_for_publish(timeout=2)
         ok = info.rc == 0
         if not quiet:
             self.events.put(("mqtt_publish", {"payload": dict(payload), "ok": ok, "rc": info.rc}))
@@ -465,6 +465,7 @@ class BridgeGui(tk.Tk):
         self._last_sd_mounted: bool | None = None
         self._last_esp_status_at = 0.0
         self._pending_plays: dict[str, dict] = {}
+        self._played_event_keys: set[tuple[int, str]] = set()
         self._build_style()
         self._build_ui()
         self.refresh_ports(initial=True)
@@ -850,8 +851,13 @@ class BridgeGui(tk.Tk):
             self.status_vars["path"].set(path)
             self.status_vars["files"].set(str(files_played))
 
+            if self._last_files_played is not None and files_played < self._last_files_played:
+                self._played_event_keys.clear()
             if self._last_files_played is not None and files_played > self._last_files_played:
-                self._log(f"[audio] played {path} files={files_played}")
+                event_key = (files_played, path)
+                if event_key not in self._played_event_keys:
+                    self._played_event_keys.add(event_key)
+                    self._log(f"[audio] played {path} files={files_played}")
                 self._pending_plays.clear()
             if last_error and last_error != self._last_audio_error:
                 self._log(f"[audio] error {last_error} path={path}")

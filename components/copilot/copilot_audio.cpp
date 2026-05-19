@@ -46,7 +46,7 @@ static TaskHandle_t s_audio_task = nullptr;
 // Sample rate must match audio_out (16kHz)
 static const int kSampleRate = 16000;
 
-#define AUDIO_TASK_STACK_BYTES (4 * 1024)
+#define AUDIO_TASK_STACK_BYTES (12 * 1024)
 #define AUDIO_SCENE_ID_MAX 32
 #define AUDIO_FILE_CHUNK_SAMPLES 512
 
@@ -60,6 +60,7 @@ struct audio_req_t {
     uint16_t freq_hz;
     uint16_t duration_ms;
     uint8_t volume;
+    uint32_t generation;
     char path[COPILOT_AUDIO_PATH_MAX];
     char scene[AUDIO_SCENE_ID_MAX];
     uint16_t sequence;
@@ -72,6 +73,7 @@ static uint8_t s_audio_queue_storage[kAudioQueueLen * sizeof(audio_req_t)];
 #endif
 
 static bool s_sd_mounted = false;
+static volatile uint32_t s_audio_generation = 1;
 static copilot_audio_status_t s_status = {};
 
 struct tone_desc_t {
@@ -335,7 +337,46 @@ static int16_t *copilot_audio_alloc_file_buffer(size_t bytes) {
     return buf;
 }
 
-static bool copilot_audio_stream_pcm(FILE *fp, const char *path) {
+static uint32_t copilot_audio_next_generation(void) {
+    uint32_t next = s_audio_generation + 1;
+    if (next == 0) {
+        next = 1;
+    }
+    s_audio_generation = next;
+    return next;
+}
+
+static bool copilot_audio_req_cancelled(uint32_t generation) {
+    return generation != 0 && generation != s_audio_generation;
+}
+
+static void copilot_audio_drop_pending(void) {
+    if (!s_audio_queue) {
+        return;
+    }
+    audio_req_t dropped = {};
+    while (xQueueReceive(s_audio_queue, &dropped, 0) == pdTRUE) {
+    }
+}
+
+static bool copilot_audio_enqueue_file(audio_req_t *req) {
+    if (!s_audio_queue || !req) {
+        return false;
+    }
+
+    req->generation = copilot_audio_next_generation();
+    copilot_audio_drop_pending();
+    copilot_audio_out_abort(AUDIO_SRC_FILE);
+
+    if (xQueueSendToFront(s_audio_queue, req, 0) == pdTRUE) {
+        return true;
+    }
+
+    copilot_audio_set_error("audio_queue_full");
+    return false;
+}
+
+static bool copilot_audio_stream_pcm(FILE *fp, const char *path, uint32_t generation, bool *out_cancelled) {
     int16_t *mono = copilot_audio_alloc_file_buffer(AUDIO_FILE_CHUNK_SAMPLES * sizeof(int16_t));
     if (!mono) {
         copilot_audio_set_error("pcm_buffer_alloc_failed");
@@ -344,9 +385,23 @@ static bool copilot_audio_stream_pcm(FILE *fp, const char *path) {
 
     bool ok = true;
     while (true) {
+        if (copilot_audio_req_cancelled(generation)) {
+            if (out_cancelled) {
+                *out_cancelled = true;
+            }
+            ok = false;
+            break;
+        }
         size_t got = fread(mono, sizeof(int16_t), AUDIO_FILE_CHUNK_SAMPLES, fp);
         if (got > 0) {
             int written = copilot_audio_out_write(AUDIO_SRC_FILE, mono, (int)got, 200);
+            if (copilot_audio_req_cancelled(generation)) {
+                if (out_cancelled) {
+                    *out_cancelled = true;
+                }
+                ok = false;
+                break;
+            }
             if (written <= 0 && copilot_audio_out_get_active() != AUDIO_SRC_FILE) {
                 ESP_LOGW(TAG, "File playback preempted: %s", path ? path : "");
                 ok = false;
@@ -366,7 +421,8 @@ static bool copilot_audio_stream_pcm(FILE *fp, const char *path) {
     return ok;
 }
 
-static bool copilot_audio_stream_wav(FILE *fp, const char *path, const wav_info_t *info) {
+static bool copilot_audio_stream_wav(FILE *fp, const char *path, const wav_info_t *info,
+                                     uint32_t generation, bool *out_cancelled) {
     if (!fp || !info) {
         return false;
     }
@@ -402,6 +458,13 @@ static bool copilot_audio_stream_wav(FILE *fp, const char *path, const wav_info_
     uint32_t remaining = info->data_size;
     bool ok = true;
     while (remaining > 0) {
+        if (copilot_audio_req_cancelled(generation)) {
+            if (out_cancelled) {
+                *out_cancelled = true;
+            }
+            ok = false;
+            break;
+        }
         size_t to_read = remaining < buf_bytes ? remaining : buf_bytes;
         to_read -= to_read % frame_bytes;
         if (to_read == 0) {
@@ -423,6 +486,13 @@ static bool copilot_audio_stream_wav(FILE *fp, const char *path, const wav_info_
             written = copilot_audio_out_write(AUDIO_SRC_FILE, buf, (int)frames, 200);
         } else {
             written = copilot_audio_out_write_stereo(AUDIO_SRC_FILE, buf, (int)frames, 200);
+        }
+        if (copilot_audio_req_cancelled(generation)) {
+            if (out_cancelled) {
+                *out_cancelled = true;
+            }
+            ok = false;
+            break;
         }
         if (written <= 0 && copilot_audio_out_get_active() != AUDIO_SRC_FILE) {
             ESP_LOGW(TAG, "File playback preempted: %s", path ? path : "");
@@ -497,48 +567,80 @@ static FILE *copilot_audio_open_file_with_retry(const char *path, int *out_errno
 }
 
 static void copilot_audio_play_file(const audio_req_t &req) {
+    audio_req_t play_req = req;
+    const uint32_t generation = play_req.generation;
     copilot_audio_wait_network_settle();
+    if (copilot_audio_req_cancelled(generation)) {
+        return;
+    }
+    if (play_req.path[0] == '\0') {
+        bool found = copilot_audio_resolve_scene_path(play_req.scene, play_req.sequence,
+                                                      play_req.path, sizeof(play_req.path));
+        if (!found) {
+            ESP_LOGW(TAG, "Audio ID not found yet: scene=%s seq=%u expected=%s",
+                     play_req.scene, (unsigned)play_req.sequence, play_req.path);
+        }
+    }
+    if (copilot_audio_req_cancelled(generation)) {
+        return;
+    }
     if (!copilot_audio_mount_sd()) {
+        return;
+    }
+    if (copilot_audio_req_cancelled(generation)) {
         return;
     }
     if (!copilot_audio_out_acquire(AUDIO_SRC_FILE)) {
         copilot_audio_set_error("audio_output_busy");
-        ESP_LOGW(TAG, "Audio output busy, skip file: %s", req.path);
+        ESP_LOGW(TAG, "Audio output busy, skip file: %s", play_req.path);
+        return;
+    }
+    if (copilot_audio_req_cancelled(generation)) {
+        copilot_audio_out_abort(AUDIO_SRC_FILE);
         return;
     }
 
     s_status.playing_file = true;
-    strncpy(s_status.current_path, req.path, sizeof(s_status.current_path) - 1);
+    strncpy(s_status.current_path, play_req.path, sizeof(s_status.current_path) - 1);
     s_status.current_path[sizeof(s_status.current_path) - 1] = '\0';
     copilot_audio_set_error("");
 
     int open_errno = 0;
-    FILE *fp = copilot_audio_open_file_with_retry(req.path, &open_errno);
+    FILE *fp = copilot_audio_open_file_with_retry(play_req.path, &open_errno);
     if (!fp) {
         char err_msg[96];
         snprintf(err_msg, sizeof(err_msg), "open_failed:%d", open_errno);
         copilot_audio_set_error(err_msg);
-        ESP_LOGW(TAG, "Failed to open audio file %s (errno=%d)", req.path, open_errno);
+        ESP_LOGW(TAG, "Failed to open audio file %s (errno=%d)", play_req.path, open_errno);
         s_status.playing_file = false;
         copilot_audio_out_release(AUDIO_SRC_FILE);
         return;
     }
 
     ESP_LOGI(TAG, "Play SD audio: scene=%s seq=%u path=%s",
-             req.scene[0] ? req.scene : "default", (unsigned)req.sequence, req.path);
+             play_req.scene[0] ? play_req.scene : "default", (unsigned)play_req.sequence, play_req.path);
     bool ok = false;
-    if (has_ext(req.path, "pcm")) {
-        ok = copilot_audio_stream_pcm(fp, req.path);
+    bool cancelled = false;
+    if (has_ext(play_req.path, "pcm")) {
+        ok = copilot_audio_stream_pcm(fp, play_req.path, generation, &cancelled);
     } else {
         wav_info_t info = {};
         if (parse_wav_header(fp, &info)) {
-            ok = copilot_audio_stream_wav(fp, req.path, &info);
+            ok = copilot_audio_stream_wav(fp, play_req.path, &info, generation, &cancelled);
         } else {
             copilot_audio_set_error("wav_parse_failed");
-            ESP_LOGW(TAG, "Invalid WAV file: %s", req.path);
+            ESP_LOGW(TAG, "Invalid WAV file: %s", play_req.path);
         }
     }
     fclose(fp);
+
+    if (cancelled) {
+        ESP_LOGI(TAG, "SD audio cancelled by newer request: %s", play_req.path);
+        copilot_audio_out_abort(AUDIO_SRC_FILE);
+        s_status.playing_file = false;
+        copilot_audio_set_error("");
+        return;
+    }
 
     copilot_audio_out_flush(AUDIO_SRC_FILE, 1500);
     copilot_audio_out_release(AUDIO_SRC_FILE);
@@ -546,7 +648,7 @@ static void copilot_audio_play_file(const audio_req_t &req) {
     if (ok) {
         s_status.files_played++;
         copilot_audio_set_error("");
-        ESP_LOGI(TAG, "SD audio done: %s", req.path);
+        ESP_LOGI(TAG, "SD audio done: %s", play_req.path);
     }
 }
 
@@ -677,12 +779,7 @@ bool copilot_audio_play_path(const char *path) {
     req.path[sizeof(req.path) - 1] = '\0';
     strncpy(req.scene, "path", sizeof(req.scene) - 1);
     req.sequence = 0;
-    if (xQueueSend(s_audio_queue, &req, 0) != pdTRUE) {
-        audio_req_t dropped = {};
-        xQueueReceive(s_audio_queue, &dropped, 0);
-        return xQueueSend(s_audio_queue, &req, 0) == pdTRUE;
-    }
-    return true;
+    return copilot_audio_enqueue_file(&req);
 }
 
 bool copilot_audio_play_scene(const char *scene_id, uint16_t sequence_id) {
@@ -694,21 +791,9 @@ bool copilot_audio_play_scene(const char *scene_id, uint16_t sequence_id) {
     req.kind = AUDIO_REQ_FILE;
     copilot_sanitize_scene(scene_id, req.scene, sizeof(req.scene));
     req.sequence = sequence_id;
-    bool found = copilot_audio_resolve_scene_path(req.scene, sequence_id, req.path, sizeof(req.path));
-    if (!found) {
-        ESP_LOGW(TAG, "Audio ID not found yet: scene=%s seq=%u expected=%s",
-                 req.scene, (unsigned)sequence_id, req.path);
-    }
+    req.path[0] = '\0';
 
-    if (xQueueSend(s_audio_queue, &req, 0) != pdTRUE) {
-        audio_req_t dropped = {};
-        xQueueReceive(s_audio_queue, &dropped, 0);
-        if (xQueueSend(s_audio_queue, &req, 0) != pdTRUE) {
-            copilot_audio_set_error("audio_queue_full");
-            return false;
-        }
-    }
-    return true;
+    return copilot_audio_enqueue_file(&req);
 }
 
 bool copilot_audio_is_ready(void) {

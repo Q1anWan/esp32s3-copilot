@@ -205,7 +205,7 @@ static void copilot_mqtt_event_handler(void *handler_args, esp_event_base_t base
         case MQTT_EVENT_CONNECTED:
             LOGI_MQTT( "MQTT connected, subscribing: %s", s_topic_cmd);
             s_mqtt_connected = true;
-            esp_mqtt_client_subscribe(s_mqtt, s_topic_cmd, 1);
+            esp_mqtt_client_subscribe(s_mqtt, s_topic_cmd, 0);
             break;
         case MQTT_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "MQTT disconnected");
@@ -272,6 +272,7 @@ static void copilot_mqtt_start_client(void) {
     esp_mqtt_client_config_t mqtt_cfg = {};
     mqtt_cfg.broker.address.uri = s_mqtt_broker_uri;
     mqtt_cfg.credentials.client_id = s_device_id;
+    mqtt_cfg.session.disable_clean_session = false;
     mqtt_cfg.task.stack_size = 4096;
     mqtt_cfg.network.timeout_ms = 5000;
 
@@ -456,7 +457,7 @@ void copilot_mqtt_publish(const char *topic_suffix, const char *payload) {
     }
     snprintf(topic, sizeof(topic), "%s/%s/%s", prefix, s_device_id, topic_suffix);
     LOGI_MQTT( "MQTT publish: %s (%d bytes)", topic, (int)strlen(payload));
-    esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 1, 0);
+    esp_mqtt_client_publish(s_mqtt, topic, payload, 0, 0, 0);
 }
 
 bool copilot_mqtt_configure_wifi(const char *ssid, const char *password) {

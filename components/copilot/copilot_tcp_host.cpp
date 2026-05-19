@@ -19,6 +19,11 @@ static const char *TAG = "copilot_tcp";
 
 static TaskHandle_t s_tcp_task = nullptr;
 static copilot_tcp_cmd_cb s_cmd_cb = nullptr;
+static char s_tcp_rx_buf[128];
+static char s_tcp_line_buf[512];
+static char s_tcp_status_buf[768];
+static char s_tcp_payload_buf[128];
+static char s_tcp_ack_buf[128];
 
 static void tcp_send_line(int fd, const char *line) {
     if (fd < 0 || !line) {
@@ -74,19 +79,17 @@ static void handle_play_text(int fd, const char *line) {
         return;
     }
 
-    char payload[128];
-    snprintf(payload, sizeof(payload),
+    snprintf(s_tcp_payload_buf, sizeof(s_tcp_payload_buf),
              "{\"type\":\"play\",\"scene\":\"%s\",\"seq\":%u}",
              scene, seq);
     if (s_cmd_cb) {
-        s_cmd_cb(payload, (int)strlen(payload));
+        s_cmd_cb(s_tcp_payload_buf, (int)strlen(s_tcp_payload_buf));
     }
 
-    char ack[128];
-    snprintf(ack, sizeof(ack),
+    snprintf(s_tcp_ack_buf, sizeof(s_tcp_ack_buf),
              "{\"ok\":true,\"cmd\":\"play\",\"scene\":\"%s\",\"seq\":%u}",
              scene, seq);
-    tcp_send_line(fd, ack);
+    tcp_send_line(fd, s_tcp_ack_buf);
 }
 
 static void handle_tcp_line(int fd, char *line) {
@@ -101,9 +104,8 @@ static void handle_tcp_line(int fd, char *line) {
     }
 
     if (starts_with_ci(line, "STATUS")) {
-        char status[768];
-        if (copilot_app_format_status(status, sizeof(status))) {
-            tcp_send_line(fd, status);
+        if (copilot_app_format_status(s_tcp_status_buf, sizeof(s_tcp_status_buf))) {
+            tcp_send_line(fd, s_tcp_status_buf);
         } else {
             tcp_send_line(fd, "{\"ok\":false,\"error\":\"status_failed\"}");
         }
@@ -129,22 +131,20 @@ static void handle_tcp_line(int fd, char *line) {
 static void handle_client(int fd) {
     tcp_send_line(fd, "{\"ok\":true,\"device\":\"s3_copilot\",\"commands\":[\"PLAY scene seq\",\"STATUS\",\"PING\", \"json\"]}");
 
-    char rx[128];
-    char line[512];
     size_t line_len = 0;
     while (true) {
-        int got = recv(fd, rx, sizeof(rx), 0);
+        int got = recv(fd, s_tcp_rx_buf, sizeof(s_tcp_rx_buf), 0);
         if (got <= 0) {
             break;
         }
         for (int i = 0; i < got; ++i) {
-            char c = rx[i];
+            char c = s_tcp_rx_buf[i];
             if (c == '\n') {
-                line[line_len] = '\0';
-                handle_tcp_line(fd, line);
+                s_tcp_line_buf[line_len] = '\0';
+                handle_tcp_line(fd, s_tcp_line_buf);
                 line_len = 0;
-            } else if (line_len + 1 < sizeof(line)) {
-                line[line_len++] = c;
+            } else if (line_len + 1 < sizeof(s_tcp_line_buf)) {
+                s_tcp_line_buf[line_len++] = c;
             } else {
                 line_len = 0;
                 tcp_send_line(fd, "{\"ok\":false,\"error\":\"line_too_long\"}");
@@ -218,7 +218,7 @@ void copilot_tcp_host_start(copilot_tcp_cmd_cb cb) {
         return;
     }
 
-    BaseType_t ok = xTaskCreate(tcp_task, "copilot_tcp", 4096, nullptr, 4, &s_tcp_task);
+    BaseType_t ok = xTaskCreate(tcp_task, "copilot_tcp", 6144, nullptr, 4, &s_tcp_task);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create TCP host task");
     }

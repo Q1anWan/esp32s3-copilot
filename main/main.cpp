@@ -10,6 +10,7 @@
 
 #include "copilot_app.h"
 #include "copilot_audio.h"
+#include "copilot_serial_console.h"
 #include "copilot_ui.h"
 
 #if CONFIG_COPILOT_SERVO_ENABLE
@@ -47,6 +48,8 @@ static void copilot_touch_event_cb(lv_event_t *e) {
 #endif
 
 extern "C" void app_main(void) {
+    copilot_serial_console_prepare();
+
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -119,4 +122,8 @@ extern "C" void app_main(void) {
     } else {
         ESP_LOGE(TAG, "Failed to acquire LVGL lock");
     }
+
+#if CONFIG_COPILOT_SERIAL_CONSOLE_ENABLE
+    copilot_serial_console_start();
+#endif
 }

@@ -17,6 +17,7 @@
 
 // Use unified audio output manager
 #include "copilot_audio_out.h"
+#include "copilot_mqtt.h"
 #include "bsp/esp-bsp.h"
 
 static const char *TAG = "copilot_audio";
@@ -132,6 +133,20 @@ static bool copilot_audio_mount_sd(void) {
     copilot_audio_set_error(err_msg);
     ESP_LOGW(TAG, "SD card mount failed: %s", esp_err_to_name(err));
     return false;
+}
+
+static void copilot_audio_wait_network_settle(void) {
+    copilot_network_status_t net = {};
+    for (int i = 0; i < 70; ++i) {
+        if (!copilot_mqtt_get_status(&net) || !net.wifi_started ||
+            net.wifi_connected || net.ssid[0] == '\0') {
+            return;
+        }
+        if (i == 0) {
+            ESP_LOGI(TAG, "Wait for WiFi to settle before SD audio read");
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 }
 
 static bool copilot_path_exists(const char *path) {
@@ -292,13 +307,17 @@ static bool parse_wav_header(FILE *fp, wav_info_t *info) {
     return have_fmt && have_data;
 }
 
-static bool copilot_audio_stream_pcm(FILE *fp, const char *path) {
-    int16_t *mono = (int16_t *)heap_caps_malloc(AUDIO_FILE_CHUNK_SAMPLES * sizeof(int16_t),
-                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!mono) {
-        mono = (int16_t *)heap_caps_malloc(AUDIO_FILE_CHUNK_SAMPLES * sizeof(int16_t),
-                                           MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+static int16_t *copilot_audio_alloc_file_buffer(size_t bytes) {
+    int16_t *buf = (int16_t *)heap_caps_aligned_alloc(512, bytes,
+                                                       MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (!buf) {
+        buf = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     }
+    return buf;
+}
+
+static bool copilot_audio_stream_pcm(FILE *fp, const char *path) {
+    int16_t *mono = copilot_audio_alloc_file_buffer(AUDIO_FILE_CHUNK_SAMPLES * sizeof(int16_t));
     if (!mono) {
         copilot_audio_set_error("pcm_buffer_alloc_failed");
         return false;
@@ -355,10 +374,7 @@ static bool copilot_audio_stream_wav(FILE *fp, const char *path, const wav_info_
 
     size_t frame_bytes = info->channels * sizeof(int16_t);
     size_t buf_bytes = AUDIO_FILE_CHUNK_SAMPLES * frame_bytes;
-    int16_t *buf = (int16_t *)heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!buf) {
-        buf = (int16_t *)heap_caps_malloc(buf_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
+    int16_t *buf = copilot_audio_alloc_file_buffer(buf_bytes);
     if (!buf) {
         copilot_audio_set_error("wav_buffer_alloc_failed");
         return false;
@@ -431,6 +447,7 @@ static bool has_ext(const char *path, const char *ext) {
 }
 
 static void copilot_audio_play_file(const audio_req_t &req) {
+    copilot_audio_wait_network_settle();
     if (!copilot_audio_mount_sd()) {
         return;
     }

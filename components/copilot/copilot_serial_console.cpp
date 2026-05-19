@@ -2,17 +2,50 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <fcntl.h>
 
+#include "esp_err.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+#include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
+#endif
 
 #include "copilot_app.h"
 #include "copilot_mqtt.h"
 
 static const char *TAG = "copilot_serial";
 static TaskHandle_t s_serial_task = nullptr;
+static bool s_stdio_prepared = false;
+static char s_line_buf[512];
+static char s_status_buf[768];
+
+void copilot_serial_console_prepare(void) {
+    if (s_stdio_prepared) {
+        return;
+    }
+#if CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG
+    usb_serial_jtag_vfs_set_rx_line_endings(ESP_LINE_ENDINGS_LF);
+    usb_serial_jtag_vfs_set_tx_line_endings(ESP_LINE_ENDINGS_LF);
+    fcntl(fileno(stdout), F_SETFL, 0);
+    fcntl(fileno(stdin), F_SETFL, 0);
+    if (!usb_serial_jtag_is_driver_installed()) {
+        usb_serial_jtag_driver_config_t jtag_config = {
+            .tx_buffer_size = 1024,
+            .rx_buffer_size = 1024,
+        };
+        esp_err_t err = usb_serial_jtag_driver_install(&jtag_config);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "USB serial JTAG driver install failed: %s", esp_err_to_name(err));
+        }
+    }
+    usb_serial_jtag_vfs_use_driver();
+#endif
+    s_stdio_prepared = true;
+}
 
 static void trim_line(char *line) {
     if (!line) {
@@ -53,9 +86,8 @@ static bool starts_with_ci(const char *s, const char *prefix) {
 }
 
 static void print_status(void) {
-    char status[768];
-    if (copilot_app_format_status(status, sizeof(status))) {
-        printf("COPILOT_STATUS %s\n", status);
+    if (copilot_app_format_status(s_status_buf, sizeof(s_status_buf))) {
+        printf("COPILOT_STATUS %s\n", s_status_buf);
     } else {
         printf("COPILOT_ERROR status_failed\n");
     }
@@ -148,16 +180,16 @@ static void handle_text_command(char *line) {
 
 static void serial_task(void *arg) {
     (void)arg;
+    copilot_serial_console_prepare();
     setvbuf(stdin, nullptr, _IONBF, 0);
     setvbuf(stdout, nullptr, _IONBF, 0);
 
     printf("COPILOT_SERIAL ready\n");
     fflush(stdout);
 
-    char line[512];
     while (true) {
-        if (fgets(line, sizeof(line), stdin) != nullptr) {
-            handle_text_command(line);
+        if (fgets(s_line_buf, sizeof(s_line_buf), stdin) != nullptr) {
+            handle_text_command(s_line_buf);
         } else {
             clearerr(stdin);
             vTaskDelay(pdMS_TO_TICKS(50));

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from typing import Iterable
@@ -48,9 +49,38 @@ def auto_port() -> str:
 def open_serial(args):
     serial, _ = require_serial()
     port = args.port if args.port != "auto" else auto_port()
-    ser = serial.Serial(port, args.baud, timeout=0.05, write_timeout=1.0)
+    ser = serial.Serial()
+    ser.port = port
+    ser.baudrate = args.baud
+    ser.timeout = 0.05
+    ser.write_timeout = 1.0
+    ser.dtr = False
+    ser.rts = False
+    ser.open()
+    disable_hangup_on_close(ser)
+    ser.dtr = False
+    ser.rts = False
+    if args.reset:
+        ser.dtr = True
+        ser.rts = False
+        time.sleep(0.05)
+        ser.dtr = False
+        ser.rts = False
     time.sleep(args.settle)
     return ser, port
+
+
+def disable_hangup_on_close(ser) -> None:
+    if os.name != "posix":
+        return
+    try:
+        import termios
+
+        attrs = termios.tcgetattr(ser.fileno())
+        attrs[2] &= ~termios.HUPCL
+        termios.tcsetattr(ser.fileno(), termios.TCSANOW, attrs)
+    except Exception:
+        pass
 
 
 def send_line(ser, line: str) -> None:
@@ -82,6 +112,22 @@ def read_lines(ser, seconds: float) -> list[str]:
     return lines
 
 
+def wait_ready(ser, seconds: float) -> list[str]:
+    if seconds <= 0:
+        return []
+    deadline = time.time() + seconds
+    started = time.time()
+    seen: list[str] = []
+    while time.time() < deadline:
+        lines = read_lines(ser, min(0.25, max(0.0, deadline - time.time())))
+        seen.extend(lines)
+        if any("COPILOT_SERIAL ready" in line for line in lines):
+            break
+        if not seen and time.time() - started >= 0.5:
+            break
+    return seen
+
+
 def extract_status(lines: Iterable[str]) -> dict | None:
     for line in reversed(list(lines)):
         if line.startswith("COPILOT_STATUS "):
@@ -93,15 +139,41 @@ def extract_status(lines: Iterable[str]) -> dict | None:
     return None
 
 
+def request_status(ser, wait: float) -> tuple[dict | None, list[str]]:
+    send_line(ser, "status")
+    lines = read_lines(ser, wait)
+    return extract_status(lines), lines
+
+
+def status_is_ready(status: dict | None, wait_wifi: bool) -> bool:
+    if not status:
+        return False
+    if not wait_wifi:
+        return True
+    wifi = status.get("wifi", {})
+    return bool(wifi.get("connected") and wifi.get("ip") and status.get("tcp_host"))
+
+
+def poll_status(ser, wait: float, timeout: float, wait_wifi: bool) -> dict | None:
+    deadline = time.time() + max(0.0, timeout)
+    last_status: dict | None = None
+    while True:
+        status, _ = request_status(ser, wait)
+        if status:
+            last_status = status
+        if status_is_ready(status, wait_wifi) or time.time() >= deadline:
+            return last_status
+        time.sleep(0.4)
+
+
 def cmd_wifi(args) -> None:
     ser, port = open_serial(args)
     print(f"[usb] opened {port} @ {args.baud}")
+    wait_ready(ser, args.ready_timeout)
     payload = {"type": "wifi", "ssid": args.ssid, "password": args.password or ""}
     send_line(ser, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     read_lines(ser, args.wait)
-    send_line(ser, "status")
-    lines = read_lines(ser, args.wait)
-    status = extract_status(lines)
+    status = poll_status(ser, args.wait, args.timeout, True)
     if status:
         wifi = status.get("wifi", {})
         print(f"[status] connected={wifi.get('connected')} ip={wifi.get('ip')} tcp={status.get('tcp_host')}")
@@ -110,9 +182,8 @@ def cmd_wifi(args) -> None:
 def cmd_status(args) -> None:
     ser, port = open_serial(args)
     print(f"[usb] opened {port} @ {args.baud}")
-    send_line(ser, "status")
-    lines = read_lines(ser, args.wait)
-    status = extract_status(lines)
+    wait_ready(ser, args.ready_timeout)
+    status = poll_status(ser, args.wait, args.timeout, not args.no_wait_wifi)
     if status:
         print(json.dumps(status, ensure_ascii=False, indent=2))
 
@@ -120,6 +191,7 @@ def cmd_status(args) -> None:
 def cmd_play(args) -> None:
     ser, port = open_serial(args)
     print(f"[usb] opened {port} @ {args.baud}")
+    wait_ready(ser, args.ready_timeout)
     send_line(ser, f"play {args.scene} {args.seq}")
     read_lines(ser, args.wait)
 
@@ -127,6 +199,7 @@ def cmd_play(args) -> None:
 def cmd_debug(args) -> None:
     ser, port = open_serial(args)
     print(f"[usb] opened {port} @ {args.baud}")
+    wait_ready(ser, args.ready_timeout)
     send_line(ser, f"debug {args.state}")
     read_lines(ser, args.wait)
 
@@ -144,8 +217,10 @@ def cmd_monitor(args) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Configure and debug ESP32-S3 Copilot over USB serial.")
     parser.add_argument("--port", default="auto", help="Serial port, for example COM7 or /dev/ttyACM0. Default: auto")
-    parser.add_argument("--baud", type=int, default=2_000_000, help="Serial baud rate. Default: 2000000")
+    parser.add_argument("--baud", type=int, default=115_200, help="Serial baud rate. Default: 115200")
     parser.add_argument("--settle", type=float, default=0.2, help="Delay after opening port. Default: 0.2s")
+    parser.add_argument("--ready-timeout", type=float, default=8.0, help="Wait for COPILOT_SERIAL ready before commands. Default: 8s")
+    parser.add_argument("--reset", action="store_true", help="Reset the ESP32 after opening the serial port before sending commands")
     parser.add_argument("--wait", type=float, default=2.0, help="How long to read responses. Default: 2s")
 
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -153,9 +228,12 @@ def build_parser() -> argparse.ArgumentParser:
     wifi = sub.add_parser("wifi", help="Save WiFi credentials to NVS and reconnect")
     wifi.add_argument("--ssid", required=True)
     wifi.add_argument("--password", default="")
+    wifi.add_argument("--timeout", type=float, default=15.0, help="Seconds to wait for WiFi/TCP after configuring. Default: 15s")
     wifi.set_defaults(func=cmd_wifi)
 
     status = sub.add_parser("status", help="Print system status JSON")
+    status.add_argument("--timeout", type=float, default=15.0, help="Seconds to wait for WiFi/TCP readiness. Default: 15s")
+    status.add_argument("--no-wait-wifi", action="store_true", help="Return the first status response without waiting for WiFi/TCP")
     status.set_defaults(func=cmd_status)
 
     play = sub.add_parser("play", help="Play /sdcard/audio/<scene>/<seq>.wav")

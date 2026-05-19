@@ -71,6 +71,7 @@ struct copilot_action_t {
 static QueueHandle_t s_action_queue = nullptr;
 static TaskHandle_t s_action_task = nullptr;
 static bool s_network_started = false;
+static char s_screen_event_publish_buf[512];
 
 static const char *copilot_screen_state_name(copilot_screen_state_t state) {
     switch (state) {
@@ -96,8 +97,7 @@ static void copilot_publish_screen_event(const copilot_action_t *action, copilot
     if (!action) {
         return;
     }
-    char buf[512];
-    snprintf(buf, sizeof(buf),
+    snprintf(s_screen_event_publish_buf, sizeof(s_screen_event_publish_buf),
              "{\"type\":\"screen_event\","
              "\"calibration_content_present\":%s,"
              "\"visual_semantic_content_present\":%s,"
@@ -116,7 +116,7 @@ static void copilot_publish_screen_event(const copilot_action_t *action, copilot
              copilot_screen_state_name(state),
              copilot_screen_orientation_name(action->orientation),
              action->message_id);
-    copilot_mqtt_publish("status", buf);
+    copilot_mqtt_publish("status", s_screen_event_publish_buf);
 }
 
 static void copilot_apply_screen_action(const copilot_action_t *action,
@@ -244,13 +244,11 @@ static void copilot_ensure_action_task(void) {
 
     int core = copilot_normalize_core(CONFIG_COPILOT_ACTION_CORE);
     BaseType_t task_ok;
-    // Priority lowered from 4 to 3 to reduce UI impact during MQTT processing
-    // Keep 3KB stack - audio playback path needs more stack
     if (core >= 0) {
-        task_ok = xTaskCreatePinnedToCore(copilot_action_task, "copilot_action", 3 * 1024, nullptr, 3,
+        task_ok = xTaskCreatePinnedToCore(copilot_action_task, "copilot_action", 6 * 1024, nullptr, 3,
                                           &s_action_task, core);
     } else {
-        task_ok = xTaskCreate(copilot_action_task, "copilot_action", 3 * 1024, nullptr, 3, &s_action_task);
+        task_ok = xTaskCreate(copilot_action_task, "copilot_action", 6 * 1024, nullptr, 3, &s_action_task);
     }
     if (task_ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create action task");
@@ -960,9 +958,6 @@ void copilot_app_init(void) {
     copilot_app_network_start();
 #if CONFIG_COPILOT_TCP_HOST_ENABLE
     copilot_tcp_host_start(copilot_app_handle_command);
-#endif
-#if CONFIG_COPILOT_SERIAL_CONSOLE_ENABLE
-    copilot_serial_console_start();
 #endif
 }
 

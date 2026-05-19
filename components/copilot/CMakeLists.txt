@@ -1,5 +1,4 @@
-idf_component_register(
-  SRCS
+set(COPILOT_SRCS
     "copilot_face_data.cpp"
     "copilot_app.cpp"
     "copilot_ui.cpp"
@@ -10,10 +9,18 @@ idf_component_register(
     "copilot_serial_console.cpp"
     "copilot_perf.cpp"
     "copilot_imu.cpp"
-    "copilot_servo.cpp"
     "copilot_axp2101.cpp"
+)
+
+if(CONFIG_COPILOT_SERVO_ENABLE)
+  list(APPEND COPILOT_SRCS "copilot_servo.cpp")
+endif()
+
+idf_component_register(
+  SRCS
+    ${COPILOT_SRCS}
   INCLUDE_DIRS "." "../XPowersLib/src" "../XPowersLib/src/REG"
-  PRIV_REQUIRES lvgl esp_wifi esp_event esp_netif nvs_flash mqtt cjson esp_timer driver lwip waveshare__qmi8658
+  PRIV_REQUIRES lvgl esp_wifi esp_event esp_netif nvs_flash mqtt cjson esp_timer driver esp_driver_usb_serial_jtag lwip waveshare__qmi8658
   REQUIRES esp32_s3_touch_amoled_1_75 esp_codec_dev copilot_voice XPowersLib
 )
 

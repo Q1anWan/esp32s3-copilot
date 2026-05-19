@@ -26,7 +26,10 @@ Rules:
 - `trigger >= 0.5` is active.
 - Playback happens only on a `0 -> 1` rising edge.
 - Continuous fixed-rate `trigger=1` packets are ignored until a `trigger=0` packet resets the latch.
-- Numeric scene IDs map to TF-card folders using the GUI prefix. Default: `1` -> `scene001`.
+- Numeric scene IDs first use GUI aliases, then fall back to the GUI prefix.
+  The default alias is `1=boot` so the current TF-card test file
+  `/sdcard/audio/boot/001.wav` works immediately. Without an alias, `1` maps
+  to `scene001`.
 
 Example:
 
@@ -37,13 +40,13 @@ Example:
 The GUI forwards this MQTT payload:
 
 ```json
-{"type":"play","scene":"scene001","seq":1,"message_id":"silab_..."}
+{"type":"play","scene":"boot","seq":1,"message_id":"silab_..."}
 ```
 
 ESP32 then plays:
 
 ```text
-/sdcard/audio/scene001/001.wav
+/sdcard/audio/boot/001.wav
 ```
 
 ## Run On Experiment PC
@@ -76,6 +79,9 @@ In the GUI:
 4. Press `Save MQTT` with ESP32 connected over USB.
 5. Press `Connect` in the MQTT panel.
 6. Press `Start TCP Host` and set SILAB `Destination_IP` to the experiment PC Ethernet LAN A IP.
+7. Keep `Aliases = 1=boot` for the current TF-card test audio. For formal
+   multi-scene audio, copy files such as `/sdcard/audio/scene001/001.wav` and
+   clear or edit the alias field.
 
 ## ESP32 MQTT Topics
 

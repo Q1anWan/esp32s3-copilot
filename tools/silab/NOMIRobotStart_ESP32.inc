@@ -12,9 +12,10 @@
 # - trigger 1: play once
 # - trigger 1 repeated: ignored until trigger returns to 0
 #
-# Numeric scene IDs map to TF-card folders:
-# - scene=1, seq=1 -> /sdcard/audio/scene001/001.wav
-# - scene=2, seq=5 -> /sdcard/audio/scene002/005.wav
+# Numeric scene IDs are mapped by the PC bridge GUI:
+# - default GUI alias scene=1, seq=1 -> /sdcard/audio/boot/001.wav
+# - without aliases, scene=1, seq=1 -> /sdcard/audio/scene001/001.wav
+# - without aliases, scene=2, seq=5 -> /sdcard/audio/scene002/005.wav
 #
 # Before running:
 # - Change Destination_IP to the experiment PC Ethernet LAN A IP.
@@ -73,7 +74,7 @@ Connections =
     # Field 1: trigger flag.
     NOMIStartTrigger.Greater -> NOMIAudioSender.DataPort1,
 
-    # Field 2: scene ID. 1 means /sdcard/audio/scene001/.
+    # Field 2: scene ID. GUI default alias maps 1 to /sdcard/audio/boot/.
     AudioSceneId.Out -> NOMIAudioSender.DataPort2,
 
     # Field 3: sequence ID. 1 means 001.wav.

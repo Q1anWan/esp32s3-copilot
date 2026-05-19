@@ -22,7 +22,7 @@ Field meaning:
 | Field | Meaning |
 | --- | --- |
 | `trigger` | `1` while the scenario condition is active, `0` otherwise |
-| `scene` | Audio scene ID. Numeric scenes map to `sceneNNN`, so `1` becomes `scene001` |
+| `scene` | Audio scene ID. The PC bridge can alias numeric scenes; default `1=boot` for the current TF-card test audio. Without an alias, numeric scenes map to `sceneNNN`, so `1` becomes `scene001` |
 | `seq` | Audio sequence ID, 1..65535 |
 
 The PC bridge listens on TCP port `7777` by default. The ESP32 direct TCP host
@@ -32,7 +32,15 @@ The firmware treats `trigger >= 0.5` as active. Playback is edge-triggered, so
 fixed-rate continuous `trigger=1` traffic does not repeatedly queue audio. The
 trigger must return to `0` before the next `1` can trigger playback again.
 
-Default playback mapping:
+Default PC bridge playback mapping with the shipped test audio:
+
+```text
+scene = boot
+seq   = 1
+file  = /sdcard/audio/boot/001.wav
+```
+
+Formal multi-scene mapping without aliases:
 
 ```text
 scene = scene001

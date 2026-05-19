@@ -34,6 +34,7 @@ DEFAULT_STATUS_TOPIC = os.environ.get("COPILOT_STATUS_TOPIC", "copilot/s3_copilo
 DEFAULT_TCP_HOST = os.environ.get("SILAB_TCP_HOST", "0.0.0.0")
 DEFAULT_TCP_PORT = int(os.environ.get("SILAB_TCP_PORT", "7777"))
 DEFAULT_SCENE_PREFIX = os.environ.get("SILAB_SCENE_PREFIX", "scene")
+DEFAULT_SCENE_ALIASES = os.environ.get("SILAB_SCENE_ALIASES", "1=boot")
 
 
 def require_mqtt():
@@ -152,8 +153,28 @@ def scene_token_is_valid(scene: str) -> bool:
     return bool(scene) and all(c in allowed for c in scene)
 
 
-def normalize_scene(scene: str, prefix: str) -> str:
+def parse_scene_aliases(text: str) -> dict[int, str]:
+    aliases: dict[int, str] = {}
+    for item in text.replace(";", ",").split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        numeric = parse_integer_like(key.strip())
+        value = value.strip()
+        if numeric is None or numeric < 0 or not scene_token_is_valid(value):
+            continue
+        aliases[numeric] = value
+    return aliases
+
+
+def normalize_scene(scene: str, prefix: str, aliases: str | dict[int, str] | None = None) -> str:
     numeric = parse_integer_like(scene)
+    if numeric is not None and aliases:
+        alias_map = parse_scene_aliases(aliases) if isinstance(aliases, str) else aliases
+        alias = alias_map.get(numeric)
+        if alias:
+            return alias
     if numeric is not None:
         return f"{prefix}{numeric:03d}"
     return scene
@@ -267,12 +288,14 @@ class SilabTcpBridge:
         events: "queue.Queue[tuple[str, object]]",
         publish_cb,
         scene_prefix_cb,
+        scene_aliases_cb,
         threshold_cb,
         ack_cb,
     ) -> None:
         self.events = events
         self.publish_cb = publish_cb
         self.scene_prefix_cb = scene_prefix_cb
+        self.scene_aliases_cb = scene_aliases_cb
         self.threshold_cb = threshold_cb
         self.ack_cb = ack_cb
         self._stop = threading.Event()
@@ -374,7 +397,7 @@ class SilabTcpBridge:
                 self._trigger_count += 1
             trigger_count = self._trigger_count
 
-        scene = normalize_scene(packet.scene, self.scene_prefix_cb())
+        scene = normalize_scene(packet.scene, self.scene_prefix_cb(), self.scene_aliases_cb())
         accepted = False
         if rising:
             payload = {
@@ -426,6 +449,7 @@ class BridgeGui(tk.Tk):
             self.events,
             publish_cb=self._publish_mqtt,
             scene_prefix_cb=lambda: self.scene_prefix_var.get().strip() or DEFAULT_SCENE_PREFIX,
+            scene_aliases_cb=lambda: self.scene_aliases_var.get().strip(),
             threshold_cb=lambda: self.threshold_var.get(),
             ack_cb=lambda: self.tcp_ack_var.get(),
         )
@@ -527,6 +551,7 @@ class BridgeGui(tk.Tk):
         self.tcp_port_var = tk.IntVar(value=self.args.tcp_port)
         self.threshold_var = tk.DoubleVar(value=self.args.trigger_threshold)
         self.scene_prefix_var = tk.StringVar(value=self.args.scene_prefix)
+        self.scene_aliases_var = tk.StringVar(value=self.args.scene_aliases)
         self.tcp_ack_var = tk.BooleanVar(value=self.args.tcp_ack)
         ttk.Label(box, text="Bind").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
         ttk.Entry(box, textvariable=self.tcp_host_var, width=18).grid(row=0, column=1, sticky="ew", padx=8, pady=(8, 4))
@@ -536,9 +561,11 @@ class BridgeGui(tk.Tk):
         ttk.Entry(box, textvariable=self.threshold_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=4)
         ttk.Label(box, text="Prefix").grid(row=3, column=0, sticky="w", padx=8, pady=4)
         ttk.Entry(box, textvariable=self.scene_prefix_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=4)
-        ttk.Checkbutton(box, text="Send TCP ACK", variable=self.tcp_ack_var).grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+        ttk.Label(box, text="Aliases").grid(row=4, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(box, textvariable=self.scene_aliases_var, width=18).grid(row=4, column=1, sticky="ew", padx=8, pady=4)
+        ttk.Checkbutton(box, text="Send TCP ACK", variable=self.tcp_ack_var).grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=4)
         self.tcp_btn = ttk.Button(box, text="Start TCP Host", command=self.toggle_tcp)
-        self.tcp_btn.grid(row=5, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
+        self.tcp_btn.grid(row=6, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
 
     def _build_play(self, parent: ttk.Frame) -> None:
         box = ttk.LabelFrame(parent, text="Manual MQTT Play")
@@ -721,7 +748,8 @@ class BridgeGui(tk.Tk):
         if not scene or seq < 1 or seq > 65535:
             messagebox.showwarning("Play", "Scene must be non-empty and seq must be 1..65535")
             return
-        scene = normalize_scene(scene, self.scene_prefix_var.get().strip() or DEFAULT_SCENE_PREFIX)
+        scene = normalize_scene(scene, self.scene_prefix_var.get().strip() or DEFAULT_SCENE_PREFIX,
+                                self.scene_aliases_var.get().strip())
         self.mqtt.publish({"type": "play", "scene": scene, "seq": seq, "message_id": f"manual_{int(time.time() * 1000)}"})
 
     def query_status(self) -> None:
@@ -811,6 +839,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tcp-port", type=int, default=DEFAULT_TCP_PORT, help="SILAB TCP port. Default: 7777")
     parser.add_argument("--trigger-threshold", type=float, default=0.5, help="Trigger active threshold. Default: 0.5")
     parser.add_argument("--scene-prefix", default=DEFAULT_SCENE_PREFIX, help="Numeric scene prefix. Default: scene")
+    parser.add_argument("--scene-aliases", default=DEFAULT_SCENE_ALIASES, help="Numeric scene aliases, for example 1=boot,2=scene002")
     parser.add_argument("--tcp-ack", action="store_true", help="Send JSON ACK lines back to SILAB TCP client")
     parser.add_argument("--port", default="auto", help="ESP32 USB serial port for setup. Default: auto")
     parser.add_argument("--baud", type=int, default=115_200, help="ESP32 USB serial baud. Default: 115200")

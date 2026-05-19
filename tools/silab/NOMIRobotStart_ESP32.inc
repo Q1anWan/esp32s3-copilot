@@ -3,7 +3,8 @@
 # Interface contract:
 # - SILAB acts as TCP client.
 # - The experiment PC bridge GUI acts as TCP host/server.
-# - The PC forwards accepted trigger events to ESP32 over MQTT.
+# - The PC forwards accepted trigger events to ESP32 over direct TCP.
+# - MQTT is used by the bridge GUI for ESP32 status and fallback control.
 # - Every packet is one UTF-8/ASCII text line:
 #     trigger<TAB>scene<TAB>seq<LF>
 #

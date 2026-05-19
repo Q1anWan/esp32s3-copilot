@@ -1,91 +1,107 @@
-# Windows SILAB Bridge Deployment Guide
+# Windows 实验主机部署说明：SILAB Bridge + ESP32 音频播放
 
-This guide is for non-software operators setting up the experiment PC on
-Windows. Follow it in order.
+这份文档给非计算机专业同学使用。目标是把 Windows 实验主机配置成
+SILAB 与 ESP32 之间的桥接主机，并能完成播放、停止、模拟 SILAB、检查
+SILAB 数据包。
 
-## What Is Ready
+## 最终交付的 5 个文件
 
-The three required programs are ready in this repository:
+| 序号 | 类型 | 文件 | 用途 |
+| --- | --- | --- | --- |
+| 1 | 程序 | `tools/silab_mqtt_bridge_gui.py` | Bridge 可视化程序。接收 SILAB TCP 数据，控制 ESP32 播放/停止，显示 ESP32 状态 |
+| 2 | 程序 | `tools/silab_tcp_simulator.py` | 模拟 SILAB 脚本。按固定频率发送 `trigger scene seq` 数据包 |
+| 3 | 程序 | `tools/silab_tcp_probe.py` | SILAB 数据包测试脚本。接收真实 SILAB 数据并打印解析结果 |
+| 4 | INC | `tools/silab/NOMIRobotStart_ESP32.inc` | SILAB 参考设计。说明 SILAB 如何向 Bridge 发送场景和序号 |
+| 5 | 文档 | `docs/WINDOWS_SILAB_BRIDGE_DEPLOYMENT.md` | 本中文部署文档 |
 
-| Purpose | File | Status |
-| --- | --- | --- |
-| Visual bridge and ESP32 control panel | `tools/silab_mqtt_bridge_gui.py` | OK. Receives SILAB TCP, controls ESP32 playback by direct TCP, monitors ESP32 by MQTT |
-| SILAB simulator | `tools/silab_tcp_simulator.py` | OK. Sends fixed-rate SILAB-like `trigger scene seq` packets |
-| SILAB packet probe | `tools/silab_tcp_probe.py` | OK. Receives real SILAB packets and prints parsed fields, trigger edge, and expected audio file |
+注意：`silab_mqtt_bridge_gui.py` 和 `silab_tcp_probe.py` 都会监听 TCP
+`7777` 端口，因此二者不能同时运行。正式实验用 GUI；调试 SILAB 数据格式
+时用 probe。
 
-Windows helper files are in `tools/windows/`.
-
-Important: the probe and the bridge GUI cannot listen on port `7777` at the
-same time. Use either the GUI, or the probe.
-
-## Network Topology
+## 系统拓扑
 
 ```text
-SILAB --Ethernet LAN A/TCP 7777--> Windows experiment PC
-Windows experiment PC --WiFi LAN B/MQTT 1883 + TCP 7777--> ESP32
+SILAB --网线局域网 A / TCP 7777--> Windows 实验主机
+Windows 实验主机 --WiFi 局域网 B / MQTT 1883 + TCP 7777--> ESP32
 ```
 
-The Windows PC has two useful IP addresses:
+Windows 实验主机有两个重要 IP：
 
-- Ethernet LAN A IP: give this to SILAB as `Destination_IP`.
-- WiFi LAN B IP: give this to ESP32 as the MQTT broker IP.
+| 网络 | 给谁使用 | 例子 |
+| --- | --- | --- |
+| 网线局域网 A 的 IPv4 | 填到 SILAB 的 `Destination_IP` | `192.168.100.10` |
+| WiFi 局域网 B 的 IPv4 | 配给 ESP32 的 MQTT Broker URI | `mqtt://192.168.0.10:1883` |
 
-Do not use `127.0.0.1` for ESP32. `127.0.0.1` only means the Windows PC itself.
+不要把 `127.0.0.1` 配给 ESP32。`127.0.0.1` 只代表 Windows 电脑自己。
 
-## Install Python
+## 第一步：安装 Python
 
-1. Install Python 3 from https://www.python.org/downloads/windows/.
-2. During install, enable `Add python.exe to PATH` if the installer shows it.
-3. Open `PowerShell` and check:
+1. 打开 Python 官网下载安装包：
+
+   ```text
+   https://www.python.org/downloads/windows/
+   ```
+
+2. 安装时如果看到 `Add python.exe to PATH`，请勾选。
+
+3. 打开 PowerShell，输入：
 
    ```powershell
    py -3 --version
    ```
 
-4. In the project folder, double-click:
+   如果能看到 Python 版本号，说明安装成功。
+
+4. 进入项目文件夹，双击：
 
    ```text
    tools\windows\install_python_deps.bat
    ```
 
-Expected result: it installs `paho-mqtt` and `pyserial` without red error lines.
+   这个脚本会安装：
 
-## Install Mosquitto MQTT Broker
+   ```text
+   paho-mqtt
+   pyserial
+   ```
 
-The bridge GUI has a `Start Dev Broker` button, but this is only for developer
-tests. For the experiment PC, install Mosquitto as a normal Windows broker.
+   如果窗口里没有红色报错，依赖安装完成。
 
-Official references:
+## 第二步：安装 Mosquitto MQTT Broker
 
-- Mosquitto download page: https://mosquitto.org/download/
-- Mosquitto 2.x remote-listener note: https://mosquitto.org/documentation/migrating-to-2-0/
+Bridge GUI 里的 `Start Dev Broker` 只适合开发临时测试，不适合正式实验。
+正式实验必须在 Windows 上安装 Mosquitto Broker 服务。
 
-### Install
+官方页面：
 
-1. Download the Windows x64 installer from the official Mosquitto download page.
-   Use the latest stable Windows x64 installer shown on that page.
-2. Run the installer.
-3. Keep the default install directory:
+- 下载页：`https://mosquitto.org/download/`
+- Mosquitto 2.x 局域网监听说明：`https://mosquitto.org/documentation/migrating-to-2-0/`
+
+### 安装 Mosquitto
+
+1. 打开 Mosquitto 下载页。
+2. 下载 Windows x64 installer。
+3. 安装到默认目录：
 
    ```text
    C:\Program Files\mosquitto
    ```
 
-4. If the installer asks whether to install the service, enable it.
+4. 如果安装程序询问是否安装服务，请选择安装服务。
 
-### Configure LAN Access
+### 配置允许 ESP32 连接
 
-Mosquitto 2.x does not automatically accept remote devices when run with the
-default local-only mode. ESP32 is a remote device, so use this lab config:
+Mosquitto 2.x 默认直接运行时通常只允许本机连接。ESP32 是外部设备，
+所以必须写配置文件。
 
-1. Open Notepad as Administrator.
-2. Open:
+1. 用管理员权限打开 Notepad。
+2. 打开：
 
    ```text
    C:\Program Files\mosquitto\mosquitto.conf
    ```
 
-3. Add these lines at the end, or replace the file with the same contents:
+3. 在文件末尾加入下面内容，或直接把文件改成下面内容：
 
    ```conf
    listener 1883 0.0.0.0
@@ -93,168 +109,202 @@ default local-only mode. ESP32 is a remote device, so use this lab config:
    persistence false
    ```
 
-For convenience, the same template is available here:
+仓库里也提供了同样的模板：
 
 ```text
 tools\windows\mosquitto-copilot.conf
 ```
 
-Security note: `allow_anonymous true` is acceptable only on an isolated lab LAN.
-Do not expose this broker to the Internet.
+安全提醒：`allow_anonymous true` 只适合封闭实验局域网，不要暴露到公网。
 
-### Open Windows Firewall
+### 打开 Windows 防火墙端口
 
-Open PowerShell as Administrator and run:
+用管理员权限打开 PowerShell，执行：
 
 ```powershell
 New-NetFirewallRule -DisplayName "Copilot MQTT 1883" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 1883
 New-NetFirewallRule -DisplayName "Copilot SILAB TCP 7777" -Direction Inbound -Action Allow -Protocol TCP -LocalPort 7777
 ```
 
-### Restart Broker
+### 重启 Mosquitto 服务
 
-Open PowerShell as Administrator and run:
+用管理员权限打开 PowerShell，执行：
 
 ```powershell
 Restart-Service mosquitto
 ```
 
-If that command says the service does not exist, open Windows `Services`, find
-`Mosquitto Broker` or `mosquitto`, and start/restart it there. If no service was
-installed, rerun the installer and select the service option.
+如果提示找不到服务，打开 Windows 的 `Services`，查找 `Mosquitto Broker`
+或 `mosquitto`，手动启动或重启。若完全没有服务，重新运行安装程序，并选择
+安装服务。
 
-### Broker Self-Test
+### 测试 Broker 是否正常
 
-Open two PowerShell windows.
+打开两个 PowerShell 窗口。
 
-Window 1:
+窗口 1：
 
 ```powershell
 & "C:\Program Files\mosquitto\mosquitto_sub.exe" -h 127.0.0.1 -t test/copilot
 ```
 
-Window 2:
+窗口 2：
 
 ```powershell
 & "C:\Program Files\mosquitto\mosquitto_pub.exe" -h 127.0.0.1 -t test/copilot -m hello
 ```
 
-Expected result: Window 1 prints `hello`.
+如果窗口 1 出现：
 
-## Find Windows IP Addresses
+```text
+hello
+```
 
-Open PowerShell:
+说明 Broker 本机测试通过。
+
+## 第三步：找到 Windows 的两个 IP
+
+打开 PowerShell：
 
 ```powershell
 ipconfig
 ```
 
-Write down:
+记录两个 IPv4 地址：
 
-| Network | Where To Use It | Example |
-| --- | --- | --- |
-| WiFi IPv4 Address | ESP32 MQTT broker URI | `mqtt://192.168.0.10:1883` |
-| Ethernet IPv4 Address | SILAB `Destination_IP` | `192.168.100.10` |
+| 要找的地址 | 用途 |
+| --- | --- |
+| WiFi 适配器 IPv4 | ESP32 的 MQTT Broker URI |
+| 以太网适配器 IPv4 | SILAB 的 `Destination_IP` |
 
-If you are not sure which is which, unplug Ethernet temporarily and run
-`ipconfig` again. The disappearing adapter is Ethernet LAN A.
+如果分不清哪个是网线 IP，可以先拔掉网线，再执行一次 `ipconfig`。消失的那
+个就是网线局域网 A。
 
-## Start The Bridge GUI
+## 第四步：启动 Bridge 可视化程序
 
-Double-click:
+双击：
 
 ```text
 tools\windows\start_bridge_gui.bat
 ```
 
-In the GUI:
+GUI 打开后按下面步骤操作：
 
-1. In `MQTT Broker`, set:
-   - `Host`: `127.0.0.1`
-   - `Port`: `1883`
-2. Click `Connect`.
-3. Do not click `Start Dev Broker` during formal tests.
-4. In `ESP32 USB Setup`, set `Broker URI` to the Windows WiFi LAN B IP:
+1. 在 `MQTT Broker` 区域设置：
 
    ```text
-   mqtt://<WINDOWS_WIFI_IP>:1883
+   Host = 127.0.0.1
+   Port = 1883
    ```
 
-   Example:
+2. 点击 `Connect`。
+
+3. 正式实验不要点击 `Start Dev Broker`。
+
+4. 在 `ESP32 USB Setup` 区域，把 `Broker URI` 设置为 Windows 的 WiFi
+   局域网 B IP：
+
+   ```text
+   mqtt://<Windows WiFi IP>:1883
+   ```
+
+   例子：
 
    ```text
    mqtt://192.168.0.10:1883
    ```
 
-5. Connect ESP32 by USB and click `Save MQTT`.
-6. If ESP32 WiFi is not already configured, fill `SSID` and `Pass`, then click
-   `Save WiFi`.
-7. Wait for ESP32 status. The GUI should show:
-   - WiFi connected with an ESP32 IP
-   - MQTT connected
-   - SD mounted
-   - `ESP Host` auto-filled, for example `192.168.0.56`
-8. Keep `Direct ESP TCP` checked.
-9. Click `Play`. ESP32 should play `/sdcard/audio/boot/001.wav`.
-10. Click `Stop`. ESP32 should stop playback and return to neutral face.
+5. 用 USB 连接 ESP32，点击 `Save MQTT`。
 
-## Start SILAB TCP Host
+6. 如果 ESP32 还没有配置 WiFi，填写 `SSID` 和 `Pass`，点击 `Save WiFi`。
 
-In the same Bridge GUI:
-
-1. In `SILAB TCP Host`, set:
-   - `Bind`: `0.0.0.0`
-   - `Port`: `7777`
-   - `Threshold`: `0.5`
-   - `Aliases`: `1=boot`
-2. Optional: enable `Send TCP ACK` if SILAB can read ACK lines.
-3. Click `Start TCP Host`.
-4. In SILAB, set:
-   - `Destination_IP`: Windows Ethernet LAN A IP
-   - `Destination_Port`: `7777`
-5. SILAB packet format:
+7. 等待 ESP32 状态刷新。正常时应看到：
 
    ```text
-   trigger<TAB>scene<TAB>seq<LF>
+   WiFi connected
+   MQTT connected
+   SD mounted
+   ESP Host 自动填写，例如 192.168.0.56
    ```
 
-Example:
+8. 保持 `Direct ESP TCP` 勾选。
+
+9. 点击 `Play`，ESP32 应播放：
+
+   ```text
+   /sdcard/audio/boot/001.wav
+   ```
+
+10. 点击 `Stop`，ESP32 应停止播放，并回到中性表情。
+
+## 第五步：启动 SILAB TCP Host
+
+在同一个 GUI 里：
+
+1. 在 `SILAB TCP Host` 区域设置：
+
+   ```text
+   Bind = 0.0.0.0
+   Port = 7777
+   Threshold = 0.5
+   Aliases = 1=boot
+   ```
+
+2. 如果 SILAB 需要接收 ACK，可以勾选 `Send TCP ACK`。
+
+3. 点击 `Start TCP Host`。
+
+4. 在 SILAB 里设置：
+
+   ```text
+   Destination_IP = Windows 网线局域网 A 的 IPv4
+   Destination_Port = 7777
+   ```
+
+SILAB 发送格式：
+
+```text
+trigger<TAB>scene<TAB>seq<LF>
+```
+
+例子：
 
 ```text
 1	1	1
 ```
 
-With default alias `1=boot`, this plays:
+默认 `Aliases = 1=boot`，所以这条命令会播放：
 
 ```text
 /sdcard/audio/boot/001.wav
 ```
 
-Trigger rule:
+触发规则：
 
-- `trigger >= 0.5` means active.
-- Playback happens once on the `0 -> 1` rising edge.
-- Repeated fixed-rate `1` packets do not repeatedly play.
-- Trigger must return to `0` before the next playback can happen.
+- `trigger >= 0.5` 表示触发有效。
+- 只在 `0 -> 1` 上升沿播放一次。
+- SILAB 固定频率连续发送 `1` 时，不会重复播放。
+- 必须先回到 `0`，下一次 `1` 才会再次触发播放。
 
-## Use The SILAB Simulator
+## 使用模拟 SILAB 脚本
 
-Use this when SILAB hardware is not connected, or before a formal run.
+当没有 SILAB 硬件，或正式实验前要检查链路时使用。
 
-1. Start the Bridge GUI.
-2. Click `Connect` for MQTT.
-3. Click `Start TCP Host`.
-4. Double-click:
+1. 启动 Bridge GUI。
+2. 点击 MQTT `Connect`。
+3. 点击 `Start TCP Host`。
+4. 双击：
 
    ```text
    tools\windows\start_silab_simulator.bat
    ```
 
-5. For `Bridge PC IP`, press Enter to use `127.0.0.1` if the simulator is on
-   the same Windows PC.
-6. For `Bridge TCP port`, press Enter to use `7777`.
+5. 如果模拟器和 GUI 在同一台 Windows 电脑上，`Bridge PC IP` 直接按回车，
+   使用默认 `127.0.0.1`。
 
-Expected GUI log:
+6. `Bridge TCP port` 直接按回车，使用默认 `7777`。
+
+GUI 日志里应该出现类似内容：
 
 ```text
 [silab] connected ...
@@ -263,23 +313,28 @@ Expected GUI log:
 [esp32] screen speaking ...
 ```
 
-## Use The SILAB Packet Probe
+## 使用 SILAB 数据包测试脚本
 
-Use this when you want to verify the real SILAB output format. The probe only
-receives and prints packets. It does not control ESP32.
+这个脚本用于确认真实 SILAB 发来的数据格式是否正确。它只接收和打印数据，
+不会控制 ESP32。
 
-1. Stop the Bridge GUI TCP Host, or close the Bridge GUI.
-2. Double-click:
+1. 关闭 Bridge GUI 的 TCP Host，或者直接关闭 Bridge GUI。
+2. 双击：
 
    ```text
    tools\windows\start_silab_probe.bat
    ```
 
-3. In SILAB, set `Destination_IP` to the Windows Ethernet LAN A IP and
-   `Destination_Port` to `7777`.
-4. Run the SILAB scenario.
+3. 在 SILAB 里设置：
 
-Expected probe output:
+   ```text
+   Destination_IP = Windows 网线局域网 A 的 IPv4
+   Destination_Port = 7777
+   ```
+
+4. 运行 SILAB 场景。
+
+正常输出类似：
 
 ```text
 format: OK
@@ -289,89 +344,78 @@ trigger_active=True rising_edge=True
 would_play: /sdcard/audio/boot/001.wav
 ```
 
-The probe also appends machine-readable logs to:
+脚本还会把机器可读日志追加到：
 
 ```text
 silab_probe_log.jsonl
 ```
 
-## Normal Experiment Startup Checklist
+## 正式实验启动检查表
 
-1. Windows connected to Ethernet LAN A and WiFi LAN B.
-2. Mosquitto service running.
-3. Windows firewall allows TCP `1883` and `7777`.
-4. ESP32 powered on, TF card inserted.
-5. Bridge GUI started.
-6. GUI MQTT connected to `127.0.0.1:1883`.
-7. ESP32 status shows MQTT connected and SD mounted.
-8. `ESP Host` is filled and `Direct ESP TCP` is checked.
-9. Manual `Play` and `Stop` work.
-10. GUI `Start TCP Host` is active.
-11. SILAB sends to Windows Ethernet LAN A IP, port `7777`.
+1. Windows 已连接网线局域网 A 和 WiFi 局域网 B。
+2. Mosquitto 服务正在运行。
+3. Windows 防火墙已允许 TCP `1883` 和 `7777`。
+4. ESP32 已上电，TF 卡已插入。
+5. Bridge GUI 已启动。
+6. GUI MQTT 已连接 `127.0.0.1:1883`。
+7. ESP32 状态显示 MQTT connected、SD mounted。
+8. `ESP Host` 已自动填写，`Direct ESP TCP` 已勾选。
+9. 手动 `Play` 和 `Stop` 均正常。
+10. GUI 的 `Start TCP Host` 已启动。
+11. SILAB 发送目标为 Windows 网线局域网 A IP，端口 `7777`。
 
-## Troubleshooting
+## 常见问题
 
-### ESP32 MQTT stays disconnected
+### ESP32 MQTT 一直 disconnected
 
-Check:
+检查：
 
-- ESP32 Broker URI is `mqtt://<WINDOWS_WIFI_IP>:1883`, not `127.0.0.1`.
-- Mosquitto service is running.
-- Windows firewall allows TCP `1883`.
-- ESP32 and Windows WiFi are on the same LAN B.
+- ESP32 的 Broker URI 是 `mqtt://<Windows WiFi IP>:1883`，不是 `127.0.0.1`。
+- Mosquitto 服务正在运行。
+- Windows 防火墙允许 TCP `1883`。
+- ESP32 和 Windows WiFi 在同一个局域网 B。
 
-### GUI `Play` works but SILAB does not trigger
+### GUI 手动 Play 可以，但 SILAB 不触发
 
-Check:
+检查：
 
-- GUI `Start TCP Host` is active.
-- SILAB `Destination_IP` is the Windows Ethernet LAN A IP.
-- Windows firewall allows TCP `7777`.
-- The probe is not running at the same time as the GUI TCP Host.
+- GUI 的 `Start TCP Host` 是否已启动。
+- SILAB 的 `Destination_IP` 是否为 Windows 网线局域网 A IP。
+- Windows 防火墙是否允许 TCP `7777`。
+- `silab_tcp_probe.py` 是否还在运行。probe 和 GUI 不能同时占用 `7777`。
 
-### Probe cannot start
+### probe 无法启动
 
-Port `7777` is already in use. Close the Bridge GUI TCP Host or any other
-program using port `7777`.
+说明 TCP `7777` 端口已经被占用。关闭 Bridge GUI 的 TCP Host，或关闭其它
+使用 `7777` 的程序。
 
-PowerShell check:
+PowerShell 检查：
 
 ```powershell
 netstat -ano | findstr :7777
 ```
 
-### Manual `Play` has delay or does not play
+### 手动 Play 延迟大或没有声音
 
-Check:
+检查：
 
-- `Direct ESP TCP` is checked.
-- `ESP Host` is filled, for example `192.168.0.56`.
-- ESP32 status has `tcp_host`, for example `192.168.0.56:7777`.
-- TF card status is `mounted`.
-- Current test file exists on TF card:
+- `Direct ESP TCP` 是否已勾选。
+- `ESP Host` 是否已填写，例如 `192.168.0.56`。
+- ESP32 状态里是否有 `tcp_host`，例如 `192.168.0.56:7777`。
+- TF 卡状态是否为 `mounted`。
+- 当前测试音频是否存在：
 
   ```text
   /sdcard/audio/boot/001.wav
   ```
 
-### `Stop` does not stop playback
+### Stop 无法停止
 
-Check the ESP32 firmware version. It must include commit:
+检查 ESP32 固件版本，必须包含：
 
 ```text
 5b317fe Add GUI audio stop control
 ```
 
-Then restart the Bridge GUI so the new `Stop` button is visible.
-
-## File Summary
-
-| File | For Operator |
-| --- | --- |
-| `tools\windows\install_python_deps.bat` | Install Python packages |
-| `tools\windows\start_bridge_gui.bat` | Start visual bridge |
-| `tools\windows\start_silab_simulator.bat` | Simulate SILAB trigger |
-| `tools\windows\start_silab_probe.bat` | Inspect real SILAB packets |
-| `tools\windows\mosquitto-copilot.conf` | Minimal MQTT broker config |
-| `tools\windows\start_mosquitto_console.bat` | Developer fallback broker console |
+然后重新启动 Bridge GUI，确认界面里出现 `Stop` 按钮。
 

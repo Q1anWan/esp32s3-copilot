@@ -1,6 +1,6 @@
 # Windows 实验主机部署说明：SILAB Bridge + ESP32 音频播放
 
-这份文档给非计算机专业同学使用。目标是把 Windows 实验主机配置成
+这份文档目标是把 Windows 实验主机配置成
 SILAB 与 ESP32 之间的桥接主机，并能完成播放、停止、模拟 SILAB、检查
 SILAB 数据包。
 
@@ -8,11 +8,11 @@ SILAB 数据包。
 
 | 序号 | 类型 | 文件 | 用途 |
 | --- | --- | --- | --- |
-| 1 | 程序 | `tools/silab_mqtt_bridge_gui.py` | Bridge 可视化程序。接收 SILAB TCP 数据，控制 ESP32 播放/停止，显示 ESP32 状态 |
-| 2 | 程序 | `tools/silab_tcp_simulator.py` | 模拟 SILAB 脚本。按固定频率发送 `trigger scene seq` 数据包 |
-| 3 | 程序 | `tools/silab_tcp_probe.py` | SILAB 数据包测试脚本。接收真实 SILAB 数据并打印解析结果 |
-| 4 | INC | `tools/silab/NOMIRobotStart_ESP32.inc` | SILAB 参考设计。说明 SILAB 如何向 Bridge 发送场景和序号 |
-| 5 | 文档 | `docs/WINDOWS_SILAB_BRIDGE_DEPLOYMENT.md` | 本中文部署文档 |
+| 1 | 程序 | `silab_mqtt_bridge_gui.py` | Bridge 可视化程序。接收 SILAB TCP 数据，控制 ESP32 播放/停止，显示 ESP32 状态 |
+| 2 | 程序 | `silab_tcp_simulator.py` | 模拟 SILAB 脚本。按固定频率发送 `trigger scene seq` 数据包 |
+| 3 | 程序 | `silab_tcp_probe.py` | SILAB 数据包测试脚本。接收真实 SILAB 数据并打印解析结果 |
+| 4 | INC | `NOMIRobotStart_ESP32.inc` | SILAB 参考设计。说明 SILAB 如何向 Bridge 发送场景和序号 |
+| 5 | 文档 | `WINDOWS_SILAB_BRIDGE_DEPLOYMENT.md` | 本中文部署文档 |
 
 注意：`silab_mqtt_bridge_gui.py` 和 `silab_tcp_probe.py` 都会监听 TCP
 `7777` 端口，因此二者不能同时运行。正式实验用 GUI；调试 SILAB 数据格式
@@ -52,13 +52,17 @@ Windows 实验主机有两个重要 IP：
 
    如果能看到 Python 版本号，说明安装成功。
 
-4. 进入项目文件夹，双击：
+4. 进入解压后的交付文件夹，在空白处按住 `Shift` 并点击鼠标右键，选择
+   `Open PowerShell window here` 或 `在终端中打开`。
 
-   ```text
-   tools\windows\install_python_deps.bat
+5. 执行：
+
+   ```powershell
+   py -3 -m pip install --upgrade pip
+   py -3 -m pip install paho-mqtt pyserial
    ```
 
-   这个脚本会安装：
+   这会安装：
 
    ```text
    paho-mqtt
@@ -108,12 +112,6 @@ Mosquitto 2.x 默认直接运行时通常只允许本机连接。ESP32 是外部
    allow_anonymous true
    persistence false
    ```
-
-仓库里也提供了同样的模板：
-
-```text
-tools\windows\mosquitto-copilot.conf
-```
 
 安全提醒：`allow_anonymous true` 只适合封闭实验局域网，不要暴露到公网。
 
@@ -182,10 +180,10 @@ ipconfig
 
 ## 第四步：启动 Bridge 可视化程序
 
-双击：
+进入解压后的交付文件夹，打开 PowerShell，执行：
 
-```text
-tools\windows\start_bridge_gui.bat
+```powershell
+py -3 .\silab_mqtt_bridge_gui.py
 ```
 
 GUI 打开后按下面步骤操作：
@@ -293,16 +291,14 @@ trigger<TAB>scene<TAB>seq<LF>
 1. 启动 Bridge GUI。
 2. 点击 MQTT `Connect`。
 3. 点击 `Start TCP Host`。
-4. 双击：
+4. 另开一个 PowerShell，进入解压后的交付文件夹，执行：
 
-   ```text
-   tools\windows\start_silab_simulator.bat
+   ```powershell
+   py -3 .\silab_tcp_simulator.py --host 127.0.0.1 --port 7777 --scene 1 --seq 1 --rate-hz 10 --pre-idle 1 --hold 2 --post-idle 1 --read-ack --verbose
    ```
 
-5. 如果模拟器和 GUI 在同一台 Windows 电脑上，`Bridge PC IP` 直接按回车，
-   使用默认 `127.0.0.1`。
-
-6. `Bridge TCP port` 直接按回车，使用默认 `7777`。
+5. 如果模拟器不在同一台电脑上，把 `--host 127.0.0.1` 改成运行 Bridge GUI
+   的 Windows 电脑 IP。
 
 GUI 日志里应该出现类似内容：
 
@@ -319,10 +315,10 @@ GUI 日志里应该出现类似内容：
 不会控制 ESP32。
 
 1. 关闭 Bridge GUI 的 TCP Host，或者直接关闭 Bridge GUI。
-2. 双击：
+2. 打开 PowerShell，进入解压后的交付文件夹，执行：
 
-   ```text
-   tools\windows\start_silab_probe.bat
+   ```powershell
+   py -3 .\silab_tcp_probe.py --host 0.0.0.0 --port 7777 --scene-aliases 1=boot --jsonl silab_probe_log.jsonl
    ```
 
 3. 在 SILAB 里设置：
@@ -418,4 +414,3 @@ netstat -ano | findstr :7777
 ```
 
 然后重新启动 Bridge GUI，确认界面里出现 `Stop` 按钮。
-

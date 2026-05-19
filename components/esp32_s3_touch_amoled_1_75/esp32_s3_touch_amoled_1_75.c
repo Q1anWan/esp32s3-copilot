@@ -215,7 +215,14 @@ esp_err_t bsp_sdcard_mount(void)
 
 esp_err_t bsp_sdcard_unmount(void)
 {
-    return esp_vfs_fat_sdcard_unmount(BSP_SD_MOUNT_POINT, bsp_sdcard);
+    if (!bsp_sdcard) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t err = esp_vfs_fat_sdcard_unmount(BSP_SD_MOUNT_POINT, bsp_sdcard);
+    if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
+        bsp_sdcard = NULL;
+    }
+    return err;
 }
 
 /**************************************************************************************************

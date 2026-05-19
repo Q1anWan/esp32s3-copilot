@@ -135,6 +135,25 @@ static bool copilot_audio_mount_sd(void) {
     return false;
 }
 
+static void copilot_audio_unmount_sd(void) {
+    if (!s_sd_mounted) {
+        return;
+    }
+    esp_err_t err = bsp_sdcard_unmount();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "SD card unmount returned: %s", esp_err_to_name(err));
+    }
+    s_sd_mounted = false;
+    s_status.sd_mounted = false;
+}
+
+static bool copilot_audio_remount_sd(const char *reason) {
+    ESP_LOGW(TAG, "Remount SD card (%s)", reason ? reason : "unknown");
+    copilot_audio_unmount_sd();
+    vTaskDelay(pdMS_TO_TICKS(250));
+    return copilot_audio_mount_sd();
+}
+
 static void copilot_audio_wait_network_settle(void) {
     copilot_network_status_t net = {};
     for (int i = 0; i < 70; ++i) {
@@ -446,6 +465,37 @@ static bool has_ext(const char *path, const char *ext) {
     return *dot == '\0' && *ext == '\0';
 }
 
+static FILE *copilot_audio_open_file_with_retry(const char *path, int *out_errno) {
+    errno = 0;
+    FILE *fp = fopen(path, "rb");
+    if (fp) {
+        if (out_errno) {
+            *out_errno = 0;
+        }
+        return fp;
+    }
+
+    int first_errno = errno;
+    if (first_errno == EIO || first_errno == ENODEV) {
+        if (copilot_audio_remount_sd("file_open_failed")) {
+            errno = 0;
+            fp = fopen(path, "rb");
+            if (fp) {
+                ESP_LOGI(TAG, "SD file open recovered after remount: %s", path);
+                if (out_errno) {
+                    *out_errno = 0;
+                }
+                return fp;
+            }
+        }
+    }
+
+    if (out_errno) {
+        *out_errno = errno ? errno : first_errno;
+    }
+    return nullptr;
+}
+
 static void copilot_audio_play_file(const audio_req_t &req) {
     copilot_audio_wait_network_settle();
     if (!copilot_audio_mount_sd()) {
@@ -462,12 +512,13 @@ static void copilot_audio_play_file(const audio_req_t &req) {
     s_status.current_path[sizeof(s_status.current_path) - 1] = '\0';
     copilot_audio_set_error("");
 
-    FILE *fp = fopen(req.path, "rb");
+    int open_errno = 0;
+    FILE *fp = copilot_audio_open_file_with_retry(req.path, &open_errno);
     if (!fp) {
         char err_msg[96];
-        snprintf(err_msg, sizeof(err_msg), "open_failed:%d", errno);
+        snprintf(err_msg, sizeof(err_msg), "open_failed:%d", open_errno);
         copilot_audio_set_error(err_msg);
-        ESP_LOGW(TAG, "Failed to open audio file %s (errno=%d)", req.path, errno);
+        ESP_LOGW(TAG, "Failed to open audio file %s (errno=%d)", req.path, open_errno);
         s_status.playing_file = false;
         copilot_audio_out_release(AUDIO_SRC_FILE);
         return;

@@ -237,7 +237,7 @@ class MqttController:
             self.connected = ok
             if ok:
                 client.subscribe(self.status_topic, qos=1)
-                self.events.put(("log", f"[mqtt] connected {self.host}:{self.port}; sub {self.status_topic}"))
+                self.events.put(("log", f"[mqtt] connected {self.host}:{self.port}"))
             else:
                 self.events.put(("log", f"[mqtt] connect failed rc={reason_code}"))
 
@@ -247,10 +247,10 @@ class MqttController:
 
         def on_message(client, userdata, msg):
             text = msg.payload.decode("utf-8", errors="replace")
-            self.events.put(("log", f"[mqtt] {msg.topic} <- {text}"))
             try:
                 payload = json.loads(text)
             except json.JSONDecodeError:
+                self.events.put(("log", f"[mqtt] ignored non-JSON status on {msg.topic}"))
                 return
             self.events.put(("status", payload))
 
@@ -270,7 +270,7 @@ class MqttController:
         self.client = None
         self.connected = False
 
-    def publish(self, payload: dict) -> bool:
+    def publish(self, payload: dict, quiet: bool = False) -> bool:
         if not self.client or not self.connected:
             self.events.put(("log", "[mqtt] publish skipped: not connected"))
             return False
@@ -278,7 +278,8 @@ class MqttController:
         info = self.client.publish(self.cmd_topic, data, qos=1)
         info.wait_for_publish(timeout=3)
         ok = info.rc == 0
-        self.events.put(("log", f"[mqtt] {self.cmd_topic} -> {data} rc={info.rc}"))
+        if not quiet:
+            self.events.put(("mqtt_publish", {"payload": dict(payload), "ok": ok, "rc": info.rc}))
         return ok
 
 
@@ -456,6 +457,14 @@ class BridgeGui(tk.Tk):
         self.port_map: dict[str, str] = {}
         self.broker_proc: subprocess.Popen | None = None
         self.auto_status_after: str | None = None
+        self._last_files_played: int | None = None
+        self._last_audio_error = ""
+        self._last_audio_path = ""
+        self._last_wifi_connected: bool | None = None
+        self._last_mqtt_connected: bool | None = None
+        self._last_sd_mounted: bool | None = None
+        self._last_esp_status_at = 0.0
+        self._pending_plays: dict[str, dict] = {}
         self._build_style()
         self._build_ui()
         self.refresh_ports(initial=True)
@@ -750,14 +759,25 @@ class BridgeGui(tk.Tk):
             return
         scene = normalize_scene(scene, self.scene_prefix_var.get().strip() or DEFAULT_SCENE_PREFIX,
                                 self.scene_aliases_var.get().strip())
-        self.mqtt.publish({"type": "play", "scene": scene, "seq": seq, "message_id": f"manual_{int(time.time() * 1000)}"})
+        message_id = f"manual_{int(time.time() * 1000)}"
+        payload = {"type": "play", "scene": scene, "seq": seq, "message_id": message_id}
+        if self.mqtt.publish(payload):
+            self._pending_plays[message_id] = {
+                "scene": scene,
+                "seq": seq,
+                "files_before": self._last_files_played,
+                "t0": time.time(),
+            }
+            self._log(f"[manual] play requested {scene}/{seq:03d}")
+            self.after(1200, lambda: self.query_status(quiet=True))
+            self.after(3500, lambda: self.query_status(quiet=True))
 
-    def query_status(self) -> None:
-        self.mqtt.publish({"type": "status", "query": "all"})
+    def query_status(self, quiet: bool = False) -> None:
+        self.mqtt.publish({"type": "status", "query": "all"}, quiet=quiet)
 
     def _auto_status(self) -> None:
         if self.mqtt.connected:
-            self.query_status()
+            self.query_status(quiet=True)
         self.auto_status_after = self.after(3000, self._auto_status)
 
     def _drain_events(self) -> None:
@@ -766,6 +786,8 @@ class BridgeGui(tk.Tk):
                 kind, payload = self.events.get_nowait()
                 if kind == "log":
                     self._log(str(payload))
+                elif kind == "mqtt_publish":
+                    self._log_publish(payload if isinstance(payload, dict) else {})
                 elif kind == "status":
                     self._update_status(payload if isinstance(payload, dict) else {})
                 elif kind == "silab_packet":
@@ -782,22 +804,61 @@ class BridgeGui(tk.Tk):
 
     def _update_status(self, payload: dict) -> None:
         if payload.get("type") != "status":
+            if payload.get("type") == "screen_event":
+                state = payload.get("screen_state", "-")
+                message_id = payload.get("message_id") or ""
+                suffix = f" message={message_id}" if message_id else ""
+                self._log(f"[esp32] screen {state}{suffix}")
             return
-        wifi = payload.get("wifi", {})
-        mqtt_status = payload.get("mqtt", {})
-        audio = payload.get("audio", {})
-        wifi_text = "connected" if wifi.get("connected") else "offline"
-        if wifi.get("ip"):
-            wifi_text += f" {wifi.get('ip')}"
-        self.status_vars["wifi"].set(wifi_text)
-        self.status_vars["mqtt"].set("connected" if mqtt_status.get("connected") else "off")
-        audio_text = "ready" if audio.get("ready") else "not ready"
-        if audio.get("last_error"):
-            audio_text += f" err={audio.get('last_error')}"
-        self.status_vars["audio"].set(audio_text)
-        self.status_vars["sd"].set("mounted" if audio.get("sd_mounted") else "not mounted")
-        self.status_vars["path"].set(str(audio.get("current_path") or "-"))
-        self.status_vars["files"].set(str(audio.get("files_played", 0)))
+        self._last_esp_status_at = time.time()
+
+        if "wifi" in payload:
+            wifi = payload.get("wifi") or {}
+            wifi_connected = bool(wifi.get("connected"))
+            wifi_text = "connected" if wifi_connected else "offline"
+            if wifi.get("ip"):
+                wifi_text += f" {wifi.get('ip')}"
+            self.status_vars["wifi"].set(wifi_text)
+            if self._last_wifi_connected is not None and self._last_wifi_connected != wifi_connected:
+                self._log(f"[esp32] WiFi {'connected' if wifi_connected else 'offline'}")
+            self._last_wifi_connected = wifi_connected
+
+        if "mqtt" in payload:
+            mqtt_status = payload.get("mqtt") or {}
+            mqtt_connected = bool(mqtt_status.get("connected"))
+            self.status_vars["mqtt"].set("connected" if mqtt_connected else "off")
+            if self._last_mqtt_connected is not None and self._last_mqtt_connected != mqtt_connected:
+                self._log(f"[esp32] MQTT {'connected' if mqtt_connected else 'offline'}")
+            self._last_mqtt_connected = mqtt_connected
+
+        if "audio" in payload:
+            audio = payload.get("audio") or {}
+            audio_text = "ready" if audio.get("ready") else "not ready"
+            last_error = str(audio.get("last_error") or "")
+            if last_error:
+                audio_text += f" err={last_error}"
+            self.status_vars["audio"].set(audio_text)
+
+            sd_mounted = bool(audio.get("sd_mounted"))
+            self.status_vars["sd"].set("mounted" if sd_mounted else "not mounted")
+            if self._last_sd_mounted is not None and self._last_sd_mounted != sd_mounted:
+                self._log(f"[esp32] TF card {'mounted' if sd_mounted else 'not mounted'}")
+            self._last_sd_mounted = sd_mounted
+
+            path = str(audio.get("current_path") or "-")
+            files_played = int(audio.get("files_played", 0) or 0)
+            self.status_vars["path"].set(path)
+            self.status_vars["files"].set(str(files_played))
+
+            if self._last_files_played is not None and files_played > self._last_files_played:
+                self._log(f"[audio] played {path} files={files_played}")
+                self._pending_plays.clear()
+            if last_error and last_error != self._last_audio_error:
+                self._log(f"[audio] error {last_error} path={path}")
+            if path != self._last_audio_path and path != "-":
+                self._last_audio_path = path
+            self._last_audio_error = last_error
+            self._last_files_played = files_played
 
     def _update_silab(self, packet: dict) -> None:
         self.status_vars["silab"].set(
@@ -806,6 +867,20 @@ class BridgeGui(tk.Tk):
         self.status_vars["trigger"].set(
             f"{packet.get('trigger')} count={packet.get('trigger_count')} ok={packet.get('accepted')}"
         )
+
+    def _log_publish(self, event: dict) -> None:
+        payload = event.get("payload") or {}
+        ok = bool(event.get("ok"))
+        rc = event.get("rc")
+        msg_type = payload.get("type")
+        if msg_type == "play":
+            scene = payload.get("scene", "-")
+            seq = int(payload.get("seq", 0) or 0)
+            self._log(f"[mqtt] play {'sent' if ok else 'failed'} {scene}/{seq:03d} rc={rc}")
+        elif msg_type == "status":
+            self._log(f"[mqtt] status query {'sent' if ok else 'failed'} rc={rc}")
+        elif msg_type:
+            self._log(f"[mqtt] {msg_type} {'sent' if ok else 'failed'} rc={rc}")
 
     def _log(self, text: str) -> None:
         stamp = time.strftime("%H:%M:%S")

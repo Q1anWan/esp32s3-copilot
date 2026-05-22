@@ -65,8 +65,10 @@ class VoicePackage:
 def find_default_package_dir() -> Path | None:
     here = Path(__file__).resolve()
     candidates = [
+        here.parents[1] / "voice_package",
         here.parents[1] / "dist" / DEFAULT_PACKAGE_NAME,
         here.parents[2] / "silent_failure_tts" / "dist" / DEFAULT_PACKAGE_NAME,
+        Path.cwd() / "voice_package",
         Path.cwd() / "dist" / DEFAULT_PACKAGE_NAME,
     ]
     for path in candidates:

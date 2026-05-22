@@ -33,6 +33,7 @@ static bool s_mqtt_connected = false;
 static bool s_wifi_connected = false;
 static bool s_wifi_started = false;
 static int s_retry_num = 0;
+static int s_wifi_last_reason = 0;
 static copilot_mqtt_cmd_cb s_cmd_cb = nullptr;
 static esp_netif_t *s_netif_sta = nullptr;
 static bool s_voice_start_pending = false;
@@ -134,6 +135,28 @@ static void copilot_load_wifi_credentials(void) {
     if (s_wifi_ssid[0] != '\0') {
         ESP_LOGI(TAG, "WiFi credentials loaded from sdkconfig: %s", s_wifi_ssid);
     }
+}
+
+static bool copilot_read_saved_wifi_ssid(char *out, size_t out_len) {
+    if (!out || out_len == 0) {
+        return false;
+    }
+    out[0] = '\0';
+
+    nvs_handle_t handle = 0;
+    esp_err_t err = copilot_ensure_nvs() ? nvs_open(kWifiNvsNs, NVS_READONLY, &handle) : ESP_FAIL;
+    if (err != ESP_OK) {
+        return false;
+    }
+    size_t ssid_len = out_len;
+    err = nvs_get_str(handle, kWifiNvsSsid, out, &ssid_len);
+    nvs_close(handle);
+    if (err != ESP_OK || out[0] == '\0') {
+        out[0] = '\0';
+        return false;
+    }
+    out[out_len - 1] = '\0';
+    return true;
 }
 
 static bool copilot_is_valid_broker_uri(const char *broker_uri) {
@@ -299,12 +322,15 @@ static void copilot_wifi_event_handler(void *arg, esp_event_base_t event_base, i
 
     if (event_id == WIFI_EVENT_STA_START) {
         LOGI_MQTT( "WiFi start, connecting...");
+        s_wifi_last_reason = 0;
         esp_wifi_connect();
     } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
         LOGI_MQTT( "WiFi connected, waiting for IP...");
+        s_wifi_last_reason = 0;
     } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
-        ESP_LOGW(TAG, "WiFi disconnected, reason=%d", disc ? disc->reason : -1);
+        s_wifi_last_reason = disc ? disc->reason : -1;
+        ESP_LOGW(TAG, "WiFi disconnected, reason=%d", s_wifi_last_reason);
         s_wifi_connected = false;
         copilot_mqtt_stop_client("wifi_down");
         if (s_retry_num < kMaxRetry) {
@@ -566,6 +592,8 @@ bool copilot_mqtt_get_status(copilot_network_status_t *out_status) {
     memset(out_status, 0, sizeof(*out_status));
     out_status->wifi_started = s_wifi_started;
     out_status->wifi_connected = s_wifi_connected;
+    out_status->wifi_nvs_saved = copilot_read_saved_wifi_ssid(out_status->saved_ssid, sizeof(out_status->saved_ssid));
+    out_status->wifi_last_reason = s_wifi_last_reason;
     out_status->mqtt_started = s_mqtt_started;
     out_status->mqtt_connected = s_mqtt_connected;
     strncpy(out_status->ssid, s_wifi_ssid, sizeof(out_status->ssid) - 1);

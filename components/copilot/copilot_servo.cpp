@@ -29,7 +29,8 @@ static const char *TAG = "servo";
 // Smoothing
 #define SERVO_SMOOTH_ALPHA 0.30f
 #define SERVO_TASK_PERIOD_MS 20
-#define SERVO_TASK_STACK  2048
+#define SERVO_START_DELAY_MS 5000
+#define SERVO_TASK_STACK  4096
 #define SERVO_TASK_PRIO   (CONFIG_COPILOT_SERVO_TASK_PRIORITY)
 #define SERVO_TASK_CORE   (CONFIG_COPILOT_SERVO_TASK_CORE)
 
@@ -56,6 +57,8 @@ static float s_cur_pitch;
 static float s_cur_yaw;
 static uint16_t s_cur_pitch_us;
 static uint16_t s_cur_yaw_us;
+static StaticTask_t s_servo_task_tcb;
+static StackType_t s_servo_task_stack[SERVO_TASK_STACK];
 
 // Convert angle (degrees from center) to pulse width (microseconds)
 static uint16_t angle_to_pulse(const copilot_servo_ch_calib_t *ch, float angle_deg) {
@@ -85,10 +88,9 @@ static void servo_task(void *arg) {
     ESP_LOGI(TAG, "Servo task started (pitch=GPIO%d, yaw=GPIO%d, %dHz)",
              SERVO_PITCH_GPIO, SERVO_YAW_GPIO, SERVO_FREQ_HZ);
 
-    // Initial center
-    update_pwm(DEF_PULSE_CTR, DEF_PULSE_CTR);
-    s_cur_pitch_us = DEF_PULSE_CTR;
-    s_cur_yaw_us  = DEF_PULSE_CTR;
+    s_cur_pitch_us = 0;
+    s_cur_yaw_us = 0;
+    vTaskDelay(pdMS_TO_TICKS(SERVO_START_DELAY_MS));
 
     while (true) {
         float target_p = s_target_pitch;
@@ -162,7 +164,7 @@ void copilot_servo_init(void) {
         .channel    = SERVO_PITCH_CH,
         .intr_type  = LEDC_INTR_DISABLE,
         .timer_sel  = SERVO_LEDC_TIMER,
-        .duty       = pulse_to_duty(DEF_PULSE_CTR),
+        .duty       = 0,
         .hpoint     = 0,
         .flags      = { .output_invert = 0 },
     };
@@ -175,23 +177,24 @@ void copilot_servo_init(void) {
         .channel    = SERVO_YAW_CH,
         .intr_type  = LEDC_INTR_DISABLE,
         .timer_sel  = SERVO_LEDC_TIMER,
-        .duty       = pulse_to_duty(DEF_PULSE_CTR),
+        .duty       = 0,
         .hpoint     = 0,
         .flags      = { .output_invert = 0 },
     };
     ESP_ERROR_CHECK(ledc_channel_config(&ch_yaw));
 
     ESP_LOGI(TAG, "PWM initialized: timer=%d freq=%dHz duty_res=%d bits | "
-             "Pitch CH%d GPIO%d init_duty=%lu(%.1f°) | Yaw CH%d GPIO%d init_duty=%lu(%.1f°)",
+             "Pitch CH%d GPIO%d | Yaw CH%d GPIO%d | soft-start delay=%dms",
              SERVO_LEDC_TIMER, SERVO_FREQ_HZ, SERVO_DUTY_RES,
-             SERVO_PITCH_CH, SERVO_PITCH_GPIO, pulse_to_duty(DEF_PULSE_CTR), 0.0,
-             SERVO_YAW_CH, SERVO_YAW_GPIO, pulse_to_duty(DEF_PULSE_CTR), 0.0);
+             SERVO_PITCH_CH, SERVO_PITCH_GPIO,
+             SERVO_YAW_CH, SERVO_YAW_GPIO,
+             SERVO_START_DELAY_MS);
 
     // Start servo task
-    BaseType_t ret = xTaskCreatePinnedToCore(
+    TaskHandle_t handle = xTaskCreateStaticPinnedToCore(
         servo_task, "servo", SERVO_TASK_STACK, NULL,
-        SERVO_TASK_PRIO, NULL, SERVO_TASK_CORE);
-    if (ret != pdPASS) {
+        SERVO_TASK_PRIO, s_servo_task_stack, &s_servo_task_tcb, SERVO_TASK_CORE);
+    if (handle == nullptr) {
         ESP_LOGE(TAG, "Failed to create servo task");
     }
 }

@@ -42,13 +42,15 @@ static int copilot_normalize_core(int core) {
 // Audio output manager handles the codec now
 static QueueHandle_t s_audio_queue = nullptr;
 static TaskHandle_t s_audio_task = nullptr;
+static copilot_audio_file_event_cb_t s_file_event_cb = nullptr;
+static void *s_file_event_user = nullptr;
 
 // Sample rate must match audio_out (16kHz)
 static const int kSampleRate = 16000;
 
 #define AUDIO_TASK_STACK_BYTES (12 * 1024)
 #define AUDIO_SCENE_ID_MAX 32
-#define AUDIO_FILE_CHUNK_SAMPLES 512
+#define AUDIO_FILE_CHUNK_SAMPLES 128
 
 enum audio_req_kind_t {
     AUDIO_REQ_TONE = 0,
@@ -116,8 +118,29 @@ static void copilot_audio_set_error(const char *msg) {
     s_status.last_error[sizeof(s_status.last_error) - 1] = '\0';
 }
 
+static void copilot_audio_emit_file_event(copilot_audio_file_event_kind_t kind,
+                                          const audio_req_t &req) {
+    if (!s_file_event_cb) {
+        return;
+    }
+    copilot_audio_file_event_t event = {};
+    event.kind = kind;
+    event.generation = req.generation;
+    event.scene = req.scene;
+    event.sequence = req.sequence;
+    event.path = req.path;
+    event.error = s_status.last_error;
+    s_file_event_cb(&event, s_file_event_user);
+}
+
 static bool copilot_audio_mount_sd(void) {
     if (s_sd_mounted) {
+        return true;
+    }
+    if (bsp_sdcard) {
+        s_sd_mounted = true;
+        s_status.sd_mounted = true;
+        copilot_audio_set_error("");
         return true;
     }
 
@@ -331,9 +354,6 @@ static bool parse_wav_header(FILE *fp, wav_info_t *info) {
 static int16_t *copilot_audio_alloc_file_buffer(size_t bytes) {
     int16_t *buf = (int16_t *)heap_caps_aligned_alloc(512, bytes,
                                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-    if (!buf) {
-        buf = (int16_t *)heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
     return buf;
 }
 
@@ -539,6 +559,7 @@ static FILE *copilot_audio_open_file_with_retry(const char *path, int *out_errno
     errno = 0;
     FILE *fp = fopen(path, "rb");
     if (fp) {
+        setvbuf(fp, nullptr, _IONBF, 0);
         if (out_errno) {
             *out_errno = 0;
         }
@@ -551,6 +572,7 @@ static FILE *copilot_audio_open_file_with_retry(const char *path, int *out_errno
             errno = 0;
             fp = fopen(path, "rb");
             if (fp) {
+                setvbuf(fp, nullptr, _IONBF, 0);
                 ESP_LOGI(TAG, "SD file open recovered after remount: %s", path);
                 if (out_errno) {
                     *out_errno = 0;
@@ -585,6 +607,7 @@ static void copilot_audio_play_file(const audio_req_t &req) {
         return;
     }
     if (!copilot_audio_mount_sd()) {
+        copilot_audio_emit_file_event(COPILOT_AUDIO_FILE_FAILED, play_req);
         return;
     }
     if (copilot_audio_req_cancelled(generation)) {
@@ -593,6 +616,7 @@ static void copilot_audio_play_file(const audio_req_t &req) {
     if (!copilot_audio_out_acquire(AUDIO_SRC_FILE)) {
         copilot_audio_set_error("audio_output_busy");
         ESP_LOGW(TAG, "Audio output busy, skip file: %s", play_req.path);
+        copilot_audio_emit_file_event(COPILOT_AUDIO_FILE_FAILED, play_req);
         return;
     }
     if (copilot_audio_req_cancelled(generation)) {
@@ -614,6 +638,7 @@ static void copilot_audio_play_file(const audio_req_t &req) {
         ESP_LOGW(TAG, "Failed to open audio file %s (errno=%d)", play_req.path, open_errno);
         s_status.playing_file = false;
         copilot_audio_out_release(AUDIO_SRC_FILE);
+        copilot_audio_emit_file_event(COPILOT_AUDIO_FILE_FAILED, play_req);
         return;
     }
 
@@ -649,6 +674,9 @@ static void copilot_audio_play_file(const audio_req_t &req) {
         s_status.files_played++;
         copilot_audio_set_error("");
         ESP_LOGI(TAG, "SD audio done: %s", play_req.path);
+        copilot_audio_emit_file_event(COPILOT_AUDIO_FILE_DONE, play_req);
+    } else {
+        copilot_audio_emit_file_event(COPILOT_AUDIO_FILE_FAILED, play_req);
     }
 }
 
@@ -749,6 +777,11 @@ void copilot_audio_init(void) {
     }
 }
 
+void copilot_audio_set_file_event_callback(copilot_audio_file_event_cb_t cb, void *user) {
+    s_file_event_cb = cb;
+    s_file_event_user = user;
+}
+
 void copilot_audio_play(const char *sound_id) {
     if (!s_audio_queue) {
         return;
@@ -817,6 +850,9 @@ bool copilot_audio_is_ready(void) {
 bool copilot_audio_get_status(copilot_audio_status_t *out_status) {
     if (!out_status) {
         return false;
+    }
+    if (bsp_sdcard) {
+        s_sd_mounted = true;
     }
     s_status.ready = copilot_audio_is_ready();
     s_status.sd_mounted = s_sd_mounted;

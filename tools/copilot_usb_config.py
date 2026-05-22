@@ -124,7 +124,7 @@ def wait_ready(ser, seconds: float) -> list[str]:
         seen.extend(lines)
         if any("COPILOT_SERIAL ready" in line for line in lines):
             break
-        if not seen and time.time() - started >= 0.5:
+        if not seen and time.time() - started >= 1.0:
             break
     return seen
 
@@ -144,6 +144,47 @@ def request_status(ser, wait: float) -> tuple[dict | None, list[str]]:
     send_line(ser, "status")
     lines = read_lines(ser, wait)
     return extract_status(lines), lines
+
+
+def wait_status_response(ser, wait: float, timeout: float) -> dict | None:
+    deadline = time.time() + max(0.0, timeout)
+    last_status: dict | None = None
+    while time.time() < deadline:
+        status, _ = request_status(ser, wait)
+        if status:
+            return status
+        time.sleep(0.25)
+    return last_status
+
+
+def command_needs_json(ssid: str, password: str) -> bool:
+    return any(ch.isspace() for ch in ssid) or any(ch.isspace() for ch in password)
+
+
+def wifi_command_line(ssid: str, password: str) -> str:
+    if command_needs_json(ssid, password):
+        payload = {"type": "wifi", "ssid": ssid, "password": password}
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"wifi {ssid} {password}".rstrip()
+
+
+def command_accepted(lines: Iterable[str], command: str) -> bool:
+    if command.startswith("{"):
+        return any(line.startswith("COPILOT_OK json_accepted") for line in lines)
+    return any(line.startswith("COPILOT_OK wifi ") for line in lines)
+
+
+def send_wifi_with_retry(ser, ssid: str, password: str, wait: float, attempts: int = 3) -> bool:
+    command = wifi_command_line(ssid, password)
+    safe = command.replace(password, "***") if password else command
+    for idx in range(1, attempts + 1):
+        print(f"[usb] wifi attempt {idx}: {safe}")
+        send_line(ser, command)
+        lines = read_lines(ser, wait)
+        if command_accepted(lines, command):
+            return True
+        time.sleep(0.4)
+    return False
 
 
 def status_is_ready(status: dict | None, wait_wifi: bool) -> bool:
@@ -171,13 +212,20 @@ def cmd_wifi(args) -> None:
     ser, port = open_serial(args)
     print(f"[usb] opened {port} @ {args.baud}")
     wait_ready(ser, args.ready_timeout)
-    payload = {"type": "wifi", "ssid": args.ssid, "password": args.password or ""}
-    send_line(ser, json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-    read_lines(ser, args.wait)
+    wait_status_response(ser, args.wait, args.ready_timeout)
+    accepted = send_wifi_with_retry(ser, args.ssid, args.password or "", max(args.wait, 3.0))
+    if accepted:
+        print("[usb] WiFi credentials accepted; NVS/Flash save requested")
+    else:
+        print("[usb] WARNING: no WiFi ACK received before timeout", file=sys.stderr)
     status = poll_status(ser, args.wait, args.timeout, True)
     if status:
         wifi = status.get("wifi", {})
-        print(f"[status] connected={wifi.get('connected')} ip={wifi.get('ip')} tcp={status.get('tcp_host')}")
+        print(
+            f"[status] saved={wifi.get('saved')} ssid={wifi.get('ssid')} "
+            f"saved_ssid={wifi.get('saved_ssid')} connected={wifi.get('connected')} "
+            f"ip={wifi.get('ip')} tcp={status.get('tcp_host')}"
+        )
 
 
 def cmd_mqtt(args) -> None:

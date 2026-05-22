@@ -8,10 +8,10 @@ SILAB 数据包。
 
 | 序号 | 类型 | 文件 | 用途 |
 | --- | --- | --- | --- |
-| 1 | 程序 | `silab_mqtt_bridge_gui.py` | Bridge 可视化程序。接收 SILAB TCP 数据，控制 ESP32 播放/停止，显示 ESP32 状态 |
-| 2 | 程序 | `silab_tcp_simulator.py` | 模拟 SILAB 脚本。按固定频率发送 `trigger scene seq` 数据包 |
+| 1 | 程序 | `silab_mqtt_bridge_gui.py` | Bridge 可视化程序。接收 SILAB TCP 数据，控制 ESP32 播放/停止，显示 ESP32 状态，并可转发 HRT TCP Device 数据 |
+| 2 | 程序 | `silab_tcp_simulator.py` | 模拟 SILAB 脚本。按固定频率发送 `TRIGGER;TIME_LOW;TIME_HIGH;SCENE;SEQ;SPEED` 数据包 |
 | 3 | 程序 | `silab_tcp_probe.py` | SILAB 数据包测试脚本。接收真实 SILAB 数据并打印解析结果 |
-| 4 | INC | `NOMIRobotStart_ESP32.inc` | SILAB 参考设计。说明 SILAB 如何向 Bridge 发送场景和序号 |
+| 4 | INC | `NOMIRobotStart_ESP32.inc` / `NOMITimeBase.inc` | SILAB 参考设计。说明 SILAB 如何向 Bridge 发送时间戳、触发标记、场景和序号 |
 | 5 | 文档 | `WINDOWS_SILAB_BRIDGE_DEPLOYMENT.md` | 本中文部署文档 |
 
 注意：`silab_mqtt_bridge_gui.py` 和 `silab_tcp_probe.py` 都会监听 TCP
@@ -23,6 +23,7 @@ SILAB 数据包。
 ```text
 SILAB --网线局域网 A / TCP 7777--> Windows 实验主机
 Windows 实验主机 --WiFi 局域网 B / MQTT 1883 + TCP 7777--> ESP32
+Windows 实验主机 --TCP Device--> HRT Host
 ```
 
 Windows 实验主机有两个重要 IP：
@@ -183,7 +184,7 @@ ipconfig
 进入解压后的交付文件夹，打开 PowerShell，执行：
 
 ```powershell
-py -3 .\silab_mqtt_bridge_gui.py
+py -3 tools\silab_mqtt_bridge_gui.py
 ```
 
 GUI 打开后按下面步骤操作：
@@ -262,13 +263,19 @@ GUI 打开后按下面步骤操作：
 SILAB 发送格式：
 
 ```text
-trigger<TAB>scene<TAB>seq<LF>
+TRIGGER;TIME_LOW;TIME_HIGH;SCENE;SEQ;SPEED<LF>
 ```
 
-例子：
+其中 `TIME_LOW` 是 Unix 时间低 6 位，`TIME_HIGH` 是 `Unix 时间 / 100000` 后取整数。Bridge 拼接方式是：
 
 ```text
-1	1	1
+timestamp = TIME_HIGH * 100000 + (TIME_LOW % 100000)
+```
+
+`SPEED` 通常接 `VDyn.v_kmh`，用于 GUI、Probe 和 HRT 观察/状态判断。例子：
+
+```text
+1;235200;17792;1;1;1.2
 ```
 
 默认 `Aliases = 1=boot`，所以这条命令会播放：
@@ -284,6 +291,33 @@ trigger<TAB>scene<TAB>seq<LF>
 - SILAB 固定频率连续发送 `1` 时，不会重复播放。
 - 必须先回到 `0`，下一次 `1` 才会再次触发播放。
 
+## HRT TCP Device 转发
+
+如果需要把 SILAB 数据同步发给 HRT：
+
+1. 在 GUI 的 `HRT TCP Device` 区域填写：
+
+   ```text
+   HRT Host = HRT 所在主机 IP
+   HRT Port = HRT 监听端口，默认可填 9001
+   ```
+
+2. 勾选 `Forward SILAB samples to HRT`。
+
+3. 点击 `Connect HRT`。
+
+Bridge 会把每一条合法 SILAB 数据转成 HRT Device 文本：
+
+```text
+trigger,timestamp,scene,seq,speed;
+```
+
+例如：
+
+```text
+1,1779235200,boot,1,1.2;
+```
+
 ## 使用模拟 SILAB 脚本
 
 当没有 SILAB 硬件，或正式实验前要检查链路时使用。
@@ -294,7 +328,7 @@ trigger<TAB>scene<TAB>seq<LF>
 4. 另开一个 PowerShell，进入解压后的交付文件夹，执行：
 
    ```powershell
-   py -3 .\silab_tcp_simulator.py --host 127.0.0.1 --port 7777 --scene 1 --seq 1 --rate-hz 10 --pre-idle 1 --hold 2 --post-idle 1 --read-ack --verbose
+   py -3 tools\silab_tcp_simulator.py --host 127.0.0.1 --port 7777 --scene 1 --seq 1 --rate-hz 10 --pre-idle 1 --hold 2 --post-idle 1 --read-ack --verbose
    ```
 
 5. 如果模拟器不在同一台电脑上，把 `--host 127.0.0.1` 改成运行 Bridge GUI
@@ -304,7 +338,7 @@ GUI 日志里应该出现类似内容：
 
 ```text
 [silab] connected ...
-[silab] #... play trigger=1 scene=boot seq=1
+[silab] #... play ts=... trigger=1 scene=boot seq=1 hrt=...
 [direct] play boot/001 sent ...
 [esp32] screen speaking ...
 ```
@@ -318,7 +352,7 @@ GUI 日志里应该出现类似内容：
 2. 打开 PowerShell，进入解压后的交付文件夹，执行：
 
    ```powershell
-   py -3 .\silab_tcp_probe.py --host 0.0.0.0 --port 7777 --scene-aliases 1=boot --jsonl silab_probe_log.jsonl
+   py -3 tools\silab_tcp_probe.py --host 0.0.0.0 --port 7777 --scene-aliases 1=boot --jsonl silab_probe_log.jsonl
    ```
 
 3. 在 SILAB 里设置：

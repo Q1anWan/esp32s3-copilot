@@ -69,6 +69,11 @@ struct copilot_action_t {
     bool visual_semantic_content_present;
 };
 
+static void copilot_schedule_screen_state(copilot_screen_state_t state, copilot_screen_orientation_t orientation,
+                                          uint32_t duration_ms, const char *message_id,
+                                          bool calibration_content_present,
+                                          bool visual_semantic_content_present);
+
 static QueueHandle_t s_action_queue = nullptr;
 static TaskHandle_t s_action_task = nullptr;
 static volatile uint32_t s_action_generation = 1;
@@ -137,6 +142,25 @@ static void copilot_apply_screen_action(const copilot_action_t *action,
     event.visual_semantic_content_present = action->visual_semantic_content_present;
     copilot_ui_set_screen_event_async(&event);
     copilot_publish_screen_event(action, state);
+}
+
+static void copilot_audio_file_event_handler(const copilot_audio_file_event_t *event, void *user) {
+    (void)user;
+    if (!event) {
+        return;
+    }
+    ESP_LOGI(TAG, "SD audio event kind=%d scene=%s seq=%u path=%s error=%s",
+             (int)event->kind,
+             event->scene ? event->scene : "",
+             (unsigned)event->sequence,
+             event->path ? event->path : "",
+             event->error ? event->error : "");
+    copilot_schedule_screen_state(COPILOT_SCREEN_STATE_RETURN_NEUTRAL,
+                                  COPILOT_SCREEN_ORIENT_FRONT,
+                                  520,
+                                  "",
+                                  false,
+                                  false);
 }
 
 static uint32_t copilot_next_action_generation(void) {
@@ -210,7 +234,11 @@ static void copilot_action_task(void *arg) {
                 copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_SPEAKING,
                                             action.duration_ms > 0 ? action.duration_ms : 0);
                 LOGI_APP("Play scene audio scene=%s seq=%u", action.scene_id, (unsigned)action.sequence_id);
-                copilot_audio_play_scene(action.scene_id, action.sequence_id);
+                if (!copilot_audio_play_scene(action.scene_id, action.sequence_id)) {
+                    ESP_LOGW(TAG, "Scene audio queue failed: scene=%s seq=%u",
+                             action.scene_id, (unsigned)action.sequence_id);
+                    copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_RETURN_NEUTRAL, 520);
+                }
                 continue;
             } else if (action.prelight_ms > 0) {
                 copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_PRE_MESSAGE_ORIENT, action.prelight_ms + 150);
@@ -401,14 +429,12 @@ static void copilot_play_scene_sound_now(const char *scene_id, uint16_t sequence
     if (!copilot_audio_play_scene(action.scene_id, sequence_id)) {
         ESP_LOGW(TAG, "Scene audio immediate queue failed: scene=%s seq=%u",
                  action.scene_id, (unsigned)sequence_id);
+        action.screen_state = COPILOT_SCREEN_STATE_RETURN_NEUTRAL;
+        action.orientation = COPILOT_SCREEN_ORIENT_FRONT;
+        action.duration_ms = 520;
     }
     copilot_enqueue_action_front(&action);
 }
-
-static void copilot_schedule_screen_state(copilot_screen_state_t state, copilot_screen_orientation_t orientation,
-                                          uint32_t duration_ms, const char *message_id,
-                                          bool calibration_content_present,
-                                          bool visual_semantic_content_present);
 
 static void copilot_stop_audio_now(const char *message_id) {
     copilot_cancel_pending_actions();
@@ -1041,16 +1067,21 @@ bool copilot_app_format_status(char *out, unsigned out_len) {
     snprintf(out, out_len,
              "{\"type\":\"status\","
              "\"device_id\":\"%s\","
-             "\"wifi\":{\"started\":%s,\"connected\":%s,\"ssid\":\"%s\",\"ip\":\"%s\"},"
+             "\"wifi\":{\"started\":%s,\"connected\":%s,\"saved\":%s,\"last_reason\":%d,"
+             "\"ssid\":\"%s\",\"saved_ssid\":\"%s\",\"ip\":\"%s\"},"
              "\"mqtt\":{\"started\":%s,\"connected\":%s,\"broker\":\"%s\"},"
              "\"tcp_host\":\"%s\","
              "\"audio\":{\"ready\":%s,\"sd_mounted\":%s,\"playing_file\":%s,"
              "\"files_played\":%lu,\"current_path\":\"%s\",\"last_error\":\"%s\"},"
-             "\"heap\":{\"internal_free\":%lu,\"psram_free\":%lu}}",
+             "\"heap\":{\"internal_free\":%lu,\"dma_free\":%lu,\"dma_largest\":%lu,"
+             "\"psram_free\":%lu}}",
              net.device_id,
              net.wifi_started ? "true" : "false",
              net.wifi_connected ? "true" : "false",
+             net.wifi_nvs_saved ? "true" : "false",
+             net.wifi_last_reason,
              net.ssid,
+             net.saved_ssid,
              net.ip,
              net.mqtt_started ? "true" : "false",
              net.mqtt_connected ? "true" : "false",
@@ -1063,6 +1094,8 @@ bool copilot_app_format_status(char *out, unsigned out_len) {
              audio.current_path,
              audio.last_error,
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
              (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     return true;
 }
@@ -1071,6 +1104,7 @@ void copilot_app_init(void) {
     LOGI_APP( "Init copilot app");
     copilot_perf_init();
     copilot_audio_init();
+    copilot_audio_set_file_event_callback(copilot_audio_file_event_handler, nullptr);
     copilot_imu_init();
 
     // Initialize voice module (session will start after WiFi connects)

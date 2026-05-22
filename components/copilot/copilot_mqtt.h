@@ -13,9 +13,12 @@ typedef void (*copilot_mqtt_cmd_cb)(const char *topic, const char *payload, int 
 typedef struct {
     bool wifi_started;
     bool wifi_connected;
+    bool wifi_nvs_saved;
     bool mqtt_started;
     bool mqtt_connected;
+    int wifi_last_reason;
     char ssid[33];
+    char saved_ssid[33];
     char ip[16];
     char mqtt_broker_uri[128];
     char device_id[32];

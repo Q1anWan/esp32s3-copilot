@@ -1,0 +1,4 @@
+# Python 3.9+ is recommended.
+# The dual TCP host simulator, voice-package loader, and logic decision
+# simulator use only the Python standard library.
+# No third-party packages are required.

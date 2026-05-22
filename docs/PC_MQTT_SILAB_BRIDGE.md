@@ -4,6 +4,7 @@
 
 ```text
 SILAB --Ethernet LAN A/TCP--> Experiment PC --WiFi LAN B/direct TCP play + MQTT status--> ESP32
+                                  └-- TCP device packet --> HRT
 ```
 
 The experiment PC is the stable protocol boundary:
@@ -11,6 +12,7 @@ The experiment PC is the stable protocol boundary:
 - Mosquitto MQTT broker listens on `0.0.0.0:1883` and is reachable from WiFi LAN B for status and fallback control.
 - `tools/silab_mqtt_bridge_gui.py` listens as the TCP host for SILAB on LAN A.
 - The GUI forwards only trigger rising edges to ESP32, using ESP32 direct TCP first and MQTT only as fallback.
+- The GUI forwards every valid SILAB sample to HRT as a TCP device packet when HRT host/port is configured.
 - ESP32 still reports status over MQTT, so the GUI can discover the ESP32 IP and monitor TF/audio state.
 
 ## SILAB Packet
@@ -18,7 +20,7 @@ The experiment PC is the stable protocol boundary:
 SILAB sends one text line per sample:
 
 ```text
-trigger<TAB>scene<TAB>seq<LF>
+TRIGGER;TIME_LOW;TIME_HIGH;SCENE;SEQ;SPEED<LF>
 ```
 
 Rules:
@@ -26,6 +28,11 @@ Rules:
 - `trigger >= 0.5` is active.
 - Playback happens only on a `0 -> 1` rising edge.
 - Continuous fixed-rate `trigger=1` packets are ignored until a `trigger=0` packet resets the latch.
+- `TIME_LOW` is the low 6 digits of Unix time.
+- `TIME_HIGH` is `floor(unix_time / 100000)`.
+- The bridge reconstructs `timestamp = TIME_HIGH * 100000 + (TIME_LOW % 100000)`.
+- `SPEED` is displayed for observation/debug and forwarded to HRT.
+- HRT forwarding is not edge-triggered; every valid SILAB sample is sent as `trigger,timestamp,scene,seq,speed;`.
 - Numeric scene IDs first use GUI aliases, then fall back to the GUI prefix.
   The default alias is `1=boot` so the current TF-card test file
   `/sdcard/audio/boot/001.wav` works immediately. Without an alias, `1` maps
@@ -34,7 +41,7 @@ Rules:
 Example:
 
 ```text
-1	1	1
+1;235200;17792;1;1;1.2
 ```
 
 The GUI forwards this play payload over ESP32 direct TCP by default:
@@ -85,7 +92,8 @@ In the GUI:
 6. Wait for ESP32 status; the GUI auto-fills `ESP Host` from `tcp_host` or WiFi IP.
 7. Keep `Direct ESP TCP` enabled for low-latency playback.
 8. Press `Start TCP Host` and set SILAB `Destination_IP` to the experiment PC Ethernet LAN A IP.
-9. Keep `Aliases = 1=boot` for the current TF-card test audio. For formal
+9. If HRT is used, set `HRT Host` and `HRT Port`, check `Forward SILAB samples to HRT`, then press `Connect HRT`.
+10. Keep `Aliases = 1=boot` for the current TF-card test audio. For formal
    multi-scene audio, copy files such as `/sdcard/audio/scene001/001.wav` and
    clear or edit the alias field.
 

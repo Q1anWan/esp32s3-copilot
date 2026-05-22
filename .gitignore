@@ -1,6 +1,7 @@
 # Build output
 build/
 build_codex_*/
+dist/
 
 # Python cache
 __pycache__/
@@ -37,6 +38,20 @@ Thumbs.db
 
 # Debug files
 *.log
+
+# Local secrets
+.env
+api_key.md
+**/api_key.md
+*.local.json
+config/*.local.json
+tools/voice_backend/config.local.yaml
+
+# Generated or local audio assets
+*.wav
+*.mp3
+*.pcm
+*.zip
 
 # Audio recordings (debug output)
 tools/voice_backend/audio_recordings/

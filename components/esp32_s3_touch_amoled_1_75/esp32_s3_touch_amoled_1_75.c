@@ -159,6 +159,10 @@ esp_err_t bsp_spiffs_unmount(void)
 
 esp_err_t bsp_sdcard_mount(void)
 {
+    if (bsp_sdcard) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     esp_io_expander_handle_t expander = bsp_io_expander_init();
     if (expander) {
         const uint32_t sd_power_pins = IO_EXPANDER_PIN_NUM_0 |
@@ -188,25 +192,18 @@ esp_err_t bsp_sdcard_mount(void)
         .max_files = 5,
         .allocation_unit_size = 16 * 1024};
 
-    const sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    const sdmmc_slot_config_t slot_config = {
-        .clk = BSP_SD_CLK,
-        .cmd = BSP_SD_CMD,
-        .d0 = BSP_SD_D0,
-        .d1 = GPIO_NUM_NC,
-        .d2 = GPIO_NUM_NC,
-        .d3 = GPIO_NUM_NC,
-        .d4 = GPIO_NUM_NC,
-        .d5 = GPIO_NUM_NC,
-        .d6 = GPIO_NUM_NC,
-        .d7 = GPIO_NUM_NC,
-        .cd = SDMMC_SLOT_NO_CD,
-        .wp = SDMMC_SLOT_NO_WP,
-        .width = 1,
-        .flags = 0,
-    };
+    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot_config.clk = BSP_SD_CLK;
+    slot_config.cmd = BSP_SD_CMD;
+    slot_config.d0 = BSP_SD_D0;
+    slot_config.d1 = GPIO_NUM_NC;
+    slot_config.d2 = GPIO_NUM_NC;
+    slot_config.d3 = GPIO_NUM_NC;
+    slot_config.width = 1;
+    slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
 
-#if !CONFIG_FATFS_LONG_FILENAMES
+#if !CONFIG_FATFS_LFN_HEAP && !CONFIG_FATFS_LFN_STACK
     ESP_LOGW(TAG, "Warning: Long filenames on SD card are disabled in menuconfig!");
 #endif
 

@@ -33,15 +33,21 @@ static const char *TAG = "copilot_ui";
 #define FACE_BOX_X (((LCD_H_RES - FACE_BOX_SIZE) / 2) + UI_OFFSET_X)
 #define FACE_BOX_Y (((LCD_V_RES - FACE_BOX_SIZE) / 2) + UI_OFFSET_Y)
 
-#define RING_SIZE ((LCD_H_RES * 94) / 100)
-#define RING_X (((LCD_H_RES - RING_SIZE) / 2) + UI_OFFSET_X)
-#define RING_Y (((LCD_V_RES - RING_SIZE) / 2) + UI_OFFSET_Y)
-#define RING_SEGMENTS 60
-#define RING_POINTS (RING_SEGMENTS + 1)
-#define RING_OUTER_WIDTH 14
-#define RING_INNER_WIDTH 7
+/*
+ * Speaking indicator: a large square-line halo around the face, placed inside
+ * the circular screen's safe center area. It uses only a few line points and
+ * switches instantly to avoid per-frame opacity redraws while audio is playing.
+ */
+#define RING_SIZE ((LCD_H_RES * 68) / 100)
+#define RING_X ((LCD_H_RES - RING_SIZE) / 2)
+#define RING_Y ((LCD_V_RES - RING_SIZE) / 2)
+#define RING_POINTS 5
+#define RING_OUTER_WIDTH 7
+#define RING_INNER_WIDTH 3
+#define RING_OPA 255
 
 #define ANIM_TIMER_MS 16
+#define UI_ASYNC_LOCK_MS 1000
 #define TOUCH_FLASH_MS  180
 #define SPEAKING_HOLD_MS 120
 
@@ -161,8 +167,10 @@ struct copilot_ui_state_t {
 
     lv_timer_t *anim_timer;
     bool ring_visible;
+    bool ring_objects_visible;
     uint8_t ring_opa_current;
     uint8_t ring_opa_target;
+    uint8_t ring_opa_applied;
     bool ready;
     uint32_t last_touch_ms;
     bool touch_flash_active;
@@ -191,6 +199,11 @@ struct copilot_ui_state_t {
     uint32_t last_idle_pose_bucket;
     uint32_t last_servo_update_ms;
     int16_t last_servo_angle;
+    int16_t servo_idle_pitch;
+    int16_t servo_idle_yaw;
+    int16_t servo_idle_pitch_target;
+    int16_t servo_idle_yaw_target;
+    uint32_t servo_idle_next_ms;
 };
 
 static copilot_ui_state_t s_ui = {};
@@ -334,24 +347,23 @@ static void copilot_log_screen_event(const char *phase) {
              ASSET_VERSION_HASH);
 }
 
-static void copilot_build_ring_points(lv_point_precise_t *pts, int16_t radius) {
-    if (!pts || radius <= 0) return;
-    const int16_t cx = (int16_t)(RING_SIZE / 2);
-    const int16_t cy = (int16_t)(RING_SIZE / 2);
-    for (int i = 0; i <= RING_SEGMENTS; ++i) {
-        int16_t angle = (int16_t)((360 * i) / RING_SEGMENTS);
-        int32_t cos_v = lv_trigo_cos(angle);
-        int32_t sin_v = lv_trigo_sin(angle);
-        pts[i].x = (lv_coord_t)((int32_t)cx + (((int32_t)radius * cos_v) >> LV_TRIGO_SHIFT));
-        pts[i].y = (lv_coord_t)((int32_t)cy + (((int32_t)radius * sin_v) >> LV_TRIGO_SHIFT));
-    }
+static void copilot_build_ring_points(lv_point_precise_t *pts, int16_t inset) {
+    if (!pts) return;
+    inset = copilot_clamp_i16(inset, 1, (RING_SIZE / 2) - 1);
+    const int16_t hi = (int16_t)(RING_SIZE - inset);
+
+    pts[0].x = inset; pts[0].y = inset;
+    pts[1].x = hi;    pts[1].y = inset;
+    pts[2].x = hi;    pts[2].y = hi;
+    pts[3].x = inset; pts[3].y = hi;
+    pts[4].x = inset; pts[4].y = inset;
 }
 
 static void copilot_line_style(lv_obj_t *line, lv_color_t color, uint8_t width) {
     lv_obj_set_style_line_width(line, width, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_line_color(line, color, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_line_opa(line, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_line_rounded(line, false, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_line_rounded(line, true, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(line, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(line, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
@@ -380,6 +392,29 @@ static void copilot_blob_outline(lv_obj_t *obj, lv_color_t fill, lv_color_t bord
 
 static void copilot_ring_set_opa(lv_obj_t *line, lv_opa_t opa) {
     lv_obj_set_style_line_opa(line, opa, LV_PART_MAIN | LV_STATE_DEFAULT);
+}
+
+static void copilot_ring_set_visible(bool visible) {
+    if (s_ui.ring_objects_visible == visible) {
+        return;
+    }
+    s_ui.ring_objects_visible = visible;
+    if (visible) {
+        lv_obj_clear_flag(s_ui.ring_outer, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_ui.ring_inner, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_ui.ring_outer, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_ui.ring_inner, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void copilot_ring_apply_opa(uint8_t opa) {
+    if (s_ui.ring_opa_applied == opa) {
+        return;
+    }
+    s_ui.ring_opa_applied = opa;
+    copilot_ring_set_opa(s_ui.ring_outer, (lv_opa_t)opa);
+    copilot_ring_set_opa(s_ui.ring_inner, (lv_opa_t)opa);
 }
 
 static bool copilot_voice_speaking(uint32_t now) {
@@ -525,6 +560,36 @@ static bool copilot_update_motion(void) {
     if (changed) copilot_apply_motion_transform();
     return changed;
 }
+
+#if CONFIG_COPILOT_SERVO_ENABLE
+static void copilot_update_servo_idle_motion(uint32_t now, bool speaking) {
+    if (speaking) {
+        s_ui.servo_idle_pitch_target = 0;
+        s_ui.servo_idle_yaw_target = 0;
+        s_ui.servo_idle_next_ms = now + 260;
+    } else if (s_ui.servo_idle_next_ms == 0 || now >= s_ui.servo_idle_next_ms) {
+        uint32_t r = copilot_eye_rand(now + 0x314159u);
+        bool settle = (r % 6u) == 0u;
+        int16_t yaw_deg = (int16_t)((int16_t)((r >> 8) % 21u) - 10);
+        int16_t pitch_deg = (int16_t)((int16_t)((r >> 17) % 11u) - 5);
+        if (settle) {
+            yaw_deg = 0;
+            pitch_deg = 0;
+        }
+        s_ui.servo_idle_yaw_target = (int16_t)(yaw_deg << FP_SHIFT);
+        s_ui.servo_idle_pitch_target = (int16_t)(pitch_deg << FP_SHIFT);
+        s_ui.servo_idle_next_ms = now + 320 + ((r >> 24) % 820u);
+    }
+
+    uint8_t alpha = speaking ? 74 : 34;
+    s_ui.servo_idle_pitch = copilot_approach_i16(s_ui.servo_idle_pitch,
+                                                 s_ui.servo_idle_pitch_target,
+                                                 alpha);
+    s_ui.servo_idle_yaw = copilot_approach_i16(s_ui.servo_idle_yaw,
+                                               s_ui.servo_idle_yaw_target,
+                                               alpha);
+}
+#endif
 
 /*
  * 3D face renderer — rich grayscale cartoon with depth shading.
@@ -721,12 +786,17 @@ static void copilot_apply_head(uint32_t now, bool speaking) {
 
 #if CONFIG_COPILOT_SERVO_ENABLE
     if (!copilot_servo_get_manual()) {
-        // Drive servos only from the stable orienting cue, never from mouth motion.
+        copilot_update_servo_idle_motion(now, speaking);
+        // Drive servos from the stable head cue plus small idle wandering,
+        // never from mouth motion.
         float face_deg = (float)s_ui.face_angle / 256.0f;  // Q8.8 -> degrees
-        float yaw_s   = face_deg   * (CONFIG_COPILOT_SERVO_YAW_SCALE   / 100.0f);
+        float pitch_idle = (float)s_ui.servo_idle_pitch / 256.0f;
+        float yaw_idle = (float)s_ui.servo_idle_yaw / 256.0f;
+        float pitch_s = pitch_idle * (CONFIG_COPILOT_SERVO_PITCH_SCALE / 100.0f);
+        float yaw_s = (face_deg + yaw_idle) * (CONFIG_COPILOT_SERVO_YAW_SCALE / 100.0f);
         if ((now - s_ui.last_servo_update_ms) >= 60 ||
             copilot_abs_i16((int16_t)(s_ui.face_angle - s_ui.last_servo_angle)) > (1 << FP_SHIFT)) {
-            copilot_servo_set_target(0.0f, yaw_s);
+            copilot_servo_set_target(pitch_s, yaw_s);
             s_ui.last_servo_update_ms = now;
             s_ui.last_servo_angle = s_ui.face_angle;
         }
@@ -735,27 +805,16 @@ static void copilot_apply_head(uint32_t now, bool speaking) {
 }
 
 static void copilot_update_ring(void) {
-    uint8_t target = s_ui.ring_opa_target;
-    int16_t delta = (int16_t)target - (int16_t)s_ui.ring_opa_current;
-    if (delta != 0) {
-        int16_t step = (delta * 54) >> 8;
-        if (step == 0) {
-            step = delta > 0 ? 1 : -1;
-        }
-        s_ui.ring_opa_current = (uint8_t)((int16_t)s_ui.ring_opa_current + step);
-    }
-
-    if (s_ui.ring_opa_current > 2) {
-        lv_obj_clear_flag(s_ui.ring_outer, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(s_ui.ring_inner, LV_OBJ_FLAG_HIDDEN);
-        copilot_ring_set_opa(s_ui.ring_outer, (lv_opa_t)((s_ui.ring_opa_current * 3) / 5));
-        copilot_ring_set_opa(s_ui.ring_inner, (lv_opa_t)s_ui.ring_opa_current);
-    } else if (s_ui.ring_opa_target == 0) {
+    if (s_ui.ring_visible) {
+        copilot_ring_set_visible(true);
+        copilot_ring_apply_opa(RING_OPA);
+        s_ui.ring_opa_current = RING_OPA;
+        s_ui.ring_opa_target = RING_OPA;
+    } else {
         s_ui.ring_opa_current = 0;
-        copilot_ring_set_opa(s_ui.ring_outer, 0);
-        copilot_ring_set_opa(s_ui.ring_inner, 0);
-        lv_obj_add_flag(s_ui.ring_outer, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(s_ui.ring_inner, LV_OBJ_FLAG_HIDDEN);
+        s_ui.ring_opa_target = 0;
+        copilot_ring_apply_opa(0);
+        copilot_ring_set_visible(false);
     }
 }
 
@@ -892,9 +951,8 @@ void copilot_ui_init(lv_obj_t *root) {
     lv_obj_set_style_bg_opa(s_ui.root, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_border_width(s_ui.root, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
 
-    int16_t outer_radius = (int16_t)((RING_SIZE / 2) - (RING_OUTER_WIDTH / 2));
-    copilot_build_ring_points(s_ring_outer_pts, outer_radius);
-    copilot_build_ring_points(s_ring_inner_pts, outer_radius);
+    copilot_build_ring_points(s_ring_outer_pts, (int16_t)(RING_OUTER_WIDTH / 2 + 1));
+    copilot_build_ring_points(s_ring_inner_pts, (int16_t)(RING_OUTER_WIDTH + 8));
 
     s_ui.ring_outer = lv_line_create(s_ui.root);
     lv_obj_set_size(s_ui.ring_outer, RING_SIZE, RING_SIZE);
@@ -911,6 +969,8 @@ void copilot_ui_init(lv_obj_t *root) {
     copilot_line_style(s_ui.ring_inner, lv_color_hex(0x61E6FF), RING_INNER_WIDTH);
     lv_obj_add_flag(s_ui.ring_inner, LV_OBJ_FLAG_HIDDEN);
     copilot_ring_set_opa(s_ui.ring_inner, 0);
+    s_ui.ring_objects_visible = false;
+    s_ui.ring_opa_applied = 0;
 
     s_ui.face_root = lv_obj_create(s_ui.root);
     lv_obj_set_size(s_ui.face_root, FACE_BOX_SIZE, FACE_BOX_SIZE);
@@ -976,6 +1036,8 @@ void copilot_ui_init(lv_obj_t *root) {
     s_ui.screen_state_started_ms = lv_tick_get();
     s_ui.message_id[0] = '\0';
     copilot_apply_head(lv_tick_get(), false);
+    lv_obj_move_foreground(s_ui.ring_outer);
+    lv_obj_move_foreground(s_ui.ring_inner);
 
     s_ui.anim_timer = lv_timer_create(copilot_anim_timer, ANIM_TIMER_MS, nullptr);
     s_ui.ready = true;
@@ -1093,11 +1155,15 @@ void copilot_ui_ring_show(bool on) {
         s_ui.touch_flash_owns_ring = false;
     if (on == s_ui.ring_visible) return;
     s_ui.ring_visible = on;
-    s_ui.ring_opa_target = on ? 180 : 0;
+    s_ui.ring_opa_current = on ? RING_OPA : 0;
+    s_ui.ring_opa_target = s_ui.ring_opa_current;
     LOGI_UI("Ring show=%s", on ? "on" : "off");
     if (on) {
-        lv_obj_clear_flag(s_ui.ring_outer, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_clear_flag(s_ui.ring_inner, LV_OBJ_FLAG_HIDDEN);
+        copilot_ring_set_visible(true);
+        copilot_ring_apply_opa(RING_OPA);
+    } else {
+        copilot_ring_apply_opa(0);
+        copilot_ring_set_visible(false);
     }
 }
 
@@ -1115,24 +1181,32 @@ void copilot_ui_on_touch(uint16_t x, uint16_t y) {
     }
 }
 
+static bool copilot_ui_lock_async(const char *op) {
+    if (bsp_display_lock(UI_ASYNC_LOCK_MS)) {
+        return true;
+    }
+    ESP_LOGW(TAG, "LVGL lock timeout while applying %s", op ? op : "ui event");
+    return false;
+}
+
 void copilot_ui_set_screen_event_async(const copilot_screen_event_t *event) {
     if (!s_ui.ready || !event) return;
-    if (bsp_display_lock(100)) { copilot_ui_set_screen_event(event); bsp_display_unlock(); }
+    if (copilot_ui_lock_async("screen event")) { copilot_ui_set_screen_event(event); bsp_display_unlock(); }
 }
 
 void copilot_ui_set_expression_async(copilot_expr_t expr, uint32_t duration_ms) {
     if (!s_ui.ready) return;
-    if (bsp_display_lock(100)) { copilot_ui_set_expression(expr, duration_ms); bsp_display_unlock(); }
+    if (copilot_ui_lock_async("expression")) { copilot_ui_set_expression(expr, duration_ms); bsp_display_unlock(); }
 }
 
 void copilot_ui_set_motion_async(const copilot_motion_t *motion) {
     if (!s_ui.ready || !motion) return;
-    if (bsp_display_lock(100)) { copilot_ui_set_motion(motion); bsp_display_unlock(); }
+    if (copilot_ui_lock_async("motion")) { copilot_ui_set_motion(motion); bsp_display_unlock(); }
 }
 
 void copilot_ui_set_motion_only_async(const copilot_motion_t *motion) {
     if (!s_ui.ready || !motion) return;
-    if (bsp_display_lock(100)) {
+    if (copilot_ui_lock_async("motion-only")) {
         s_ui.motion_target = *motion;
         ESP_LOGD(TAG, "Motion only ax=%d ay=%d yaw=%d (Q8.8)",
                  motion->ax, motion->ay, motion->yaw_deg);
@@ -1142,5 +1216,5 @@ void copilot_ui_set_motion_only_async(const copilot_motion_t *motion) {
 
 void copilot_ui_ring_show_async(bool on) {
     if (!s_ui.ready) return;
-    if (bsp_display_lock(100)) { copilot_ui_ring_show(on); bsp_display_unlock(); }
+    if (copilot_ui_lock_async("ring")) { copilot_ui_ring_show(on); bsp_display_unlock(); }
 }

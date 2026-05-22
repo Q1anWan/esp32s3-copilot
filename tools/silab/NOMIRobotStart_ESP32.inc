@@ -1,28 +1,30 @@
-# NOMI-like desktop robot audio trigger for Copilot PC bridge
+# NOMI-like desktop robot audio trigger for Copilot PC bridge + HRT
 #
-# Interface contract:
-# - SILAB acts as TCP client.
-# - The experiment PC bridge GUI acts as TCP host/server.
-# - The PC forwards accepted trigger events to ESP32 over direct TCP.
-# - MQTT is used by the bridge GUI for ESP32 status and fallback control.
-# - Every packet is one UTF-8/ASCII text line:
-#     trigger<TAB>scene<TAB>seq<LF>
+# SILAB sends one text line per fixed-rate sample:
+#   TRIGGER;TIME_LOW;TIME_HIGH;SCENE;SEQ;SPEED<LF>
 #
-# Fixed-rate sending is OK. ESP32 plays only on the rising edge:
-# - trigger 0: idle/reset latch
-# - trigger 1: play once
-# - trigger 1 repeated: ignored until trigger returns to 0
+# Field definition:
+# - TRIGGER:   1 while active, 0 while idle.
+# - TIME_LOW:  Low 6 digits of Unix time.
+# - TIME_HIGH: floor(Unix time / 100000). The bridge uses integer/floor.
+# - SCENE:     Audio scene ID.
+# - SEQ:       Audio sequence ID.
+# - SPEED:     VDyn.v_kmh, used by the experimenter for observation/debug.
 #
-# Numeric scene IDs are mapped by the PC bridge GUI:
-# - default GUI alias scene=1, seq=1 -> /sdcard/audio/boot/001.wav
-# - without aliases, scene=1, seq=1 -> /sdcard/audio/scene001/001.wav
-# - without aliases, scene=2, seq=5 -> /sdcard/audio/scene002/005.wav
+# The bridge reconstructs:
+#   unix_time = TIME_HIGH * 100000 + (TIME_LOW % 100000)
+#
+# The bridge forwards accepted trigger rising edges to ESP32.
+# The bridge forwards every valid sample to HRT as:
+#   unix_time,trigger,scene,seq,speed;
 #
 # Before running:
+# - Copy NOMITimeBase.inc next to this file or into SILAB's system include path.
+# - Update NOMITimeBase.inc before the experiment day.
 # - Change Destination_IP to the experiment PC Ethernet LAN A IP.
-# - Keep Destination_Port aligned with the bridge GUI TCP port.
-# - Replace the AudioSceneId/AudioSeqId placeholder sources with constant
-#   outputs in your SILAB project if the exact DPUConstant syntax differs.
+# - Keep Destination_Port aligned with the bridge GUI SILAB TCP port.
+
+include system\NOMITimeBase.inc
 
 DPUComparator NOMIStartTrigger
 {
@@ -36,7 +38,7 @@ DPUComparator NOMIStartTrigger
 
 # Reference constant blocks for the audio ID. If your SILAB version names
 # constant blocks differently, keep the DataStreamSender and connect equivalent
-# constant signals to DataPort2 and DataPort3.
+# constant signals to DataPort4 and DataPort5.
 DPUConstant AudioSceneId
 {
     Computer = {OPERATOR};
@@ -60,7 +62,7 @@ DPUDataStreamSender NOMIAudioSender
     Destination_IP = "192.168.1.100";
     Destination_Port = 7777;
 
-    UsedDataPorts = 3;
+    UsedDataPorts = 6;
     Version = 3.0;
     TCPMode = 1;
 
@@ -70,14 +72,25 @@ DPUDataStreamSender NOMIAudioSender
 
 Connections =
 {
+    ~SystemTime.unixtime -> NOMITimeLow6.In,
+    ~SystemTime.unixtime -> NOMITimeHigh100000.In,
     VDyn.v_kmh -> NOMIStartTrigger.In,
 
     # Field 1: trigger flag.
     NOMIStartTrigger.Greater -> NOMIAudioSender.DataPort1,
 
-    # Field 2: scene ID. GUI default alias maps 1 to /sdcard/audio/boot/.
-    AudioSceneId.Out -> NOMIAudioSender.DataPort2,
+    # Field 2: low 6 digits of Unix timestamp.
+    NOMITimeLow6.Out -> NOMIAudioSender.DataPort2,
 
-    # Field 3: sequence ID. 1 means 001.wav.
-    AudioSeqId.Out -> NOMIAudioSender.DataPort3
+    # Field 3: Unix timestamp / 100000. The bridge floors this value.
+    NOMITimeHigh100000.Out -> NOMIAudioSender.DataPort3,
+
+    # Field 4: scene ID. GUI default alias maps 1 to /sdcard/audio/boot/.
+    AudioSceneId.Out -> NOMIAudioSender.DataPort4,
+
+    # Field 5: sequence ID. 1 means 001.wav.
+    AudioSeqId.Out -> NOMIAudioSender.DataPort5,
+
+    # Field 6: speed in km/h for observation/status/debug.
+    VDyn.v_kmh -> NOMIAudioSender.DataPort6
 };

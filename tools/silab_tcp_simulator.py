@@ -10,7 +10,7 @@ MQTT is still used by the GUI for ESP32 status and as a playback fallback.
 
 Default packet format, one line per fixed-rate sample:
 
-  trigger<TAB>scene<TAB>seq<LF>
+  trigger;time_low;time_high;scene;seq;speed<LF>
 
 The bridge should play only when trigger rises from 0 to 1. Repeated trigger=1
 samples are intentionally sent so the edge latch can be tested.
@@ -32,12 +32,31 @@ class Sample:
     trigger: float
     scene: str
     seq: int
+    speed: float
 
-    def line(self, delimiter: str) -> str:
-        return f"{self.trigger:g}{delimiter}{self.scene}{delimiter}{self.seq}\n"
+    def line(self, delimiter: str, timestamp_mode: str, timestamp: float) -> str:
+        ts_int = int(timestamp)
+        if timestamp_mode == "silab":
+            time_low = ts_int % 1_000_000
+            time_high = ts_int // 100_000
+            return (
+                f"{self.trigger:g}{delimiter}{time_low}{delimiter}{time_high}{delimiter}"
+                f"{self.scene}{delimiter}{self.seq}{delimiter}{self.speed:g}\n"
+            )
+        if timestamp_mode == "none":
+            prefix = ""
+        elif timestamp_mode == "full":
+            prefix = f"{timestamp:.3f}".rstrip("0").rstrip(".") + delimiter
+        elif timestamp_mode == "split5":
+            prefix = f"{ts_int // 100000}{delimiter}{ts_int % 100000}{delimiter}"
+        elif timestamp_mode == "split10000":
+            prefix = f"{ts_int // 10000}{delimiter}{ts_int % 100000}{delimiter}"
+        else:
+            raise ValueError(f"unknown timestamp mode {timestamp_mode!r}")
+        return f"{prefix}{self.trigger:g}{delimiter}{self.scene}{delimiter}{self.seq}\n"
 
 
-def parse_pattern(text: str, scene: str, seq: int) -> list[tuple[float, Sample]]:
+def parse_pattern(text: str, scene: str, seq: int, idle_speed: float, active_speed: float) -> list[tuple[float, Sample]]:
     """Parse a compact pattern string.
 
     Format:
@@ -59,15 +78,16 @@ def parse_pattern(text: str, scene: str, seq: int) -> list[tuple[float, Sample]]
         seconds = float(seconds_text.strip())
         if seconds < 0:
             raise ValueError("Pattern seconds must be >= 0")
-        steps.append((seconds, Sample(trigger=trigger, scene=scene, seq=seq)))
+        speed = active_speed if trigger >= 0.5 else idle_speed
+        steps.append((seconds, Sample(trigger=trigger, scene=scene, seq=seq, speed=speed)))
     if not steps:
         raise ValueError("Pattern is empty")
     return steps
 
 
 def default_steps(args: argparse.Namespace) -> list[tuple[float, Sample]]:
-    idle = Sample(trigger=args.idle_trigger, scene=args.scene, seq=args.seq)
-    active = Sample(trigger=args.active_trigger, scene=args.scene, seq=args.seq)
+    idle = Sample(trigger=args.idle_trigger, scene=args.scene, seq=args.seq, speed=args.idle_speed)
+    active = Sample(trigger=args.active_trigger, scene=args.scene, seq=args.seq, speed=args.active_speed)
     return [
         (args.pre_idle, idle),
         (args.hold, active),
@@ -113,7 +133,7 @@ def send_samples(sock: socket.socket, args: argparse.Namespace, samples: list[Sa
     period_s = 1.0 / args.rate_hz
     ack_buffer = bytearray()
     for index, sample in enumerate(samples, start=1):
-        line = sample.line(args.delimiter)
+        line = sample.line(args.delimiter, args.timestamp_mode, time.time())
         raw = line.encode("utf-8")
         send_t = time.monotonic()
         sock.sendall(raw)
@@ -150,23 +170,26 @@ def run(args: argparse.Namespace) -> None:
         args.delimiter = " "
     elif delimiter == "comma":
         args.delimiter = ","
+    elif delimiter in ("semicolon", ";"):
+        args.delimiter = ";"
 
     if args.seq < 1 or args.seq > 65535:
         raise ValueError("seq must be 1..65535")
 
-    steps = parse_pattern(args.pattern, args.scene, args.seq) if args.pattern else default_steps(args)
+    steps = parse_pattern(args.pattern, args.scene, args.seq, args.idle_speed, args.active_speed) if args.pattern else default_steps(args)
     samples = expand_steps(steps, args.rate_hz)
     if args.dry_run:
         print(f"[dry-run] {len(samples)} samples at {args.rate_hz:g} Hz")
         for index, sample in enumerate(samples, start=1):
-            print(f"{index:04d}: {sample.line(args.delimiter).rstrip()}")
+            ts = time.time() + ((index - 1) / args.rate_hz)
+            print(f"{index:04d}: {sample.line(args.delimiter, args.timestamp_mode, ts).rstrip()}")
         return
 
     print(f"[connect] {args.host}:{args.port}", flush=True)
     with socket.create_connection((args.host, args.port), timeout=args.timeout) as sock:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         print(
-            f"[connected] rate={args.rate_hz:g}Hz scene={args.scene} seq={args.seq} "
+            f"[connected] rate={args.rate_hz:g}Hz mode={args.timestamp_mode} scene={args.scene} seq={args.seq} "
             f"samples/cycle={len(samples)} cycles={args.cycles}",
             flush=True,
         )
@@ -183,6 +206,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=7777, help="Bridge TCP port. Default: 7777")
     parser.add_argument("--scene", default="1", help="Scene ID sent by SILAB. Default: 1")
     parser.add_argument("--seq", type=int, default=1, help="Sequence ID sent by SILAB. Default: 1")
+    parser.add_argument(
+        "--timestamp-mode",
+        choices=("silab", "full", "split5", "split10000", "none"),
+        default="silab",
+        help="Packet mode. silab: trigger time_low6 time_high scene seq speed; full/split5/split10000/none are legacy modes. Default: silab",
+    )
     parser.add_argument("--rate-hz", type=float, default=10.0, help="Fixed send rate. Default: 10")
     parser.add_argument("--pre-idle", type=float, default=1.0, help="Seconds of trigger=0 before pulse. Default: 1")
     parser.add_argument("--hold", type=float, default=2.0, help="Seconds of trigger=1 during pulse. Default: 2")
@@ -191,6 +220,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cycle-gap", type=float, default=0.0, help="Seconds between cycles. Default: 0")
     parser.add_argument("--idle-trigger", type=float, default=0.0, help="Idle trigger value. Default: 0")
     parser.add_argument("--active-trigger", type=float, default=1.0, help="Active trigger value. Default: 1")
+    parser.add_argument("--idle-speed", type=float, default=0.0, help="Idle speed value. Default: 0")
+    parser.add_argument("--active-speed", type=float, default=1.2, help="Active speed value. Default: 1.2")
     parser.add_argument(
         "--pattern",
         default="",
@@ -198,8 +229,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--delimiter",
-        default=r"\t",
-        help=r"Field delimiter: \t, tab, space, or comma. Default: \t",
+        default=";",
+        help=r"Field delimiter: ;, semicolon, \t, tab, space, or comma. Default: ;",
     )
     parser.add_argument("--timeout", type=float, default=5.0, help="TCP connect timeout seconds. Default: 5")
     parser.add_argument("--read-ack", action="store_true", help="Print JSON ACK lines if GUI Send TCP ACK is enabled")

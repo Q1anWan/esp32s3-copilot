@@ -2,21 +2,31 @@
 """PC-side SILAB TCP to ESP32 MQTT bridge GUI.
 
 Topology:
-  SILAB --LAN A/TCP--> experiment PC --LAN B/direct TCP--> ESP32
+  SILAB --LAN A/TCP--> experiment PC bridge GUI
+                         ├─ MQTT/direct TCP --> ESP32
+                         └─ TCP client/device --> HRT host
 
 MQTT is still used for ESP32 status, and as a play-command fallback when the
 direct TCP host is unavailable.
 
-The PC listens for fixed-rate SILAB audio-ID packets:
-  trigger<TAB>scene<TAB>seq<LF>
+The PC listens for fixed-rate logic-program audio-ID packets:
+  trigger;timestamp;scene;seq;speed<LF>
+
+It also accepts the older SILAB-friendly split timestamp packets:
+  trigger;time_low;time_high;scene;seq;speed<LF>
+
+time_low is the low 6 digits of Unix time. time_high is floor(unix / 100000).
 
 Only trigger rising edges are forwarded to ESP32 as MQTT play commands.
+Every valid sample is forwarded to HRT as:
+  trigger,timestamp,scene,seq,speed;
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import queue
 import socket
@@ -40,6 +50,8 @@ DEFAULT_ESP_TCP_HOST = os.environ.get("COPILOT_ESP_TCP_HOST", "")
 DEFAULT_ESP_TCP_PORT = int(os.environ.get("COPILOT_ESP_TCP_PORT", "7777"))
 DEFAULT_SCENE_PREFIX = os.environ.get("SILAB_SCENE_PREFIX", "scene")
 DEFAULT_SCENE_ALIASES = os.environ.get("SILAB_SCENE_ALIASES", "1=boot")
+DEFAULT_HRT_HOST = os.environ.get("COPILOT_HRT_HOST", "")
+DEFAULT_HRT_PORT = int(os.environ.get("COPILOT_HRT_PORT", "9001"))
 
 
 def require_mqtt():
@@ -101,7 +113,7 @@ def disable_hangup_on_close(ser) -> None:
         pass
 
 
-def send_usb_line(port: str, baud: int, line: str, read_seconds: float = 2.0) -> list[str]:
+def open_usb_serial(port: str, baud: int):
     serial, _ = require_serial()
     actual_port = auto_select_port() if port == "auto" else port
     ser = serial.Serial()
@@ -112,32 +124,153 @@ def send_usb_line(port: str, baud: int, line: str, read_seconds: float = 2.0) ->
     ser.dtr = False
     ser.rts = False
     ser.open()
+    disable_hangup_on_close(ser)
+    ser.dtr = False
+    ser.rts = False
+    return ser
+
+
+def read_usb_lines(ser, read_seconds: float) -> list[str]:
+    deadline = time.time() + read_seconds
+    buf = bytearray()
+    lines: list[str] = []
+    while time.time() < deadline:
+        chunk = ser.read(256)
+        if not chunk:
+            continue
+        for b in chunk:
+            if b in (10, 13):
+                if buf:
+                    lines.append(buf.decode("utf-8", errors="replace"))
+                    buf.clear()
+            else:
+                buf.append(b)
+    if buf:
+        lines.append(buf.decode("utf-8", errors="replace"))
+    return lines
+
+
+def send_usb_line(port: str, baud: int, line: str, read_seconds: float = 2.0) -> list[str]:
+    ser = open_usb_serial(port, baud)
     try:
-        disable_hangup_on_close(ser)
-        ser.dtr = False
-        ser.rts = False
         time.sleep(0.2)
         ser.write((line.rstrip("\r\n") + "\n").encode("utf-8"))
         ser.flush()
-        deadline = time.time() + read_seconds
-        buf = bytearray()
-        lines: list[str] = []
-        while time.time() < deadline:
-            chunk = ser.read(256)
-            if not chunk:
-                continue
-            for b in chunk:
-                if b in (10, 13):
-                    if buf:
-                        lines.append(buf.decode("utf-8", errors="replace"))
-                        buf.clear()
-                else:
-                    buf.append(b)
-        if buf:
-            lines.append(buf.decode("utf-8", errors="replace"))
-        return lines
+        return read_usb_lines(ser, read_seconds)
     finally:
         ser.close()
+
+
+def extract_usb_status(lines: list[str]) -> dict | None:
+    for line in reversed(lines):
+        if not line.startswith("COPILOT_STATUS "):
+            continue
+        try:
+            return json.loads(line[len("COPILOT_STATUS ") :])
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+def usb_wifi_command_line(ssid: str, password: str) -> str:
+    if any(ch.isspace() for ch in ssid) or any(ch.isspace() for ch in password):
+        return json.dumps({"type": "wifi", "ssid": ssid, "password": password}, separators=(",", ":"))
+    return f"wifi {ssid} {password}".rstrip()
+
+
+def usb_wait_for_status(ser, lines: list[str], timeout: float = 8.0) -> dict | None:
+    deadline = time.time() + timeout
+    last_status = extract_usb_status(lines)
+    if last_status:
+        return last_status
+    while time.time() < deadline:
+        ser.write(b"status\n")
+        ser.flush()
+        chunk = read_usb_lines(ser, 1.0)
+        lines.extend(chunk)
+        status = extract_usb_status(chunk)
+        if status:
+            return status
+        time.sleep(0.25)
+    return None
+
+
+def read_usb_config(port: str, baud: int, timeout: float = 10.0) -> dict:
+    ser = open_usb_serial(port, baud)
+    lines: list[str] = []
+    try:
+        started = time.time()
+        deadline = time.time() + min(timeout, 8.0)
+        while time.time() < deadline:
+            chunk = read_usb_lines(ser, 0.25)
+            lines.extend(chunk)
+            if any("COPILOT_SERIAL ready" in line for line in chunk):
+                break
+            if not lines and time.time() - started >= 1.0:
+                break
+
+        status = usb_wait_for_status(ser, lines, timeout=timeout)
+        return {"status": status, "lines": lines}
+    finally:
+        ser.close()
+
+
+def configure_usb_wifi_flash(port: str, baud: int, ssid: str, password: str, wait_seconds: float = 30.0) -> dict:
+    ser = open_usb_serial(port, baud)
+    lines: list[str] = []
+    statuses: list[dict] = []
+    accepted = False
+    command = usb_wifi_command_line(ssid, password)
+    try:
+        started = time.time()
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            chunk = read_usb_lines(ser, 0.25)
+            lines.extend(chunk)
+            if any("COPILOT_SERIAL ready" in line for line in chunk):
+                break
+            if not lines and time.time() - started >= 1.0:
+                break
+
+        status = usb_wait_for_status(ser, lines, timeout=8.0)
+        if status:
+            statuses.append(status)
+
+        for _ in range(3):
+            ser.write((command + "\n").encode("utf-8"))
+            ser.flush()
+            chunk = read_usb_lines(ser, 3.0)
+            lines.extend(chunk)
+            if command.startswith("{"):
+                accepted = any(line.startswith("COPILOT_OK json_accepted") for line in chunk)
+            else:
+                accepted = any(line.startswith("COPILOT_OK wifi ") for line in chunk)
+            status = extract_usb_status(chunk)
+            if status:
+                statuses.append(status)
+            if accepted:
+                break
+            time.sleep(0.4)
+
+        poll_deadline = time.time() + wait_seconds
+        while time.time() < poll_deadline:
+            ser.write(b"status\n")
+            ser.flush()
+            chunk = read_usb_lines(ser, 1.2)
+            lines.extend(chunk)
+            status = extract_usb_status(chunk)
+            if status:
+                statuses.append(status)
+                wifi = status.get("wifi") or {}
+                current = str(wifi.get("ssid") or "")
+                saved = str(wifi.get("saved_ssid") or "")
+                if current == ssid and (wifi.get("connected") or saved == ssid or wifi.get("saved")):
+                    if wifi.get("connected"):
+                        break
+            time.sleep(0.8)
+    finally:
+        ser.close()
+    return {"accepted": accepted, "lines": lines, "statuses": statuses, "command": command}
 
 
 def parse_integer_like(text: str) -> int | None:
@@ -151,11 +284,24 @@ def parse_integer_like(text: str) -> int | None:
     return rounded
 
 
+def parse_finite_float(text: str) -> float | None:
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
 def scene_token_is_valid(scene: str) -> bool:
     if parse_integer_like(scene) is not None:
         return True
     allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
     return bool(scene) and all(c in allowed for c in scene)
+
+
+def seq_token_is_valid(seq: str) -> bool:
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+    return bool(seq) and all(c in allowed for c in seq)
 
 
 def parse_scene_aliases(text: str) -> dict[int, str]:
@@ -185,32 +331,151 @@ def normalize_scene(scene: str, prefix: str, aliases: str | dict[int, str] | Non
     return scene
 
 
+def format_number_for_wire(value: float) -> str:
+    if math.isfinite(value) and abs(value - round(value)) < 0.0001:
+        return str(int(round(value)))
+    return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
+def split_silab_fields(text: str) -> list[str]:
+    normalized = text.replace(";", " ").replace(",", " ").replace("\t", " ")
+    return [item for item in normalized.split() if item]
+
+
+def reconstruct_silab_timestamp(time_low_text: str, time_high_text: str) -> tuple[float, str] | None:
+    try:
+        low = float(time_low_text)
+        high = float(time_high_text)
+    except ValueError:
+        return None
+    if not (math.isfinite(low) and math.isfinite(high)):
+        return None
+    high_int = int(math.floor(high))
+    low_int = int(math.floor(low))
+    frac = low - low_int
+    if high_int < 0 or low_int < 0:
+        return None
+    # TIME_LOW carries the low 6 digits, while TIME_HIGH already covers the
+    # 100000-second digit. Keep only the low 5 digits during reconstruction.
+    return (float(high_int * 100000 + (low_int % 100000)) + frac, "trigger_low6_high100000")
+
+
+def reconstruct_split_timestamp(part_a: str, part_b: str) -> tuple[float, str] | None:
+    """Reconstruct Unix seconds from two SILAB-friendly timestamp parts.
+
+    Kept for backward compatibility with older test packets.
+
+    Supported forms:
+    - high + low:         17792, 35200   -> 1779235200
+    - div10000 + low:     177923, 35200  -> 1779235200
+    - base + low:         1779200000, 35200 -> 1779235200
+    - negative offset + low: -1779200000, 35200 -> 1779235200
+    """
+
+    try:
+        a = float(part_a)
+        b = float(part_b)
+    except ValueError:
+        return None
+    if not (math.isfinite(a) and math.isfinite(b)):
+        return None
+
+    a_int = int(math.floor(a))
+    b_int = int(math.floor(b))
+    frac = b - b_int
+
+    if a_int < 0:
+        return (-float(a_int) + b, "offset_low")
+    if a_int >= 1_000_000_000:
+        return (float(a_int) + b, "base_low")
+    if a_int >= 100_000:
+        return (float(a_int * 10_000 + (b_int % 10_000)) + frac, "div10000_low")
+    if a_int >= 1:
+        return (float(a_int * 100_000 + (b_int % 100_000)) + frac, "high_low")
+    return None
+
+
 @dataclass
 class AudioIdPacket:
     raw_text: str
+    timestamp: float
+    timestamp_source: str
     trigger: float
     scene: str
-    seq: int
+    seq: str
+    speed: float | None = None
 
 
 def parse_audio_id_line(line: str) -> AudioIdPacket | None:
-    text = line.strip()
+    text = line.strip().strip(";")
     if not text:
         return None
-    parts = text.replace(",", "\t").split()
-    if len(parts) != 3:
+    parts = split_silab_fields(text)
+    timestamp = time.time()
+    timestamp_source = "pc_local"
+    speed: float | None = None
+    if len(parts) == 3:
+        trigger_text, scene, seq_text = parts
+    elif len(parts) == 4:
+        try:
+            timestamp = float(parts[0])
+        except ValueError:
+            return None
+        if not math.isfinite(timestamp):
+            return None
+        timestamp_source = "full"
+        trigger_text, scene, seq_text = parts[1], parts[2], parts[3]
+    elif len(parts) == 5:
+        logic_trigger = parse_finite_float(parts[0])
+        logic_timestamp = parse_finite_float(parts[1])
+        logic_speed = parse_finite_float(parts[4])
+        if (
+            logic_trigger is not None
+            and logic_timestamp is not None
+            and logic_speed is not None
+            and scene_token_is_valid(parts[2])
+            and seq_token_is_valid(parts[3])
+        ):
+            timestamp = logic_timestamp
+            timestamp_source = "logic_full"
+            trigger_text, scene, seq_text = parts[0], parts[2], parts[3]
+            speed = logic_speed
+        else:
+            reconstructed = reconstruct_split_timestamp(parts[0], parts[1])
+            if reconstructed is None:
+                return None
+            timestamp, timestamp_source = reconstructed
+            trigger_text, scene, seq_text = parts[2], parts[3], parts[4]
+    elif len(parts) == 6:
+        reconstructed = reconstruct_silab_timestamp(parts[1], parts[2])
+        if reconstructed is None:
+            return None
+        timestamp, timestamp_source = reconstructed
+        trigger_text, scene, seq_text, speed_text = parts[0], parts[3], parts[4], parts[5]
+        try:
+            speed = float(speed_text)
+        except ValueError:
+            return None
+        if not math.isfinite(speed):
+            return None
+    else:
         return None
-    try:
-        trigger = float(parts[0])
-    except ValueError:
+    trigger = parse_finite_float(trigger_text)
+    if trigger is None:
         return None
-    scene = parts[1]
     if not scene_token_is_valid(scene):
         return None
-    seq = parse_integer_like(parts[2])
-    if seq is None or seq < 1 or seq > 65535:
+    if not seq_token_is_valid(seq_text):
         return None
-    return AudioIdPacket(raw_text=text, trigger=trigger, scene=scene, seq=seq)
+    return AudioIdPacket(
+        raw_text=text,
+        timestamp=timestamp,
+        timestamp_source=timestamp_source,
+        trigger=trigger,
+        scene=scene,
+        seq=seq_text,
+        speed=speed,
+    )
 
 
 class MqttController:
@@ -288,11 +553,121 @@ class MqttController:
         return ok
 
 
+class HrtTcpClient:
+    def __init__(self, events: "queue.Queue[tuple[str, object]]") -> None:
+        self.events = events
+        self.enabled = False
+        self.host = ""
+        self.port = DEFAULT_HRT_PORT
+        self.sock: socket.socket | None = None
+        self._lock = threading.Lock()
+        self._sent_count = 0
+
+    @property
+    def connected(self) -> bool:
+        return self.sock is not None
+
+    @property
+    def sent_count(self) -> int:
+        return self._sent_count
+
+    def configure(self, enabled: bool, host: str, port: int) -> None:
+        host = host.strip()
+        with self._lock:
+            changed = (host != self.host) or (port != self.port)
+            self.enabled = enabled
+            self.host = host
+            self.port = port
+            if (not enabled or changed) and self.sock:
+                self._close_locked(log=True)
+
+    def connect(self, host: str | None = None, port: int | None = None) -> bool:
+        with self._lock:
+            if host is not None:
+                self.host = host.strip()
+            if port is not None:
+                self.port = port
+            if not self.host:
+                self.events.put(("log", "[hrt] host is empty"))
+                return False
+            if self.port < 1 or self.port > 65535:
+                self.events.put(("log", f"[hrt] invalid port {self.port}"))
+                return False
+            if self.sock:
+                return True
+            try:
+                sock = socket.create_connection((self.host, self.port), timeout=0.5)
+                sock.settimeout(0.25)
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
+            except OSError as exc:
+                self.events.put(("log", f"[hrt] connect failed {self.host}:{self.port}: {exc}"))
+                self.events.put(("hrt_connected", False))
+                return False
+            self.sock = sock
+            self.events.put(("log", f"[hrt] connected {self.host}:{self.port}"))
+            self.events.put(("hrt_connected", True))
+            return True
+
+    def disconnect(self) -> None:
+        with self._lock:
+            self._close_locked(log=True)
+
+    def _close_locked(self, log: bool = False) -> None:
+        sock = self.sock
+        self.sock = None
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            if log:
+                self.events.put(("log", "[hrt] disconnected"))
+        self.events.put(("hrt_connected", False))
+
+    def send_packet(self, packet: AudioIdPacket, scene: str) -> bool:
+        if not self.enabled:
+            return False
+        fields = [
+            format_number_for_wire(packet.trigger),
+            format_number_for_wire(packet.timestamp),
+            scene,
+            packet.seq,
+        ]
+        if packet.speed is not None:
+            fields.append(format_number_for_wire(packet.speed))
+        data = (",".join(fields) + ";").encode("utf-8")
+        with self._lock:
+            if not self.sock:
+                host = self.host
+                port = self.port
+            else:
+                host = ""
+                port = 0
+        if host:
+            if not self.connect(host, port):
+                return False
+        with self._lock:
+            if not self.sock:
+                return False
+            try:
+                self.sock.sendall(data)
+            except OSError as exc:
+                self.events.put(("log", f"[hrt] send failed: {exc}"))
+                self._close_locked(log=False)
+                return False
+            self._sent_count += 1
+            return True
+
+
 class SilabTcpBridge:
     def __init__(
         self,
         events: "queue.Queue[tuple[str, object]]",
         publish_cb,
+        hrt_forward_cb,
         scene_prefix_cb,
         scene_aliases_cb,
         threshold_cb,
@@ -300,6 +675,7 @@ class SilabTcpBridge:
     ) -> None:
         self.events = events
         self.publish_cb = publish_cb
+        self.hrt_forward_cb = hrt_forward_cb
         self.scene_prefix_cb = scene_prefix_cb
         self.scene_aliases_cb = scene_aliases_cb
         self.threshold_cb = threshold_cb
@@ -404,6 +780,7 @@ class SilabTcpBridge:
             trigger_count = self._trigger_count
 
         scene = normalize_scene(packet.scene, self.scene_prefix_cb(), self.scene_aliases_cb())
+        hrt_sent = bool(self.hrt_forward_cb(packet, scene))
         accepted = False
         if rising:
             payload = {
@@ -421,22 +798,50 @@ class SilabTcpBridge:
                 {
                     "packet_no": packet_no,
                     "peer": peer,
+                    "timestamp": packet.timestamp,
+                    "timestamp_source": packet.timestamp_source,
                     "trigger": packet.trigger,
                     "scene": scene,
                     "seq": packet.seq,
+                    "speed": packet.speed,
                     "state": state,
                     "accepted": accepted,
+                    "hrt_sent": hrt_sent,
                     "trigger_count": trigger_count,
                 },
             )
         )
-        self.events.put(("log", f"[silab] #{packet_no} {state} trigger={packet.trigger:g} scene={scene} seq={packet.seq}"))
-        self._send_ack(conn, True, accepted, scene, packet.seq, state)
+        self.events.put(
+            (
+                "log",
+                f"[silab] #{packet_no} {state} ts={format_number_for_wire(packet.timestamp)} "
+                f"trigger={packet.trigger:g} scene={scene} seq={packet.seq} "
+                f"speed={format_number_for_wire(packet.speed) if packet.speed is not None else '-'} "
+                f"hrt={'ok' if hrt_sent else '-'}",
+            )
+        )
+        self._send_ack(conn, True, accepted, scene, packet.seq, state, packet.timestamp, hrt_sent, packet.speed)
 
-    def _send_ack(self, conn: socket.socket, ok: bool, accepted: bool, scene: str, seq: int, state: str) -> None:
+    def _send_ack(
+        self,
+        conn: socket.socket,
+        ok: bool,
+        accepted: bool,
+        scene: str,
+        seq: str,
+        state: str,
+        timestamp: float | None = None,
+        hrt_sent: bool = False,
+        speed: float | None = None,
+    ) -> None:
         if not self.ack_cb():
             return
         payload = {"ok": ok, "accepted": accepted, "scene": scene, "seq": seq, "state": state}
+        if timestamp is not None:
+            payload["timestamp"] = timestamp
+        if speed is not None:
+            payload["speed"] = speed
+        payload["hrt_sent"] = hrt_sent
         try:
             conn.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
         except OSError:
@@ -451,6 +856,7 @@ class BridgeGui(tk.Tk):
         self.args = args
         self.events: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self.mqtt = MqttController(self.events)
+        self.hrt = HrtTcpClient(self.events)
         self._scene_prefix = args.scene_prefix.strip() or DEFAULT_SCENE_PREFIX
         self._scene_aliases = args.scene_aliases.strip()
         self._trigger_threshold = float(args.trigger_threshold)
@@ -458,9 +864,13 @@ class BridgeGui(tk.Tk):
         self._direct_tcp_enabled = not args.no_direct_tcp
         self._esp_tcp_host = args.esp_tcp_host.strip()
         self._esp_tcp_port = int(args.esp_tcp_port)
+        self._hrt_enabled = bool(args.enable_hrt or args.hrt_host.strip())
+        self._hrt_host = args.hrt_host.strip()
+        self._hrt_port = int(args.hrt_port)
         self.tcp_bridge = SilabTcpBridge(
             self.events,
             publish_cb=self._send_play_command,
+            hrt_forward_cb=self._forward_hrt_packet,
             scene_prefix_cb=lambda: self._scene_prefix,
             scene_aliases_cb=lambda: self._scene_aliases,
             threshold_cb=lambda: self._trigger_threshold,
@@ -511,6 +921,7 @@ class BridgeGui(tk.Tk):
         self._build_mqtt(left)
         self._build_usb(left)
         self._build_tcp(left)
+        self._build_hrt(left)
         self._build_play(left)
         self._build_status(right)
         self._build_log(right)
@@ -561,11 +972,12 @@ class BridgeGui(tk.Tk):
         ttk.Entry(box, textvariable=self.password_var, width=28, show="*").grid(row=3, column=1, columnspan=2, sticky="ew", padx=8, pady=4)
         row = ttk.Frame(box)
         row.grid(row=4, column=0, columnspan=3, sticky="ew", padx=8, pady=(4, 8))
-        for col in range(3):
+        for col in range(4):
             row.columnconfigure(col, weight=1)
-        ttk.Button(row, text="Use URI", command=self.fill_usb_broker_uri).grid(row=0, column=0, sticky="ew")
-        ttk.Button(row, text="Save MQTT", command=self.configure_usb_mqtt).grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(row, text="Save WiFi", command=self.configure_usb_wifi).grid(row=0, column=2, sticky="ew")
+        ttk.Button(row, text="Read Config", command=self.read_usb_config).grid(row=0, column=0, sticky="ew")
+        ttk.Button(row, text="Use URI", command=self.fill_usb_broker_uri).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        ttk.Button(row, text="Save MQTT", command=self.configure_usb_mqtt).grid(row=0, column=2, sticky="ew", padx=4)
+        ttk.Button(row, text="Save WiFi", command=self.configure_usb_wifi).grid(row=0, column=3, sticky="ew")
 
     def _build_tcp(self, parent: ttk.Frame) -> None:
         box = ttk.LabelFrame(parent, text="SILAB TCP Host")
@@ -591,12 +1003,29 @@ class BridgeGui(tk.Tk):
         self.tcp_btn = ttk.Button(box, text="Start TCP Host", command=self.toggle_tcp)
         self.tcp_btn.grid(row=6, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
 
-    def _build_play(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text="Manual Play")
+    def _build_hrt(self, parent: ttk.Frame) -> None:
+        box = ttk.LabelFrame(parent, text="HRT TCP Device")
         box.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         box.columnconfigure(1, weight=1)
+        self.hrt_enable_var = tk.BooleanVar(value=self._hrt_enabled)
+        self.hrt_host_var = tk.StringVar(value=self.args.hrt_host)
+        self.hrt_port_var = tk.IntVar(value=self.args.hrt_port)
+        ttk.Checkbutton(box, text="Forward SILAB samples to HRT", variable=self.hrt_enable_var).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 4)
+        )
+        ttk.Label(box, text="HRT Host").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(box, textvariable=self.hrt_host_var, width=18).grid(row=1, column=1, sticky="ew", padx=8, pady=4)
+        ttk.Label(box, text="HRT Port").grid(row=2, column=0, sticky="w", padx=8, pady=4)
+        ttk.Entry(box, textvariable=self.hrt_port_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=4)
+        self.hrt_btn = ttk.Button(box, text="Connect HRT", command=self.toggle_hrt)
+        self.hrt_btn.grid(row=3, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
+
+    def _build_play(self, parent: ttk.Frame) -> None:
+        box = ttk.LabelFrame(parent, text="Manual Play")
+        box.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+        box.columnconfigure(1, weight=1)
         self.play_scene_var = tk.StringVar(value="boot")
-        self.play_seq_var = tk.IntVar(value=1)
+        self.play_seq_var = tk.StringVar(value="1")
         self.direct_tcp_var = tk.BooleanVar(value=not self.args.no_direct_tcp)
         self.esp_tcp_host_var = tk.StringVar(value=self.args.esp_tcp_host)
         self.esp_tcp_port_var = tk.IntVar(value=self.args.esp_tcp_port)
@@ -641,6 +1070,8 @@ class BridgeGui(tk.Tk):
             ("Path", "path"),
             ("SILAB", "silab"),
             ("Trigger", "trigger"),
+            ("Speed", "speed"),
+            ("HRT", "hrt"),
             ("Files", "files"),
         ]
         for index, (label, key) in enumerate(fields):
@@ -738,6 +1169,19 @@ class BridgeGui(tk.Tk):
         except Exception as exc:
             messagebox.showerror("SILAB TCP", str(exc))
 
+    def toggle_hrt(self) -> None:
+        if not self.hrt_enable_var.get():
+            self.hrt_enable_var.set(True)
+        self._sync_runtime_config()
+        if self.hrt.connected:
+            self.hrt.disconnect()
+            return
+        if not self._hrt_host:
+            messagebox.showwarning("HRT", "HRT Host is empty")
+            return
+        if not self.hrt.connect(self._hrt_host, self._hrt_port):
+            messagebox.showerror("HRT", f"Cannot connect to {self._hrt_host}:{self._hrt_port}")
+
     def fill_usb_broker_uri(self) -> None:
         host = self.mqtt_host_var.get().strip()
         port = int(self.mqtt_port_var.get())
@@ -756,14 +1200,110 @@ class BridgeGui(tk.Tk):
             return
         threading.Thread(target=self._usb_send_worker, args=(f"mqtt {broker}",), daemon=True).start()
 
+    def read_usb_config(self) -> None:
+        threading.Thread(target=self._usb_read_config_worker, daemon=True).start()
+
+    def _usb_read_config_worker(self) -> None:
+        self.events.put(("log", "[usb] reading ESP32 config/status"))
+        try:
+            result = read_usb_config(self._selected_port(), int(self.baud_var.get()))
+        except Exception as exc:
+            self.events.put(("log", f"[usb] read config failed: {exc}"))
+            return
+
+        lines = result.get("lines") if isinstance(result.get("lines"), list) else []
+        for item in lines:
+            if isinstance(item, str) and item.startswith("COPILOT_SERIAL ready"):
+                self.events.put(("log", "[usb] ESP32 serial ready"))
+                break
+
+        status = result.get("status")
+        if not isinstance(status, dict):
+            self.events.put(("log", "[usb] no ESP32 status returned"))
+            return
+
+        self.events.put(("status", status))
+        mqtt_status = status.get("mqtt") or {}
+        wifi = status.get("wifi") or {}
+        broker = str(mqtt_status.get("broker") or "")
+        ssid = str(wifi.get("saved_ssid") or wifi.get("ssid") or "")
+        self.events.put(("usb_config", {"broker": broker, "ssid": ssid}))
+
+        reason = wifi.get("last_reason") or 0
+        self.events.put(
+            (
+                "log",
+                f"[usb] config broker={broker or '-'} ssid={ssid or '-'} "
+                f"saved={bool(wifi.get('saved'))} connected={bool(wifi.get('connected'))} "
+                f"reason={reason} ip={wifi.get('ip') or '-'}",
+            )
+        )
+
     def configure_usb_wifi(self) -> None:
         ssid = self.ssid_var.get().strip()
         if not ssid:
             messagebox.showwarning("USB WiFi", "SSID is empty")
             return
         password = self.password_var.get()
-        payload = json.dumps({"type": "wifi", "ssid": ssid, "password": password}, separators=(",", ":"))
-        threading.Thread(target=self._usb_send_worker, args=(payload,), daemon=True).start()
+        threading.Thread(target=self._usb_wifi_worker, args=(ssid, password), daemon=True).start()
+
+    def _usb_wifi_worker(self, ssid: str, password: str) -> None:
+        self.events.put(("log", f"[usb] saving WiFi SSID={ssid} to ESP32 Flash"))
+        try:
+            result = configure_usb_wifi_flash(self._selected_port(), int(self.baud_var.get()), ssid, password)
+        except Exception as exc:
+            self.events.put(("log", f"[usb] WiFi failed: {exc}"))
+            return
+
+        accepted = bool(result.get("accepted"))
+        lines = result.get("lines") if isinstance(result.get("lines"), list) else []
+        statuses = result.get("statuses") if isinstance(result.get("statuses"), list) else []
+
+        logged = 0
+        for item in lines:
+            if not isinstance(item, str):
+                continue
+            if item.startswith("COPILOT_STATUS "):
+                status = extract_usb_status([item])
+                if status:
+                    self.events.put(("status", status))
+                continue
+            if item.startswith("COPILOT_OK") or item.startswith("COPILOT_ERROR") or "WiFi config command" in item:
+                safe = item.replace(password, "***") if password else item
+                self.events.put(("log", f"[usb] {safe}"))
+                logged += 1
+                if logged >= 8:
+                    break
+
+        if accepted:
+            self.events.put(("log", "[usb] WiFi command accepted; credentials saved to NVS/Flash"))
+        else:
+            self.events.put(("log", "[usb] WARNING: ESP32 did not ACK the WiFi command"))
+
+        status = statuses[-1] if statuses else None
+        if isinstance(status, dict):
+            self.events.put(("status", status))
+            wifi = status.get("wifi") or {}
+            current = str(wifi.get("ssid") or "")
+            saved = str(wifi.get("saved_ssid") or "")
+            connected = bool(wifi.get("connected"))
+            ip = str(wifi.get("ip") or "")
+            reason = wifi.get("last_reason")
+            flash_ok = bool(wifi.get("saved")) and (not saved or saved == ssid)
+            self.events.put(
+                (
+                    "log",
+                    f"[usb] WiFi status ssid={current or '-'} saved_ssid={saved or '-'} "
+                    f"flash={'ok' if flash_ok else 'unknown'} connected={connected} "
+                    f"reason={reason or 0} ip={ip or '-'}",
+                )
+            )
+            if current == ssid and connected:
+                self.events.put(("log", f"[usb] ESP32 connected to {ssid}"))
+            elif flash_ok or current == ssid:
+                self.events.put(("log", "[usb] Flash write is visible, but ESP32 is not connected yet"))
+        else:
+            self.events.put(("log", "[usb] no status returned after WiFi command"))
 
     def _usb_send_worker(self, line: str) -> None:
         password = self.password_var.get()
@@ -793,6 +1333,13 @@ class BridgeGui(tk.Tk):
             self._esp_tcp_port = int(self.esp_tcp_port_var.get())
         except (tk.TclError, ValueError):
             self._esp_tcp_port = DEFAULT_ESP_TCP_PORT
+        self._hrt_enabled = bool(self.hrt_enable_var.get())
+        self._hrt_host = self.hrt_host_var.get().strip()
+        try:
+            self._hrt_port = int(self.hrt_port_var.get())
+        except (tk.TclError, ValueError):
+            self._hrt_port = DEFAULT_HRT_PORT
+        self.hrt.configure(self._hrt_enabled, self._hrt_host, self._hrt_port)
 
     def _direct_tcp_target(self) -> tuple[str, int] | None:
         host = self._esp_tcp_host
@@ -825,8 +1372,8 @@ class BridgeGui(tk.Tk):
         action = payload.get("action", "")
         if msg_type == "play" or (msg_type in ("audio", "sound") and action != "stop"):
             scene = payload.get("scene", "-")
-            seq = int(payload.get("seq", 0) or 0)
-            summary = f"play {scene}/{seq:03d}"
+            seq = str(payload.get("seq", "-") or "-")
+            summary = f"play {scene}/{seq}"
         elif action == "stop" or msg_type == "stop":
             summary = "stop"
         else:
@@ -838,7 +1385,7 @@ class BridgeGui(tk.Tk):
         message_id = str(payload.get("message_id") or f"play_{int(time.time() * 1000)}")
         self._pending_plays[message_id] = {
             "scene": str(payload.get("scene") or "-"),
-            "seq": int(payload.get("seq", 0) or 0),
+            "seq": str(payload.get("seq", "-") or "-"),
             "files_before": self._last_files_played,
             "t0": time.time(),
         }
@@ -864,19 +1411,22 @@ class BridgeGui(tk.Tk):
     def _send_play_command(self, payload: dict) -> bool:
         return self._send_control_command(payload, track_play=True)
 
+    def _forward_hrt_packet(self, packet: AudioIdPacket, scene: str) -> bool:
+        return self.hrt.send_packet(packet, scene)
+
     def play_manual(self) -> None:
         self._sync_runtime_config()
         scene = self.play_scene_var.get().strip()
-        seq = int(self.play_seq_var.get())
-        if not scene or seq < 1 or seq > 65535:
-            messagebox.showwarning("Play", "Scene must be non-empty and seq must be 1..65535")
+        seq = self.play_seq_var.get().strip()
+        if not scene or not seq_token_is_valid(seq):
+            messagebox.showwarning("Play", "Scene must be non-empty and seq must use letters, digits, _ or -")
             return
         scene = normalize_scene(scene, self.scene_prefix_var.get().strip() or DEFAULT_SCENE_PREFIX,
                                 self.scene_aliases_var.get().strip())
         message_id = f"manual_{int(time.time() * 1000)}"
         payload = {"type": "play", "scene": scene, "seq": seq, "message_id": message_id}
         if self._send_play_command(payload):
-            self._log(f"[manual] play requested {scene}/{seq:03d}")
+            self._log(f"[manual] play requested {scene}/{seq}")
 
     def stop_manual(self) -> None:
         self._sync_runtime_config()
@@ -923,6 +1473,8 @@ class BridgeGui(tk.Tk):
                     self._log_publish(payload if isinstance(payload, dict) else {})
                 elif kind == "status":
                     self._update_status(payload if isinstance(payload, dict) else {})
+                elif kind == "usb_config":
+                    self._apply_usb_config(payload if isinstance(payload, dict) else {})
                 elif kind == "silab_packet":
                     self._update_silab(payload if isinstance(payload, dict) else {})
                 elif kind == "track_play":
@@ -931,11 +1483,25 @@ class BridgeGui(tk.Tk):
                     running = bool(payload)
                     self.tcp_btn.configure(text="Stop TCP Host" if running else "Start TCP Host")
                     self.tcp_state_var.set("SILAB: listening" if running else "SILAB: stopped")
+                elif kind == "hrt_connected":
+                    connected = bool(payload)
+                    self.hrt_btn.configure(text="Disconnect HRT" if connected else "Connect HRT")
+                    state = "connected" if connected else ("enabled" if self._hrt_enabled else "disabled")
+                    self.status_vars["hrt"].set(f"{state} sent={self.hrt.sent_count}")
         except queue.Empty:
             pass
         self.mqtt_state_var.set("MQTT: connected" if self.mqtt.connected else "MQTT: disconnected")
         self.mqtt_btn.configure(text="Disconnect" if self.mqtt.connected else "Connect")
+        self.hrt_btn.configure(text="Disconnect HRT" if self.hrt.connected else "Connect HRT")
         self.after(80, self._drain_events)
+
+    def _apply_usb_config(self, payload: dict) -> None:
+        broker = str(payload.get("broker") or "")
+        ssid = str(payload.get("ssid") or "")
+        if broker:
+            self.usb_broker_var.set(broker)
+        if ssid:
+            self.ssid_var.set(ssid)
 
     def _update_status(self, payload: dict) -> None:
         if payload.get("type") != "status":
@@ -951,9 +1517,20 @@ class BridgeGui(tk.Tk):
             wifi = payload.get("wifi") or {}
             wifi_connected = bool(wifi.get("connected"))
             wifi_text = "connected" if wifi_connected else "offline"
+            ssid = str(wifi.get("ssid") or "")
+            saved_ssid = str(wifi.get("saved_ssid") or "")
             if wifi.get("ip"):
                 wifi_text += f" {wifi.get('ip')}"
                 self._maybe_update_direct_target(str(wifi.get("ip")), DEFAULT_ESP_TCP_PORT)
+            if ssid:
+                wifi_text += f" ssid={ssid}"
+            if saved_ssid and saved_ssid != ssid:
+                wifi_text += f" saved={saved_ssid}"
+            elif wifi.get("saved"):
+                wifi_text += " saved"
+            reason = wifi.get("last_reason")
+            if reason not in (None, 0, "0"):
+                wifi_text += f" reason={reason}"
             self.status_vars["wifi"].set(wifi_text)
             if self._last_wifi_connected is not None and self._last_wifi_connected != wifi_connected:
                 self._log(f"[esp32] WiFi {'connected' if wifi_connected else 'offline'}")
@@ -1015,11 +1592,19 @@ class BridgeGui(tk.Tk):
 
     def _update_silab(self, packet: dict) -> None:
         self.status_vars["silab"].set(
-            f"#{packet.get('packet_no')} {packet.get('state')} {packet.get('scene')}/{int(packet.get('seq', 0)):03d}"
+            f"#{packet.get('packet_no')} {packet.get('state')} {packet.get('scene')}/{packet.get('seq')}"
         )
         self.status_vars["trigger"].set(
             f"{packet.get('trigger')} count={packet.get('trigger_count')} ok={packet.get('accepted')}"
         )
+        speed = packet.get("speed")
+        self.status_vars["speed"].set(
+            format_number_for_wire(float(speed)) if isinstance(speed, (int, float)) else "-"
+        )
+        hrt_state = "sent" if packet.get("hrt_sent") else ("enabled" if self._hrt_enabled else "disabled")
+        timestamp = packet.get("timestamp")
+        ts_text = format_number_for_wire(float(timestamp)) if isinstance(timestamp, (int, float)) else "-"
+        self.status_vars["hrt"].set(f"{hrt_state} ts={ts_text} count={self.hrt.sent_count}")
 
     def _log_publish(self, event: dict) -> None:
         payload = event.get("payload") or {}
@@ -1028,8 +1613,8 @@ class BridgeGui(tk.Tk):
         msg_type = payload.get("type")
         if msg_type == "play":
             scene = payload.get("scene", "-")
-            seq = int(payload.get("seq", 0) or 0)
-            self._log(f"[mqtt] play {'sent' if ok else 'failed'} {scene}/{seq:03d} rc={rc}")
+            seq = str(payload.get("seq", "-") or "-")
+            self._log(f"[mqtt] play {'sent' if ok else 'failed'} {scene}/{seq} rc={rc}")
         elif msg_type in ("audio", "stop") and payload.get("action", "stop") == "stop":
             self._log(f"[mqtt] stop {'sent' if ok else 'failed'} rc={rc}")
         elif msg_type == "status":
@@ -1049,6 +1634,7 @@ class BridgeGui(tk.Tk):
         if self.auto_status_after:
             self.after_cancel(self.auto_status_after)
         self.tcp_bridge.stop()
+        self.hrt.disconnect()
         self.mqtt.disconnect()
         if self.broker_proc and self.broker_proc.poll() is None:
             self.broker_proc.terminate()
@@ -1070,6 +1656,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esp-tcp-host", default=DEFAULT_ESP_TCP_HOST, help="ESP32 direct TCP host. Auto-filled from status when empty")
     parser.add_argument("--esp-tcp-port", type=int, default=DEFAULT_ESP_TCP_PORT, help="ESP32 direct TCP port. Default: 7777")
     parser.add_argument("--no-direct-tcp", action="store_true", help="Disable direct TCP play and use MQTT for play commands")
+    parser.add_argument("--hrt-host", default=DEFAULT_HRT_HOST, help="HRT TCP host IP. Empty disables HRT forwarding by default")
+    parser.add_argument("--hrt-port", type=int, default=DEFAULT_HRT_PORT, help="HRT TCP port. Default: 9001")
+    parser.add_argument("--enable-hrt", action="store_true", help="Enable HRT forwarding even if the GUI has not connected manually")
     parser.add_argument("--trigger-threshold", type=float, default=0.5, help="Trigger active threshold. Default: 0.5")
     parser.add_argument("--scene-prefix", default=DEFAULT_SCENE_PREFIX, help="Numeric scene prefix. Default: scene")
     parser.add_argument("--scene-aliases", default=DEFAULT_SCENE_ALIASES, help="Numeric scene aliases, for example 1=boot,2=scene002")

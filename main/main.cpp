@@ -1,5 +1,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_err.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "sdkconfig.h"
@@ -19,7 +20,7 @@
 #include "copilot_axp2101.h"
 
 static const char *TAG = "main";
-static constexpr uint32_t kDisplayDrawBufferLines = 12;
+static constexpr uint32_t kDisplayDrawBufferLines = 3;
 
 static int copilot_normalize_core(int core) {
     if (core < 0) {
@@ -61,6 +62,15 @@ extern "C" void app_main(void) {
     copilot_serial_console_start();
 #endif
 
+#if CONFIG_COPILOT_SD_AUDIO_ENABLE
+    esp_err_t sd_err = bsp_sdcard_mount();
+    if (sd_err == ESP_OK || sd_err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGI(TAG, "SD card mounted before display/audio/network init");
+    } else {
+        ESP_LOGW(TAG, "Early SD card mount failed: %s", esp_err_to_name(sd_err));
+    }
+#endif
+
     bsp_display_cfg_t disp_cfg = {
         .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
         .buffer_size = BSP_LCD_H_RES * kDisplayDrawBufferLines,
@@ -71,9 +81,10 @@ extern "C" void app_main(void) {
             .buff_spiram = false,
         },
     };
-    // Keep LVGL stack modest; touch is optional and disabled for display/audio builds.
+    // LCD flush can run while SPI flash cache is frozen, so the LVGL task stack
+    // must stay in internal RAM. A PSRAM stack can trip the IDF cache-safety check.
     disp_cfg.lvgl_port_cfg.task_stack = 6144;
-    disp_cfg.lvgl_port_cfg.task_stack_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    disp_cfg.lvgl_port_cfg.task_stack_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     disp_cfg.lvgl_port_cfg.task_priority = 15;
     disp_cfg.lvgl_port_cfg.task_affinity = copilot_normalize_core(CONFIG_COPILOT_UI_CORE);
     ESP_LOGI(TAG, "LVGL task affinity=%d", disp_cfg.lvgl_port_cfg.task_affinity);

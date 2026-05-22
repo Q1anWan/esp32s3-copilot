@@ -25,6 +25,19 @@ static bool s_stdio_prepared = false;
 static char s_line_buf[512];
 static char s_status_buf[1024];
 
+enum class config_cmd_type_t {
+    WIFI,
+    MQTT,
+};
+
+struct config_cmd_request_t {
+    config_cmd_type_t type;
+    char arg1[128];
+    char arg2[65];
+    bool ok;
+    TaskHandle_t waiter;
+};
+
 void copilot_serial_console_prepare(void) {
     if (s_stdio_prepared) {
         return;
@@ -106,6 +119,44 @@ static void set_debug(bool enabled) {
     fflush(stdout);
 }
 
+static void config_cmd_task(void *arg) {
+    config_cmd_request_t *req = static_cast<config_cmd_request_t *>(arg);
+    if (!req) {
+        vTaskDelete(nullptr);
+        return;
+    }
+    if (req->type == config_cmd_type_t::WIFI) {
+        req->ok = copilot_mqtt_configure_wifi(req->arg1, req->arg2);
+    } else if (req->type == config_cmd_type_t::MQTT) {
+        req->ok = copilot_mqtt_configure_broker(req->arg1);
+    }
+    if (req->waiter) {
+        xTaskNotifyGive(req->waiter);
+    }
+    vTaskDelete(nullptr);
+}
+
+static bool run_config_cmd_internal(config_cmd_type_t type, const char *arg1, const char *arg2) {
+    config_cmd_request_t req = {};
+    req.type = type;
+    strncpy(req.arg1, arg1 ? arg1 : "", sizeof(req.arg1) - 1);
+    strncpy(req.arg2, arg2 ? arg2 : "", sizeof(req.arg2) - 1);
+    req.waiter = xTaskGetCurrentTaskHandle();
+
+    TaskHandle_t task = nullptr;
+    BaseType_t ok = xTaskCreateWithCaps(config_cmd_task, "serial_cfg", 4096, &req, 4, &task,
+                                        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create internal config task");
+        return false;
+    }
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(15000)) == 0) {
+        ESP_LOGE(TAG, "Config command timed out");
+        return false;
+    }
+    return req.ok;
+}
+
 static void handle_text_command(char *line) {
     trim_line(line);
     if (line[0] == '\0') {
@@ -150,7 +201,7 @@ static void handle_text_command(char *line) {
         char ssid[33] = {};
         char password[65] = {};
         int count = sscanf(line, "%*s %32s %64s", ssid, password);
-        if (count >= 1 && copilot_mqtt_configure_wifi(ssid, count >= 2 ? password : "")) {
+        if (count >= 1 && run_config_cmd_internal(config_cmd_type_t::WIFI, ssid, count >= 2 ? password : "")) {
             printf("COPILOT_OK wifi ssid=%s\n", ssid);
         } else {
             printf("COPILOT_ERROR wifi_usage\n");
@@ -162,7 +213,7 @@ static void handle_text_command(char *line) {
     if (starts_with_ci(line, "mqtt ")) {
         char broker_uri[128] = {};
         int count = sscanf(line, "%*s %127s", broker_uri);
-        if (count == 1 && copilot_mqtt_configure_broker(broker_uri)) {
+        if (count == 1 && run_config_cmd_internal(config_cmd_type_t::MQTT, broker_uri, "")) {
             printf("COPILOT_OK mqtt broker=%s\n", broker_uri);
         } else {
             printf("COPILOT_ERROR mqtt_usage\n");

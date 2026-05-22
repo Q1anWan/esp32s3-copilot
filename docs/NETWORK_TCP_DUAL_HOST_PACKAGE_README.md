@@ -16,7 +16,7 @@ Bridge -> ESP32
 
 - `docs/NETWORK_TCP_DATA_KNOWLEDGE_BASE.md`：网络、TCP、数据帧知识库。
 - `tools/voice_package.py`：读取语音包里的 common MD 和 manifest，用于模拟小机器人查找语音。
-- `tools/logic_dual_host_simulator.py`：同时创建小机器人/Bridge Host 和 HRT Host 的测试脚本。小机器人 Host 会接入语音包，收到触发上升沿时打印将要播放的文本和 WAV 路径。
+- `tools/logic_dual_host_simulator.py`：同时创建小机器人/Bridge Host 和 HRT Host 的测试脚本。小机器人 Host 会接入语音包，收到触发上升沿时打印将要播放的文本和 WAV 路径，并默认调用本机声卡播放 WAV。
 - `tools/logic_decision_simulator.py`：新的逻辑判定程序模拟脚本。它从语音包选择 `SCENE/SEQ`，按固定频率同时发送给小机器人/Bridge Host 和 HRT Host。
 - `requirements.txt`：Python 依赖说明。本包脚本只使用标准库，无需额外安装第三方包。
 
@@ -41,6 +41,7 @@ python tools/logic_dual_host_simulator.py --self-test
 ```text
 [ROBOT_HOST] RISING trigger=1 ts=1779235200 scene=common seq=left_rear_vehicle_merge speed=1.2
 [ROBOT_HOST] robot would_play common/left_rear_vehicle_merge.wav exists=true ...
+[AUDIO] playing left_rear_vehicle_merge.wav via pw-play
 [HRT_HOST] RISING trigger=1 ts=1779235200 scene=common seq=left_rear_vehicle_merge speed=1.2
 ```
 
@@ -107,9 +108,18 @@ python tools/logic_decision_simulator.py \
 ```text
 robot would_play common/left_rear_vehicle_merge.wav exists=true ...
 text=左后方有车辆汇入
+[AUDIO] playing left_rear_vehicle_merge.wav via pw-play
 ```
 
-这说明逻辑判定程序发出的 `SCENE/SEQ` 已经能在语音包里找到真实 WAV。语音包默认从相邻仓库读取：
+这说明逻辑判定程序发出的 `SCENE/SEQ` 已经能在语音包里找到真实 WAV，并且小机器人模拟端已经调用本机声卡播放。Ubuntu 下脚本会自动尝试 `pw-play`、`paplay`、`aplay`、`ffplay`；Windows 下会使用系统自带 `winsound`。
+
+如果只想看日志、不想让电脑发声：
+
+```bash
+python tools/logic_dual_host_simulator.py --no-play-audio
+```
+
+语音包默认从相邻仓库读取：
 
 ```text
 ../silent_failure_tts/dist/common_voice_test_assets_20260522

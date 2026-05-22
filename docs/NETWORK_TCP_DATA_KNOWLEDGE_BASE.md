@@ -492,6 +492,13 @@ HRT payload:    trigger,timestamp,scene,seq,speed;
 ```text
 robot would_play common/left_rear_vehicle_merge.wav exists=true
 text=左后方有车辆汇入
+[AUDIO] playing left_rear_vehicle_merge.wav via pw-play
+```
+
+小机器人模拟端默认会调用本机声卡播放 WAV。Ubuntu 下自动尝试 `pw-play`、`paplay`、`aplay`、`ffplay`；Windows 下使用系统自带 `winsound`。如果只想看日志：
+
+```bash
+python3 tools/logic_dual_host_simulator.py --no-play-audio
 ```
 
 本机自检：

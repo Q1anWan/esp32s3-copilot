@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -29,6 +32,83 @@ from voice_package import VoicePackage, load_voice_package
 
 BRIDGE_DEFAULT_PORT = 7777
 HRT_DEFAULT_PORT = 9001
+
+
+class AudioPlayer:
+    def __init__(self, enabled: bool = True, command: str = "auto") -> None:
+        self.enabled = enabled
+        self.command = command
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+
+    def play(self, path: Path) -> bool:
+        if not self.enabled:
+            return False
+        if not path.exists():
+            log(f"[AUDIO] missing wav {path}")
+            return False
+        if os.name == "nt":
+            threading.Thread(target=self._play_windows, args=(path,), daemon=True).start()
+            return True
+
+        command = self._select_command()
+        if not command:
+            log("[AUDIO] no local player found; install pipewire-utils, pulseaudio-utils, alsa-utils, or ffmpeg")
+            return False
+
+        args = self._command_args(command, path)
+        with self._lock:
+            self._stop_locked()
+            try:
+                self._proc = subprocess.Popen(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError as exc:
+                log(f"[AUDIO] player failed {command}: {exc}")
+                return False
+        log(f"[AUDIO] playing {path.name} via {command}")
+        return True
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
+        if self._proc is None:
+            return
+        if self._proc.poll() is None:
+            self._proc.terminate()
+        self._proc = None
+
+    def _select_command(self) -> str:
+        if self.command and self.command != "auto":
+            return self.command if shutil.which(self.command) else ""
+        for candidate in ("pw-play", "paplay", "aplay", "ffplay", "afplay"):
+            if shutil.which(candidate):
+                return candidate
+        return ""
+
+    @staticmethod
+    def _command_args(command: str, path: Path) -> list[str]:
+        path_text = str(path)
+        name = Path(command).name
+        if name == "aplay":
+            return [command, "-q", path_text]
+        if name == "ffplay":
+            return [command, "-nodisp", "-autoexit", "-loglevel", "quiet", path_text]
+        return [command, path_text]
+
+    @staticmethod
+    def _play_windows(path: Path) -> None:
+        try:
+            import winsound
+
+            winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+            log(f"[AUDIO] playing {path.name} via winsound")
+        except Exception as exc:
+            log(f"[AUDIO] winsound failed: {exc}")
 
 
 @dataclass(frozen=True)
@@ -121,11 +201,13 @@ class TcpHost(threading.Thread):
         config: HostConfig,
         stop_event: threading.Event,
         voice_package: VoicePackage | None = None,
+        audio_player: AudioPlayer | None = None,
     ) -> None:
         super().__init__(daemon=True)
         self.config = config
         self.stop_event = stop_event
         self.voice_package = voice_package
+        self.audio_player = audio_player
         self._server: socket.socket | None = None
         self._last_active = False
         self._lock = threading.Lock()
@@ -228,6 +310,10 @@ class TcpHost(threading.Thread):
             f"text={entry.text}"
         )
         log(f"[{self.config.name}] robot wav_path {wav}")
+        if exists and self.audio_player is not None and entry.wav_path is not None:
+            played = self.audio_player.play(entry.wav_path)
+            if not played:
+                log(f"[{self.config.name}] robot local playback skipped")
 
     def _send_ack(self, conn: socket.socket, **payload: object) -> None:
         body = {"host": self.config.name, **payload}
@@ -261,6 +347,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--voice-md", type=Path, help="Path to playback Markdown if not using a package directory")
     parser.add_argument("--audio-root", type=Path, help="Path to package audio directory")
     parser.add_argument("--no-voice-package", action="store_true", help="Disable robot voice-package lookup")
+    parser.add_argument("--no-play-audio", action="store_true", help="Only log would_play; do not play WAV on this PC")
+    parser.add_argument("--audio-player", default="auto", help="Local WAV player command: auto, pw-play, paplay, aplay, ffplay, afplay. Default: auto")
     parser.add_argument("--ack", action="store_true", help="Send JSON ACK lines back to clients.")
     parser.add_argument("--self-test", action="store_true", help="Run local sample clients and exit.")
     return parser
@@ -291,6 +379,10 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             log(f"[ROBOT_HOST] voice package unavailable: {exc}")
 
+    audio_player = AudioPlayer(enabled=not args.no_play_audio, command=args.audio_player)
+    if args.no_play_audio:
+        log("[ROBOT_HOST] local WAV playback disabled")
+
     hosts = [
         TcpHost(
             HostConfig(
@@ -303,6 +395,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
             stop_event,
             voice_package,
+            audio_player,
         ),
         TcpHost(
             HostConfig(
@@ -348,6 +441,7 @@ def main(argv: list[str] | None = None) -> int:
         log("stopping...")
     finally:
         stop_event.set()
+        audio_player.stop()
         for host in hosts:
             host.stop()
         for host in hosts:

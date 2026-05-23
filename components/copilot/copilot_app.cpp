@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
 
 #include "cJSON.h"
 #include "esp_heap_caps.h"
@@ -62,8 +63,8 @@ struct copilot_action_t {
     uint32_t generation;
     char sound_id[16];
     char scene_id[32];
+    char sequence_id[96];
     char message_id[32];
-    uint16_t sequence_id;
     bool use_scene_audio;
     bool calibration_content_present;
     bool visual_semantic_content_present;
@@ -149,10 +150,10 @@ static void copilot_audio_file_event_handler(const copilot_audio_file_event_t *e
     if (!event) {
         return;
     }
-    ESP_LOGI(TAG, "SD audio event kind=%d scene=%s seq=%u path=%s error=%s",
+    ESP_LOGI(TAG, "SD audio event kind=%d scene=%s seq=%s path=%s error=%s",
              (int)event->kind,
              event->scene ? event->scene : "",
-             (unsigned)event->sequence,
+             event->sequence ? event->sequence : "",
              event->path ? event->path : "",
              event->error ? event->error : "");
     copilot_schedule_screen_state(COPILOT_SCREEN_STATE_RETURN_NEUTRAL,
@@ -233,10 +234,10 @@ static void copilot_action_task(void *arg) {
                 }
                 copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_SPEAKING,
                                             action.duration_ms > 0 ? action.duration_ms : 0);
-                LOGI_APP("Play scene audio scene=%s seq=%u", action.scene_id, (unsigned)action.sequence_id);
+                LOGI_APP("Play scene audio scene=%s seq=%s", action.scene_id, action.sequence_id);
                 if (!copilot_audio_play_scene(action.scene_id, action.sequence_id)) {
-                    ESP_LOGW(TAG, "Scene audio queue failed: scene=%s seq=%u",
-                             action.scene_id, (unsigned)action.sequence_id);
+                    ESP_LOGW(TAG, "Scene audio queue failed: scene=%s seq=%s",
+                             action.scene_id, action.sequence_id);
                     copilot_apply_screen_action(&action, COPILOT_SCREEN_STATE_RETURN_NEUTRAL, 520);
                 }
                 continue;
@@ -386,7 +387,7 @@ static void copilot_schedule_sound(const char *sound_id, uint32_t prelight_ms) {
     copilot_enqueue_action(&action);
 }
 
-static void copilot_schedule_scene_sound(const char *scene_id, uint16_t sequence_id,
+static void copilot_schedule_scene_sound(const char *scene_id, const char *sequence_id,
                                          uint32_t prelight_ms, uint32_t duration_ms,
                                          copilot_screen_orientation_t orientation,
                                          const char *message_id) {
@@ -398,15 +399,15 @@ static void copilot_schedule_scene_sound(const char *scene_id, uint16_t sequence
     action.duration_ms = duration_ms;
     action.prelight_ms = prelight_ms;
     action.use_scene_audio = true;
-    action.sequence_id = sequence_id;
+    copilot_copy_action_text(action.sequence_id, sizeof(action.sequence_id), sequence_id ? sequence_id : "1");
     copilot_copy_action_text(action.scene_id, sizeof(action.scene_id), scene_id ? scene_id : "default");
     copilot_copy_action_text(action.message_id, sizeof(action.message_id), message_id);
-    LOGI_APP("Schedule scene audio scene=%s seq=%u prelight=%u duration=%u",
-             action.scene_id, (unsigned)sequence_id, (unsigned)prelight_ms, (unsigned)duration_ms);
+    LOGI_APP("Schedule scene audio scene=%s seq=%s prelight=%u duration=%u",
+             action.scene_id, action.sequence_id, (unsigned)prelight_ms, (unsigned)duration_ms);
     copilot_enqueue_action(&action);
 }
 
-static void copilot_play_scene_sound_now(const char *scene_id, uint16_t sequence_id,
+static void copilot_play_scene_sound_now(const char *scene_id, const char *sequence_id,
                                          uint32_t duration_ms,
                                          copilot_screen_orientation_t orientation,
                                          const char *message_id) {
@@ -420,15 +421,15 @@ static void copilot_play_scene_sound_now(const char *scene_id, uint16_t sequence
     action.duration_ms = duration_ms;
     action.prelight_ms = 0;
     action.use_scene_audio = true;
-    action.sequence_id = sequence_id;
+    copilot_copy_action_text(action.sequence_id, sizeof(action.sequence_id), sequence_id ? sequence_id : "1");
     action.generation = s_action_generation;
     copilot_copy_action_text(action.scene_id, sizeof(action.scene_id), scene_id ? scene_id : "default");
     copilot_copy_action_text(action.message_id, sizeof(action.message_id), message_id);
 
     action.type = ACTION_SCREEN_STATE;
-    if (!copilot_audio_play_scene(action.scene_id, sequence_id)) {
-        ESP_LOGW(TAG, "Scene audio immediate queue failed: scene=%s seq=%u",
-                 action.scene_id, (unsigned)sequence_id);
+    if (!copilot_audio_play_scene(action.scene_id, action.sequence_id)) {
+        ESP_LOGW(TAG, "Scene audio immediate queue failed: scene=%s seq=%s",
+                 action.scene_id, action.sequence_id);
         action.screen_state = COPILOT_SCREEN_STATE_RETURN_NEUTRAL;
         action.orientation = COPILOT_SCREEN_ORIENT_FRONT;
         action.duration_ms = 520;
@@ -551,19 +552,47 @@ static bool copilot_get_scene_string(const cJSON *obj, char *out, size_t out_len
     return false;
 }
 
-static uint16_t copilot_get_sequence_id(const cJSON *obj, uint16_t def_value) {
+static bool copilot_get_sequence_string(const cJSON *obj, char *out, size_t out_len, const char *def_value) {
+    if (!out || out_len == 0) {
+        return false;
+    }
+    out[0] = '\0';
     const char *keys[] = {"seq", "sequence", "sequence_id", "index", "number"};
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
         const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, keys[i]);
-        if (cJSON_IsNumber(item) && item->valuedouble >= 0 && item->valuedouble <= 65535) {
-            return (uint16_t)item->valuedouble;
+        if (cJSON_IsString(item) && item->valuestring && item->valuestring[0] != '\0') {
+            strncpy(out, item->valuestring, out_len - 1);
+            out[out_len - 1] = '\0';
+            return true;
+        }
+        if (cJSON_IsNumber(item) && item->valuedouble >= 0 && item->valuedouble <= (double)UINT32_MAX) {
+            uint32_t rounded = (uint32_t)(item->valuedouble + 0.5);
+            double delta = item->valuedouble - (double)rounded;
+            if (delta >= -0.0001 && delta <= 0.0001) {
+                snprintf(out, out_len, "%lu", (unsigned long)rounded);
+                return true;
+            }
         }
     }
     const cJSON *id = cJSON_GetObjectItemCaseSensitive(obj, "id");
-    if (cJSON_IsNumber(id) && id->valuedouble >= 0 && id->valuedouble <= 65535) {
-        return (uint16_t)id->valuedouble;
+    if (cJSON_IsString(id) && id->valuestring && id->valuestring[0] != '\0') {
+        strncpy(out, id->valuestring, out_len - 1);
+        out[out_len - 1] = '\0';
+        return true;
     }
-    return def_value;
+    if (cJSON_IsNumber(id) && id->valuedouble >= 0 && id->valuedouble <= (double)UINT32_MAX) {
+        uint32_t rounded = (uint32_t)(id->valuedouble + 0.5);
+        double delta = id->valuedouble - (double)rounded;
+        if (delta >= -0.0001 && delta <= 0.0001) {
+            snprintf(out, out_len, "%lu", (unsigned long)rounded);
+            return true;
+        }
+    }
+    if (def_value && def_value[0] != '\0') {
+        strncpy(out, def_value, out_len - 1);
+        out[out_len - 1] = '\0';
+    }
+    return false;
 }
 
 static copilot_screen_orientation_t copilot_orientation_from_name(const char *name) {
@@ -789,18 +818,20 @@ void copilot_app_handle_command(const char *payload, int payload_len) {
         if (!seq_item) {
             seq_item = cJSON_GetObjectItemCaseSensitive(root, "sequence_id");
         }
-        bool has_sequence = cJSON_IsNumber(seq_item);
+        bool has_sequence = (cJSON_IsString(seq_item) && seq_item->valuestring && seq_item->valuestring[0] != '\0') ||
+                            cJSON_IsNumber(seq_item);
         if (has_scene || has_sequence) {
             if (scene_id[0] == '\0') {
                 strncpy(scene_id, "default", sizeof(scene_id) - 1);
                 scene_id[sizeof(scene_id) - 1] = '\0';
             }
-            uint16_t sequence_id = copilot_get_sequence_id(root, 1);
+            char sequence_id[96];
+            copilot_get_sequence_string(root, sequence_id, sizeof(sequence_id), "1");
             uint32_t prelight_ms = copilot_get_u32(root, "prelight_ms", 0);
             uint32_t duration_ms = copilot_get_u32(root, "duration_ms", 0);
             copilot_screen_orientation_t orientation = copilot_get_orientation(root);
             const char *message_id = copilot_get_string_any(root, "message_id", nullptr, "");
-            ESP_LOGI(TAG, "Scene audio cmd: scene=%s seq=%u", scene_id, (unsigned)sequence_id);
+            ESP_LOGI(TAG, "Scene audio cmd: scene=%s seq=%s", scene_id, sequence_id);
             if (prelight_ms == 0) {
                 copilot_play_scene_sound_now(scene_id, sequence_id, duration_ms, orientation, message_id);
             } else {

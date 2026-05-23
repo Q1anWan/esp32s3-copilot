@@ -1,7 +1,11 @@
 # Auto-generated / experiment-day time base for NOMIRobotStart_ESP32.inc
 #
-# Current frame format:
+# Legacy direct-SILAB numeric test frame format:
 #   TRIGGER;TIME_LOW;TIME_HIGH;SCENE;SEQ;SPEED
+#
+# Production Python logic decision programs should send the simpler string
+# frame instead:
+#   TRIGGER;TIMESTAMP;SCENE;SEQ;SPEED
 #
 # TIME_LOW  = low 6 digits of Unix time.
 # TIME_HIGH = Unix time / 100000. The bridge floors this value to an integer.

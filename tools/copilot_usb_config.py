@@ -6,6 +6,7 @@ Works on Windows and Ubuntu with pyserial:
   python tools/copilot_usb_config.py mqtt --broker mqtt://192.168.0.10:1883
   python tools/copilot_usb_config.py status
   python tools/copilot_usb_config.py play --scene boot --seq 1
+  python tools/copilot_usb_config.py play --scene common --seq left_rear_vehicle_merge
   python tools/copilot_usb_config.py monitor
 """
 
@@ -311,7 +312,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     play = sub.add_parser("play", help="Play /sdcard/audio/<scene>/<seq>.wav")
     play.add_argument("--scene", required=True)
-    play.add_argument("--seq", required=True, type=int)
+    play.add_argument("--seq", required=True, help="File stem under the scene folder. Numeric 1 also resolves to 001.wav.")
     play.set_defaults(func=cmd_play)
 
     debug = sub.add_parser("debug", help="Turn selected firmware debug logs on/off")

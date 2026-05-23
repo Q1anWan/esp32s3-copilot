@@ -30,12 +30,12 @@ static copilot_tcp_cmd_cb s_cmd_cb = nullptr;
 static char s_tcp_rx_buf[128];
 static char s_tcp_line_buf[512];
 static char s_tcp_status_buf[1024];
-static char s_tcp_payload_buf[128];
-static char s_tcp_ack_buf[128];
+static char s_tcp_payload_buf[256];
+static char s_tcp_ack_buf[256];
 #if CONFIG_COPILOT_TCP_AUDIO_ID_ENABLE
 static bool s_audio_id_trigger_latched = false;
 static char s_audio_id_last_scene[32];
-static uint16_t s_audio_id_last_seq = 0;
+static char s_audio_id_last_seq[96];
 static TickType_t s_audio_id_last_tick = 0;
 #endif
 
@@ -43,7 +43,7 @@ static TickType_t s_audio_id_last_tick = 0;
 struct audio_id_packet_t {
     double trigger;
     char scene[32];
-    uint16_t seq;
+    char seq[96];
 };
 #endif
 
@@ -93,48 +93,28 @@ static bool starts_with_ci(const char *s, const char *prefix) {
     return true;
 }
 
-#if CONFIG_COPILOT_TCP_AUDIO_ID_ENABLE
-static bool is_token_separator(char c) {
-    return c == '\0' || c == ',' || c == '\t' || c == ' ' || c == '\r' || c == '\n';
-}
-
-static bool is_scene_token_char(char c) {
+static bool is_audio_id_token_char(char c) {
     return (c >= 'a' && c <= 'z') ||
            (c >= 'A' && c <= 'Z') ||
            (c >= '0' && c <= '9') ||
            c == '_' || c == '-';
 }
 
-static bool is_valid_scene_token(const char *token) {
+static bool is_valid_audio_id_token(const char *token) {
     if (!token || token[0] == '\0') {
         return false;
     }
     for (size_t i = 0; token[i] != '\0'; ++i) {
-        if (!is_scene_token_char(token[i])) {
+        if (!is_audio_id_token_char(token[i])) {
             return false;
         }
     }
     return true;
 }
 
-static bool parse_u32_token(const char *token, uint32_t *out) {
-    if (!token || token[0] == '\0' || !out) {
-        return false;
-    }
-    char *end = nullptr;
-    errno = 0;
-    double value = strtod(token, &end);
-    if (end == token || *end != '\0' || errno == ERANGE ||
-        value < 0.0 || value > (double)UINT32_MAX) {
-        return false;
-    }
-    uint32_t rounded = (uint32_t)(value + 0.5);
-    double delta = value - (double)rounded;
-    if (delta < -0.0001 || delta > 0.0001) {
-        return false;
-    }
-    *out = rounded;
-    return true;
+#if CONFIG_COPILOT_TCP_AUDIO_ID_ENABLE
+static bool is_token_separator(char c) {
+    return c == '\0' || c == ',' || c == '\t' || c == ' ' || c == '\r' || c == '\n';
 }
 
 static bool parse_double_token(const char *token, double *out) {
@@ -156,7 +136,7 @@ static bool parse_audio_id_packet(const char *line, audio_id_packet_t *out) {
         return false;
     }
 
-    char tokens[3][32] = {};
+    char tokens[3][96] = {};
     int count = 0;
     const char *p = line;
     while (*p != '\0' && count < 3) {
@@ -199,25 +179,15 @@ static bool parse_audio_id_packet(const char *line, audio_id_packet_t *out) {
         return false;
     }
 
-    uint32_t seq = 0;
-    if (!parse_u32_token(tokens[2], &seq) || seq == 0 || seq > 65535) {
+    if (!is_valid_audio_id_token(tokens[1]) || !is_valid_audio_id_token(tokens[2])) {
         return false;
     }
 
-    uint32_t numeric_scene = 0;
-    if (parse_u32_token(tokens[1], &numeric_scene)) {
-        snprintf(out->scene, sizeof(out->scene), "%s%03lu",
-                 CONFIG_COPILOT_TCP_AUDIO_ID_NUMERIC_SCENE_PREFIX,
-                 (unsigned long)numeric_scene);
-    } else {
-        if (!is_valid_scene_token(tokens[1])) {
-            return false;
-        }
-        strncpy(out->scene, tokens[1], sizeof(out->scene) - 1);
-        out->scene[sizeof(out->scene) - 1] = '\0';
-    }
+    strncpy(out->scene, tokens[1], sizeof(out->scene) - 1);
+    out->scene[sizeof(out->scene) - 1] = '\0';
+    strncpy(out->seq, tokens[2], sizeof(out->seq) - 1);
+    out->seq[sizeof(out->seq) - 1] = '\0';
     out->trigger = trigger;
-    out->seq = (uint16_t)seq;
     return true;
 }
 
@@ -237,13 +207,14 @@ static bool should_accept_audio_id_packet(const audio_id_packet_t *packet) {
     TickType_t dedupe = pdMS_TO_TICKS(CONFIG_COPILOT_TCP_AUDIO_ID_DEDUPE_MS);
     if (s_audio_id_last_tick != 0 &&
         now - s_audio_id_last_tick < dedupe &&
-        s_audio_id_last_seq == packet->seq &&
+        strcmp(s_audio_id_last_seq, packet->seq) == 0 &&
         strcmp(s_audio_id_last_scene, packet->scene) == 0) {
         return false;
     }
     strncpy(s_audio_id_last_scene, packet->scene, sizeof(s_audio_id_last_scene) - 1);
     s_audio_id_last_scene[sizeof(s_audio_id_last_scene) - 1] = '\0';
-    s_audio_id_last_seq = packet->seq;
+    strncpy(s_audio_id_last_seq, packet->seq, sizeof(s_audio_id_last_seq) - 1);
+    s_audio_id_last_seq[sizeof(s_audio_id_last_seq) - 1] = '\0';
     s_audio_id_last_tick = now;
     return true;
 }
@@ -256,41 +227,42 @@ static void handle_audio_id_packet(int fd, const audio_id_packet_t *packet) {
     bool accepted = should_accept_audio_id_packet(packet);
     if (accepted && s_cmd_cb) {
         snprintf(s_tcp_payload_buf, sizeof(s_tcp_payload_buf),
-                 "{\"type\":\"play\",\"scene\":\"%s\",\"seq\":%u,\"message_id\":\"tcp_audio_id\"}",
-                 packet->scene, (unsigned)packet->seq);
+                 "{\"type\":\"play\",\"scene\":\"%s\",\"seq\":\"%s\",\"message_id\":\"tcp_audio_id\"}",
+                 packet->scene, packet->seq);
         s_cmd_cb(s_tcp_payload_buf, (int)strlen(s_tcp_payload_buf));
     }
 
     const char *state = accepted ? "accepted" : (packet->trigger >= 0.5 ? "held_or_deduped" : "inactive");
-    ESP_LOGI(TAG, "TCP audio ID %s trigger=%.3f scene=%s seq=%u",
+    ESP_LOGI(TAG, "TCP audio ID %s trigger=%.3f scene=%s seq=%s",
              state,
              packet->trigger,
              packet->scene,
-             (unsigned)packet->seq);
+             packet->seq);
     snprintf(s_tcp_ack_buf, sizeof(s_tcp_ack_buf),
-             "{\"ok\":true,\"cmd\":\"audio_id\",\"trigger\":%.3f,\"scene\":\"%s\",\"seq\":%u,\"accepted\":%s}",
-             packet->trigger, packet->scene, (unsigned)packet->seq, accepted ? "true" : "false");
+             "{\"ok\":true,\"cmd\":\"audio_id\",\"trigger\":%.3f,\"scene\":\"%s\",\"seq\":\"%s\",\"accepted\":%s}",
+             packet->trigger, packet->scene, packet->seq, accepted ? "true" : "false");
     tcp_send_line(fd, s_tcp_ack_buf);
 }
 #endif
 
 static void handle_play_text(int fd, const char *line) {
     char scene[32] = {};
-    unsigned seq = 0;
-    if (sscanf(line, "%*s %31s %u", scene, &seq) != 2 || seq > 65535) {
+    char seq[96] = {};
+    if (sscanf(line, "%*s %31s %95s", scene, seq) != 2 ||
+        !is_valid_audio_id_token(scene) || !is_valid_audio_id_token(seq)) {
         tcp_send_line(fd, "{\"ok\":false,\"error\":\"usage: PLAY <scene> <seq>\"}");
         return;
     }
 
     snprintf(s_tcp_payload_buf, sizeof(s_tcp_payload_buf),
-             "{\"type\":\"play\",\"scene\":\"%s\",\"seq\":%u}",
+             "{\"type\":\"play\",\"scene\":\"%s\",\"seq\":\"%s\"}",
              scene, seq);
     if (s_cmd_cb) {
         s_cmd_cb(s_tcp_payload_buf, (int)strlen(s_tcp_payload_buf));
     }
 
     snprintf(s_tcp_ack_buf, sizeof(s_tcp_ack_buf),
-             "{\"ok\":true,\"cmd\":\"play\",\"scene\":\"%s\",\"seq\":%u}",
+             "{\"ok\":true,\"cmd\":\"play\",\"scene\":\"%s\",\"seq\":\"%s\"}",
              scene, seq);
     tcp_send_line(fd, s_tcp_ack_buf);
 }

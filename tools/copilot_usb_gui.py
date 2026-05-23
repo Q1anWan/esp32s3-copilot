@@ -25,7 +25,12 @@ from tkinter import messagebox, ttk
 
 DEFAULT_BAUD = 115_200
 DEFAULT_TCP_PORT = 7777
-DEFAULT_SCENES = ("boot", "hachimi", "default")
+DEFAULT_SCENES = ("boot", "hachimi", "default", "common")
+
+
+def audio_id_token_is_valid(token: str) -> bool:
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+    return bool(token) and all(c in allowed for c in token)
 
 
 def require_serial():
@@ -290,8 +295,8 @@ class CopilotUsbGui(tk.Tk):
         self.scene_combo.grid(row=0, column=1, sticky="ew", padx=8, pady=(8, 4))
 
         ttk.Label(box, text="Seq").grid(row=1, column=0, sticky="w", padx=8, pady=4)
-        self.seq_var = tk.IntVar(value=1)
-        ttk.Spinbox(box, from_=1, to=65535, textvariable=self.seq_var, width=10).grid(
+        self.seq_var = tk.StringVar(value="1")
+        ttk.Entry(box, textvariable=self.seq_var, width=20).grid(
             row=1, column=1, sticky="w", padx=8, pady=4
         )
 
@@ -303,9 +308,11 @@ class CopilotUsbGui(tk.Tk):
         quick.grid(row=3, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
         for col in range(3):
             quick.columnconfigure(col, weight=1)
-        ttk.Button(quick, text="boot/001", command=lambda: self.play("boot", 1)).grid(row=0, column=0, sticky="ew")
-        ttk.Button(quick, text="hachimi/001", command=lambda: self.play("hachimi", 1)).grid(row=0, column=1, sticky="ew", padx=4)
-        ttk.Button(quick, text="default/001", command=lambda: self.play("default", 1)).grid(row=0, column=2, sticky="ew")
+        ttk.Button(quick, text="boot/001", command=lambda: self.play("boot", "1")).grid(row=0, column=0, sticky="ew")
+        ttk.Button(quick, text="hachimi/001", command=lambda: self.play("hachimi", "1")).grid(row=0, column=1, sticky="ew", padx=4)
+        ttk.Button(quick, text="common/merge", command=lambda: self.play("common", "left_rear_vehicle_merge")).grid(
+            row=0, column=2, sticky="ew"
+        )
 
     def _build_tools(self, parent: ttk.Frame) -> None:
         box = ttk.LabelFrame(parent, text="Tools")
@@ -347,12 +354,12 @@ class CopilotUsbGui(tk.Tk):
         ttk.Entry(box, textvariable=self.audio_id_trigger_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=4)
 
         ttk.Label(box, text="Scene").grid(row=3, column=0, sticky="w", padx=8, pady=4)
-        self.audio_id_scene_var = tk.StringVar(value="1")
+        self.audio_id_scene_var = tk.StringVar(value="common")
         ttk.Entry(box, textvariable=self.audio_id_scene_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=4)
 
         ttk.Label(box, text="Seq").grid(row=4, column=0, sticky="w", padx=8, pady=4)
-        self.audio_id_seq_var = tk.IntVar(value=1)
-        ttk.Entry(box, textvariable=self.audio_id_seq_var, width=10).grid(row=4, column=1, sticky="w", padx=8, pady=4)
+        self.audio_id_seq_var = tk.StringVar(value="left_rear_vehicle_merge")
+        ttk.Entry(box, textvariable=self.audio_id_seq_var, width=20).grid(row=4, column=1, sticky="w", padx=8, pady=4)
 
         buttons = ttk.Frame(box)
         buttons.grid(row=5, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
@@ -488,17 +495,17 @@ class CopilotUsbGui(tk.Tk):
             raise RuntimeError("TCP host is empty. Run USB Status first or type the ESP32 IP.")
         return host, int(self.tcp_port_var.get())
 
-    def _format_audio_id_line(self, trigger: float | None = None, scene: str | None = None, seq: int | None = None) -> str:
+    def _format_audio_id_line(self, trigger: float | None = None, scene: str | None = None, seq: str | None = None) -> str:
         trigger_value = float(self.audio_id_trigger_var.get() if trigger is None else trigger)
         scene_value = self.audio_id_scene_var.get().strip() if scene is None else str(scene).strip()
-        seq_value = int(self.audio_id_seq_var.get() if seq is None else seq)
-        if not scene_value:
-            raise RuntimeError("Scene is empty")
-        if seq_value < 1 or seq_value > 65535:
-            raise RuntimeError("Seq must be 1..65535")
+        seq_value = self.audio_id_seq_var.get().strip() if seq is None else str(seq).strip()
+        if not audio_id_token_is_valid(scene_value):
+            raise RuntimeError("Scene must use letters, digits, _ or -")
+        if not audio_id_token_is_valid(seq_value):
+            raise RuntimeError("Seq must use letters, digits, _ or -")
         return f"{trigger_value:g}\t{scene_value}\t{seq_value}\n"
 
-    def send_audio_id_packet(self, trigger: float | None = None, scene: str | None = None, seq: int | None = None) -> None:
+    def send_audio_id_packet(self, trigger: float | None = None, scene: str | None = None, seq: str | None = None) -> None:
         try:
             host, port = self._tcp_target()
             line = self._format_audio_id_line(trigger, scene, seq)
@@ -579,19 +586,17 @@ class CopilotUsbGui(tk.Tk):
         self.send_command("status")
 
     def play_selected(self) -> None:
-        try:
-            seq = int(self.seq_var.get())
-        except (TypeError, ValueError):
-            messagebox.showwarning("Audio", "Seq must be a number")
-            return
+        seq = self.seq_var.get().strip()
         self.play(self.scene_var.get().strip(), seq)
 
-    def play(self, scene: str, seq: int) -> None:
-        if not scene:
-            messagebox.showwarning("Audio", "Scene is empty")
+    def play(self, scene: str, seq: str) -> None:
+        scene = str(scene).strip()
+        seq = str(seq).strip()
+        if not audio_id_token_is_valid(scene):
+            messagebox.showwarning("Audio", "Scene must use letters, digits, _ or -")
             return
-        if seq < 1 or seq > 65535:
-            messagebox.showwarning("Audio", "Seq must be 1..65535")
+        if not audio_id_token_is_valid(seq):
+            messagebox.showwarning("Audio", "Seq must use letters, digits, _ or -")
             return
         self.scene_var.set(scene)
         self.seq_var.set(seq)

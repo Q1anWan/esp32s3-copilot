@@ -100,6 +100,25 @@ static bool starts_with_ci(const char *s, const char *prefix) {
     return true;
 }
 
+static bool is_audio_id_token_char(char c) {
+    return (c >= 'a' && c <= 'z') ||
+           (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') ||
+           c == '_' || c == '-';
+}
+
+static bool is_valid_audio_id_token(const char *token) {
+    if (!token || token[0] == '\0') {
+        return false;
+    }
+    for (size_t i = 0; token[i] != '\0'; ++i) {
+        if (!is_audio_id_token_char(token[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void print_status(void) {
     if (copilot_app_format_status(s_status_buf, sizeof(s_status_buf))) {
         printf("COPILOT_STATUS %s\n", s_status_buf);
@@ -224,14 +243,15 @@ static void handle_text_command(char *line) {
 
     if (starts_with_ci(line, "play ")) {
         char scene[32] = {};
-        unsigned seq = 0;
-        if (sscanf(line, "%*s %31s %u", scene, &seq) == 2 && seq <= 65535) {
-            char payload[128];
+        char seq[96] = {};
+        if (sscanf(line, "%*s %31s %95s", scene, seq) == 2 &&
+            is_valid_audio_id_token(scene) && is_valid_audio_id_token(seq)) {
+            char payload[192];
             snprintf(payload, sizeof(payload),
-                     "{\"type\":\"play\",\"scene\":\"%s\",\"seq\":%u}",
+                     "{\"type\":\"play\",\"scene\":\"%s\",\"seq\":\"%s\"}",
                      scene, seq);
             copilot_app_handle_command(payload, (int)strlen(payload));
-            printf("COPILOT_OK play scene=%s seq=%u\n", scene, seq);
+            printf("COPILOT_OK play scene=%s seq=%s\n", scene, seq);
         } else {
             printf("COPILOT_ERROR play_usage\n");
         }

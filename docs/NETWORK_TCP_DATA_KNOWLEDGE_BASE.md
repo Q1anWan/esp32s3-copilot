@@ -251,14 +251,14 @@ TRIGGER;TIMESTAMP;SCENE;SEQ;SPEED<LF>
 | --- | --- | --- | --- |
 | `TRIGGER` | 数字 | `0` / `1` | 触发标记。`>= 0.5` 视为有效 |
 | `TIMESTAMP` | 整数或浮点数字符串 | `1779235200` | 完整 Unix 时间戳，优先使用整数秒 |
-| `SCENE` | 字符串 | `boot` | 场景名称，直接对应 TF 卡目录名 |
-| `SEQ` | 整数 | `1` | 序号 ID，映射为 `001.wav` |
+| `SCENE` | 字符串 | `common` | 场景名称，直接对应 TF 卡目录名 |
+| `SEQ` | 字符串 | `left_rear_vehicle_merge` | 文件名 stem，不含 `.wav` 后缀 |
 | `SPEED` | 数字 | `1.2` | 速度，给实验员观察和判定状态 |
 
 例子：
 
 ```text
-1;1779235200;boot;1;1.2
+1;1779235200;common;left_rear_vehicle_merge;1.2
 ```
 
 Bridge 解析结果：
@@ -266,12 +266,12 @@ Bridge 解析结果：
 ```text
 timestamp = 1779235200
 trigger   = 1
-scene     = boot
-seq       = 1
+scene     = common
+seq       = left_rear_vehicle_merge
 speed     = 1.2
 ```
 
-由于这条帧由 Python 逻辑判定程序生成，不再受 SILAB 原始数据口限制，所以不需要把时间拆成 `TIME_LOW` 和 `TIME_HIGH`，也不需要用数字场景 ID 再做别名映射。逻辑判定程序应该直接输出完整时间戳和最终场景名称。
+由于这条帧由 Python 逻辑判定程序生成，不再受 SILAB 原始数据口限制，所以不需要把时间拆成 `TIME_LOW` 和 `TIME_HIGH`，也不需要用数字场景 ID 再做别名映射。逻辑判定程序应该直接输出完整时间戳、最终场景名称和最终文件名 stem。
 
 ### Bridge -> ESP32
 
@@ -295,7 +295,7 @@ trigger,timestamp,scene,seq,speed;
 例子：
 
 ```text
-1,1779235200,boot,1,1.2;
+1,1779235200,common,left_rear_vehicle_merge,1.2;
 ```
 
 HRT 发送不是上升沿触发，而是每条合法帧都发送，方便记录完整状态。如果某个旧版 HRT 脚本仍要求 `timestamp,trigger,scene,seq,speed;`，应在逻辑判定程序里单独做适配，不应让 Bridge 或 ESP32 继续背负旧格式。
@@ -304,14 +304,14 @@ HRT 发送不是上升沿触发，而是每条合法帧都发送，方便记录�
 
 ### 整数优先
 
-时间戳、序号这类字段应尽量使用整数。整数在文本中传输时不会丢精度，解析后也稳定。
+时间戳这类数值字段应尽量使用整数。整数在文本中传输时不会丢精度，解析后也稳定。`SCENE` 和 `SEQ` 属于标识符，不属于数值字段，应按字符串处理。
 
 推荐：
 
 ```text
 TIMESTAMP=1779235200
-SCENE=boot
-SEQ=1
+SCENE=common
+SEQ=left_rear_vehicle_merge
 ```
 
 不推荐：
@@ -320,6 +320,8 @@ SEQ=1
 TIMESTAMP=1779235200.0000000001
 SEQ=1.00001
 ```
+
+`SEQ=1.00001` 不推荐的原因不是数值精度，而是它包含小数点，不是合法文件名 stem。若要播放旧式数字文件，可以发送字符串 `SEQ=1`，ESP32 会兼容查找 `001.wav`。
 
 ### 浮点数适合观察量
 
@@ -427,7 +429,7 @@ TIME_HIGH 来自 1779300000
 JSON 适合 ESP32/MQTT 这类命令：
 
 ```json
-{"type":"play","scene":"boot","seq":1}
+{"type":"play","scene":"common","seq":"left_rear_vehicle_merge"}
 ```
 
 优点：
@@ -547,15 +549,15 @@ hrt_device_packet: ...
 ### 用 simulator 模拟逻辑判定程序
 
 ```bash
-python3 tools/silab_tcp_simulator.py --host 127.0.0.1 --port 7777 --scene boot --seq 1 --read-ack --verbose
+python3 tools/silab_tcp_simulator.py --host 127.0.0.1 --port 7777 --scene common --seq left_rear_vehicle_merge --read-ack --verbose
 ```
 
 默认会发送：
 
 ```text
-0;1779235199;boot;1;0
-1;1779235200;boot;1;1.2
-0;1779235201;boot;1;0
+0;1779235199;common;left_rear_vehicle_merge;0
+1;1779235200;common;left_rear_vehicle_merge;1.2
+0;1779235201;common;left_rear_vehicle_merge;0
 ```
 
 ### GUI 日志应该看什么
@@ -563,10 +565,10 @@ python3 tools/silab_tcp_simulator.py --host 127.0.0.1 --port 7777 --scene boot -
 正常链路里，GUI 日志应能看到：
 
 ```text
-[logic] #... play ts=... trigger=1 scene=boot seq=1 speed=1.2
-[direct] play boot/001 sent ...
+[logic] #... play ts=... trigger=1 scene=common seq=left_rear_vehicle_merge speed=1.2
+[direct] play common/left_rear_vehicle_merge sent ...
 [esp32] screen speaking ...
-[audio] played /sdcard/audio/boot/001.wav ...
+[audio] played /sdcard/audio/common/left_rear_vehicle_merge.wav ...
 ```
 
 如果没有播放，优先检查：
@@ -574,7 +576,7 @@ python3 tools/silab_tcp_simulator.py --host 127.0.0.1 --port 7777 --scene boot -
 - 逻辑判定程序是否连到了 Bridge 主机 IP 和端口。
 - GUI 是否已经 `Start TCP Host`。
 - `TRIGGER` 是否真的从 0 变 1。
-- `SCENE` 和 `SEQ` 是否能映射到 TF 卡文件，例如 `/sdcard/audio/boot/001.wav`。
+- `SCENE` 和 `SEQ` 是否能映射到 TF 卡文件，例如 `/sdcard/audio/common/left_rear_vehicle_merge.wav`。数字字符串 `SEQ=1` 仍会兼容查找 `001.wav`。
 - ESP32 是否在线，TF 卡是否 mounted。
 
 ## 11. 一句话总结

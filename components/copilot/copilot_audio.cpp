@@ -50,6 +50,7 @@ static const int kSampleRate = 16000;
 
 #define AUDIO_TASK_STACK_BYTES (12 * 1024)
 #define AUDIO_SCENE_ID_MAX 32
+#define AUDIO_SEQUENCE_ID_MAX 96
 #define AUDIO_FILE_CHUNK_SAMPLES 128
 
 enum audio_req_kind_t {
@@ -65,7 +66,7 @@ struct audio_req_t {
     uint32_t generation;
     char path[COPILOT_AUDIO_PATH_MAX];
     char scene[AUDIO_SCENE_ID_MAX];
-    uint16_t sequence;
+    char sequence[AUDIO_SEQUENCE_ID_MAX];
 };
 
 static const UBaseType_t kAudioQueueLen = 6;
@@ -198,25 +199,25 @@ static bool copilot_path_exists(const char *path) {
     return path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
-static bool copilot_is_scene_char(char c) {
+static bool copilot_is_audio_id_char(char c) {
     return (c >= 'a' && c <= 'z') ||
            (c >= 'A' && c <= 'Z') ||
            (c >= '0' && c <= '9') ||
            c == '_' || c == '-';
 }
 
-static void copilot_sanitize_scene(const char *scene, char *out, size_t out_len) {
+static void copilot_sanitize_audio_id(const char *text, const char *fallback, char *out, size_t out_len) {
     if (!out || out_len == 0) {
         return;
     }
-    if (!scene || scene[0] == '\0') {
-        scene = "default";
+    if (!text || text[0] == '\0') {
+        text = fallback && fallback[0] ? fallback : "default";
     }
 
     size_t w = 0;
-    for (size_t i = 0; scene[i] != '\0' && w + 1 < out_len; ++i) {
-        char c = scene[i];
-        if (copilot_is_scene_char(c)) {
+    for (size_t i = 0; text[i] != '\0' && w + 1 < out_len; ++i) {
+        char c = text[i];
+        if (copilot_is_audio_id_char(c)) {
             out[w++] = c;
         } else if (c == ' ' || c == '.') {
             out[w++] = '_';
@@ -231,31 +232,69 @@ static void copilot_sanitize_scene(const char *scene, char *out, size_t out_len)
     out[w] = '\0';
 }
 
-static bool copilot_audio_resolve_scene_path(const char *scene_id, uint16_t sequence_id,
+static bool copilot_parse_u32_exact(const char *text, uint32_t *out) {
+    if (!text || text[0] == '\0' || !out) {
+        return false;
+    }
+    uint32_t value = 0;
+    for (size_t i = 0; text[i] != '\0'; ++i) {
+        if (text[i] < '0' || text[i] > '9') {
+            return false;
+        }
+        uint32_t digit = (uint32_t)(text[i] - '0');
+        if (value > (UINT32_MAX - digit) / 10u) {
+            return false;
+        }
+        value = value * 10u + digit;
+    }
+    *out = value;
+    return true;
+}
+
+static bool copilot_audio_resolve_scene_path(const char *scene_id, const char *sequence_id,
                                              char *out_path, size_t out_len) {
     if (!out_path || out_len == 0) {
         return false;
     }
 
     char scene[AUDIO_SCENE_ID_MAX];
-    copilot_sanitize_scene(scene_id, scene, sizeof(scene));
+    char sequence[AUDIO_SEQUENCE_ID_MAX];
+    copilot_sanitize_audio_id(scene_id, "default", scene, sizeof(scene));
+    copilot_sanitize_audio_id(sequence_id, "1", sequence, sizeof(sequence));
 
-    char candidates[6][COPILOT_AUDIO_PATH_MAX];
-    snprintf(candidates[0], sizeof(candidates[0]), "%s/audio/%s/%03u.wav", BSP_SD_MOUNT_POINT, scene,
-             (unsigned)sequence_id);
-    snprintf(candidates[1], sizeof(candidates[1]), "%s/audio/%s/%u.wav", BSP_SD_MOUNT_POINT, scene,
-             (unsigned)sequence_id);
-    snprintf(candidates[2], sizeof(candidates[2]), "%s/audio/%s_%03u.wav", BSP_SD_MOUNT_POINT, scene,
-             (unsigned)sequence_id);
-    snprintf(candidates[3], sizeof(candidates[3]), "%s/audio/%s_%u.wav", BSP_SD_MOUNT_POINT, scene,
-             (unsigned)sequence_id);
-    snprintf(candidates[4], sizeof(candidates[4]), "%s/audio/%s/%03u.pcm", BSP_SD_MOUNT_POINT, scene,
-             (unsigned)sequence_id);
-    snprintf(candidates[5], sizeof(candidates[5]), "%s/audio/%s_%03u.pcm", BSP_SD_MOUNT_POINT, scene,
-             (unsigned)sequence_id);
+    char candidates[8][COPILOT_AUDIO_PATH_MAX];
+    size_t candidate_count = 0;
+    uint32_t numeric_sequence = 0;
+    if (copilot_parse_u32_exact(sequence, &numeric_sequence)) {
+        snprintf(candidates[candidate_count++], sizeof(candidates[0]), "%s/audio/%s/%03lu.wav",
+                 BSP_SD_MOUNT_POINT, scene, (unsigned long)numeric_sequence);
+        snprintf(candidates[candidate_count++], sizeof(candidates[0]), "%s/audio/%s/%lu.wav",
+                 BSP_SD_MOUNT_POINT, scene, (unsigned long)numeric_sequence);
+        snprintf(candidates[candidate_count++], sizeof(candidates[0]), "%s/audio/%s_%03lu.wav",
+                 BSP_SD_MOUNT_POINT, scene, (unsigned long)numeric_sequence);
+        snprintf(candidates[candidate_count++], sizeof(candidates[0]), "%s/audio/%s_%lu.wav",
+                 BSP_SD_MOUNT_POINT, scene, (unsigned long)numeric_sequence);
+        snprintf(candidates[candidate_count++], sizeof(candidates[0]), "%s/audio/%s/%03lu.pcm",
+                 BSP_SD_MOUNT_POINT, scene, (unsigned long)numeric_sequence);
+        snprintf(candidates[candidate_count++], sizeof(candidates[0]), "%s/audio/%s/%lu.pcm",
+                 BSP_SD_MOUNT_POINT, scene, (unsigned long)numeric_sequence);
+        snprintf(candidates[candidate_count++], sizeof(candidates[0]), "%s/audio/%s_%03lu.pcm",
+                 BSP_SD_MOUNT_POINT, scene, (unsigned long)numeric_sequence);
+        snprintf(candidates[candidate_count++], sizeof(candidates[0]), "%s/audio/%s_%lu.pcm",
+                 BSP_SD_MOUNT_POINT, scene, (unsigned long)numeric_sequence);
+    } else {
+        snprintf(candidates[candidate_count++], sizeof(candidates[0]), "%s/audio/%s/%s.wav",
+                 BSP_SD_MOUNT_POINT, scene, sequence);
+        snprintf(candidates[candidate_count++], sizeof(candidates[0]), "%s/audio/%s_%s.wav",
+                 BSP_SD_MOUNT_POINT, scene, sequence);
+        snprintf(candidates[candidate_count++], sizeof(candidates[0]), "%s/audio/%s/%s.pcm",
+                 BSP_SD_MOUNT_POINT, scene, sequence);
+        snprintf(candidates[candidate_count++], sizeof(candidates[0]), "%s/audio/%s_%s.pcm",
+                 BSP_SD_MOUNT_POINT, scene, sequence);
+    }
 
     if (copilot_audio_mount_sd()) {
-        for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        for (size_t i = 0; i < candidate_count; ++i) {
             if (copilot_path_exists(candidates[i])) {
                 strncpy(out_path, candidates[i], out_len - 1);
                 out_path[out_len - 1] = '\0';
@@ -599,8 +638,8 @@ static void copilot_audio_play_file(const audio_req_t &req) {
         bool found = copilot_audio_resolve_scene_path(play_req.scene, play_req.sequence,
                                                       play_req.path, sizeof(play_req.path));
         if (!found) {
-            ESP_LOGW(TAG, "Audio ID not found yet: scene=%s seq=%u expected=%s",
-                     play_req.scene, (unsigned)play_req.sequence, play_req.path);
+            ESP_LOGW(TAG, "Audio ID not found yet: scene=%s seq=%s expected=%s",
+                     play_req.scene, play_req.sequence, play_req.path);
         }
     }
     if (copilot_audio_req_cancelled(generation)) {
@@ -642,8 +681,10 @@ static void copilot_audio_play_file(const audio_req_t &req) {
         return;
     }
 
-    ESP_LOGI(TAG, "Play SD audio: scene=%s seq=%u path=%s",
-             play_req.scene[0] ? play_req.scene : "default", (unsigned)play_req.sequence, play_req.path);
+    ESP_LOGI(TAG, "Play SD audio: scene=%s seq=%s path=%s",
+             play_req.scene[0] ? play_req.scene : "default",
+             play_req.sequence[0] ? play_req.sequence : "1",
+             play_req.path);
     bool ok = false;
     bool cancelled = false;
     if (has_ext(play_req.path, "pcm")) {
@@ -811,19 +852,19 @@ bool copilot_audio_play_path(const char *path) {
     strncpy(req.path, path, sizeof(req.path) - 1);
     req.path[sizeof(req.path) - 1] = '\0';
     strncpy(req.scene, "path", sizeof(req.scene) - 1);
-    req.sequence = 0;
+    req.sequence[0] = '\0';
     return copilot_audio_enqueue_file(&req);
 }
 
-bool copilot_audio_play_scene(const char *scene_id, uint16_t sequence_id) {
+bool copilot_audio_play_scene(const char *scene_id, const char *sequence_id) {
     if (!s_audio_queue) {
         return false;
     }
 
     audio_req_t req = {};
     req.kind = AUDIO_REQ_FILE;
-    copilot_sanitize_scene(scene_id, req.scene, sizeof(req.scene));
-    req.sequence = sequence_id;
+    copilot_sanitize_audio_id(scene_id, "default", req.scene, sizeof(req.scene));
+    copilot_sanitize_audio_id(sequence_id, "1", req.sequence, sizeof(req.sequence));
     req.path[0] = '\0';
 
     return copilot_audio_enqueue_file(&req);

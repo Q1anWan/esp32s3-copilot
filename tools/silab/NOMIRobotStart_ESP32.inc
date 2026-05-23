@@ -1,4 +1,10 @@
-# NOMI-like desktop robot audio trigger for Copilot PC bridge + HRT
+# Legacy NOMI-like direct SILAB audio trigger example.
+#
+# Current production tests should prefer the Python logic decision program,
+# because it can send string SCENE and string SEQ values directly:
+#   TRIGGER;TIMESTAMP;SCENE;SEQ;SPEED<LF>
+#
+# This INC is kept only for SILAB-only numeric constant experiments.
 #
 # SILAB sends one text line per fixed-rate sample:
 #   TRIGGER;TIME_LOW;TIME_HIGH;SCENE;SEQ;SPEED<LF>
@@ -7,8 +13,8 @@
 # - TRIGGER:   1 while active, 0 while idle.
 # - TIME_LOW:  Low 6 digits of Unix time.
 # - TIME_HIGH: floor(Unix time / 100000). The bridge uses integer/floor.
-# - SCENE:     Audio scene ID.
-# - SEQ:       Audio sequence ID.
+# - SCENE:     Legacy numeric audio scene ID.
+# - SEQ:       Legacy numeric audio sequence ID.
 # - SPEED:     VDyn.v_kmh, used by the experimenter for observation/debug.
 #
 # The bridge reconstructs:
@@ -85,10 +91,10 @@ Connections =
     # Field 3: Unix timestamp / 100000. The bridge floors this value.
     NOMITimeHigh100000.Out -> NOMIAudioSender.DataPort3,
 
-    # Field 4: scene ID. GUI default alias maps 1 to /sdcard/audio/boot/.
+    # Field 4: legacy numeric scene ID.
     AudioSceneId.Out -> NOMIAudioSender.DataPort4,
 
-    # Field 5: sequence ID. 1 means 001.wav.
+    # Field 5: legacy numeric sequence ID.
     AudioSeqId.Out -> NOMIAudioSender.DataPort5,
 
     # Field 6: speed in km/h for observation/status/debug.

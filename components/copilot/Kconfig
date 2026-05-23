@@ -49,16 +49,10 @@ config COPILOT_TCP_AUDIO_ID_ENABLE
     help
         Accept newline-delimited packets:
         trigger<TAB>scene<TAB>seq. Trigger rising edges play the target audio.
-        Numeric scene IDs are mapped to a folder name using the configured
-        prefix, for example 1<TAB>1<TAB>1 plays scene001/001.wav.
-
-config COPILOT_TCP_AUDIO_ID_NUMERIC_SCENE_PREFIX
-    string "Numeric audio scene prefix"
-    default "scene"
-    depends on COPILOT_TCP_AUDIO_ID_ENABLE
-    help
-        Prefix used when the compact packet scene field is numeric.
-        Example: prefix "scene" maps scene ID 1 to folder scene001.
+        Scene and sequence are string IDs. Numeric sequence strings are still
+        resolved with zero-padded compatibility, for example seq "1" can play
+        001.wav, while seq "left_rear_vehicle_merge" plays
+        left_rear_vehicle_merge.wav.
 
 config COPILOT_TCP_AUDIO_ID_DEDUPE_MS
     int "Compact audio ID duplicate suppression ms"

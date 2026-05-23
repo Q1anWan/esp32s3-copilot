@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
-"""Validate SILAB TCP audio-ID packets for ESP32-S3 Copilot.
+"""Validate logic-decision TCP audio-ID packets for ESP32-S3 Copilot.
 
-Expected packet, one UTF-8/ASCII line per SILAB sample:
+Expected packet, one UTF-8/ASCII line per fixed-rate sample:
 
-  trigger;time_low;time_high;scene;seq;speed<LF>
-
-time_low is the low 6 digits of Unix time. time_high is floor(unix / 100000).
+  TRIGGER;TIMESTAMP;SCENE;SEQ;SPEED<LF>
 
 Examples:
-  1;235200;17792;1;1;1.2
-  0;235199;17792;boot;1;0
+  1;1779452836.933;common;left_rear_vehicle_merge;1.2
+  0;1779452837.333;boot;1;0
 
 The ESP32 plays only on the trigger rising edge. Repeated trigger=1 packets from
-a fixed-rate SILAB sender are intentionally ignored until trigger returns to 0.
+a fixed-rate logic sender are intentionally ignored until trigger returns to 0.
 """
 
 from __future__ import annotations
@@ -26,10 +24,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_SCENE_PREFIX = "scene"
-DEFAULT_SCENE_ALIASES = "1=boot"
-
-
 @dataclass
 class AudioIdPacket:
     text: str
@@ -37,7 +31,7 @@ class AudioIdPacket:
     timestamp_source: str
     trigger: float
     scene: str
-    seq: int
+    seq: str
     speed: float | None = None
 
 
@@ -57,35 +51,22 @@ def parse_integer_like(text: str) -> int | None:
     return rounded
 
 
+def parse_finite_float(text: str) -> float | None:
+    try:
+        value = float(text)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
 def scene_token_is_valid(scene: str) -> bool:
     if parse_integer_like(scene) is not None:
         return True
     return bool(scene) and all(c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in scene)
 
 
-def parse_scene_aliases(text: str) -> dict[int, str]:
-    aliases: dict[int, str] = {}
-    for item in text.replace(";", ",").split(","):
-        item = item.strip()
-        if not item or "=" not in item:
-            continue
-        key, value = item.split("=", 1)
-        numeric = parse_integer_like(key.strip())
-        value = value.strip()
-        if numeric is None or numeric < 0 or not scene_token_is_valid(value):
-            continue
-        aliases[numeric] = value
-    return aliases
-
-
-def normalize_scene(scene: str, prefix: str, aliases: str) -> str:
-    numeric = parse_integer_like(scene)
-    if numeric is not None:
-        alias = parse_scene_aliases(aliases).get(numeric)
-        if alias:
-            return alias
-        return f"{prefix}{numeric:03d}"
-    return scene
+def seq_token_is_valid(seq: str) -> bool:
+    return bool(seq) and all(c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in seq)
 
 
 def format_number_for_wire(value: float) -> str:
@@ -157,11 +138,26 @@ def parse_packet(data: bytes) -> AudioIdPacket | None:
         timestamp_source = "full"
         trigger_text, scene, seq_text = parts[1], parts[2], parts[3]
     elif len(parts) == 5:
-        reconstructed = reconstruct_split_timestamp(parts[0], parts[1])
-        if reconstructed is None:
-            return None
-        timestamp, timestamp_source = reconstructed
-        trigger_text, scene, seq_text = parts[2], parts[3], parts[4]
+        trigger_value = parse_finite_float(parts[0])
+        timestamp_value = parse_finite_float(parts[1])
+        speed_value = parse_finite_float(parts[4])
+        if (
+            trigger_value is not None
+            and timestamp_value is not None
+            and speed_value is not None
+            and scene_token_is_valid(parts[2])
+            and seq_token_is_valid(parts[3])
+        ):
+            timestamp = timestamp_value
+            timestamp_source = "logic_full"
+            trigger_text, scene, seq_text = parts[0], parts[2], parts[3]
+            speed = speed_value
+        else:
+            reconstructed = reconstruct_split_timestamp(parts[0], parts[1])
+            if reconstructed is None:
+                return None
+            timestamp, timestamp_source = reconstructed
+            trigger_text, scene, seq_text = parts[2], parts[3], parts[4]
     elif len(parts) == 6:
         reconstructed = reconstruct_silab_timestamp(parts[1], parts[2])
         if reconstructed is None:
@@ -180,12 +176,11 @@ def parse_packet(data: bytes) -> AudioIdPacket | None:
         trigger = float(trigger_text)
     except ValueError:
         return None
-    seq = parse_integer_like(seq_text)
-    if seq is None or seq < 1 or seq > 65535:
-        return None
     if not scene_token_is_valid(scene):
         return None
-    return AudioIdPacket(text=text, timestamp=timestamp, timestamp_source=timestamp_source, trigger=trigger, scene=scene, seq=seq, speed=speed)
+    if not seq_token_is_valid(seq_text):
+        return None
+    return AudioIdPacket(text=text, timestamp=timestamp, timestamp_source=timestamp_source, trigger=trigger, scene=scene, seq=seq_text, speed=speed)
 
 
 def append_jsonl(path: Path, record: dict) -> None:
@@ -211,9 +206,8 @@ def handle_data(data: bytes, packet_no: int, args: argparse.Namespace, state: di
     }
 
     if packet is None:
-        print("format: BAD expected trigger;time_low;time_high;scene;seq;speed")
+        print("format: BAD expected trigger;timestamp;scene;seq;speed")
     else:
-        bridge_scene = normalize_scene(packet.scene, args.scene_prefix, args.scene_aliases)
         active = packet.trigger >= args.trigger_threshold
         rising = active and not state["latched"]
         state["latched"] = active
@@ -223,7 +217,6 @@ def handle_data(data: bytes, packet_no: int, args: argparse.Namespace, state: di
                 "timestamp": packet.timestamp,
                 "timestamp_source": packet.timestamp_source,
                 "scene": packet.scene,
-                "bridge_scene": bridge_scene,
                 "seq": packet.seq,
                 "speed": packet.speed,
                 "active": active,
@@ -236,22 +229,11 @@ def handle_data(data: bytes, packet_no: int, args: argparse.Namespace, state: di
             f"source={packet.timestamp_source} trigger={packet.trigger} "
             f"scene={packet.scene} seq={packet.seq} speed={packet.speed if packet.speed is not None else '-'}"
         )
-        hrt_fields = [
-            format_number_for_wire(packet.timestamp),
-            format_number_for_wire(packet.trigger),
-            bridge_scene,
-            str(packet.seq),
-        ]
-        if packet.speed is not None:
-            hrt_fields.append(format_number_for_wire(packet.speed))
-        print(
-            "hrt_device_packet: "
-            f"{','.join(hrt_fields)};"
-        )
-        print(f"bridge_audio_id: scene={bridge_scene} seq={packet.seq}")
+        print(f"bridge_audio_id: scene={packet.scene} seq={packet.seq}")
         print(f"trigger_active={active} rising_edge={rising}")
         if rising:
-            print(f"would_play: /sdcard/audio/{bridge_scene}/{packet.seq:03d}.wav")
+            seq_file = f"{int(packet.seq):03d}" if parse_integer_like(packet.seq) is not None else packet.seq
+            print(f"would_play: /sdcard/audio/{packet.scene}/{seq_file}.wav")
 
     if args.jsonl:
         append_jsonl(Path(args.jsonl), record)
@@ -264,12 +246,12 @@ def run_server(args: argparse.Namespace) -> None:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((args.host, args.port))
         server.listen(1)
-        print(f"Waiting for SILAB TCP client on {args.host}:{args.port}")
-        print("Expected line: trigger;time_low;time_high;scene;seq;speed")
+        print(f"Waiting for logic TCP client on {args.host}:{args.port}")
+        print("Expected line: trigger;timestamp;scene;seq;speed")
 
         while True:
             conn, addr = server.accept()
-            print(f"SILAB connected: {addr}")
+            print(f"logic client connected: {addr}")
             buffer = bytearray()
             with conn:
                 while True:
@@ -294,13 +276,13 @@ def run_server(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Validate SILAB trigger/scene/seq TCP packets.")
+    parser = argparse.ArgumentParser(description="Validate logic-decision trigger/scene/seq TCP packets.")
     parser.add_argument("--host", default="0.0.0.0", help="Listen address. Default: 0.0.0.0")
     parser.add_argument("--port", type=int, default=7777, help="Listen TCP port. Default: 7777")
     parser.add_argument("--once", action="store_true", help="Exit after the first client disconnects")
     parser.add_argument("--trigger-threshold", type=float, default=0.5, help="Trigger threshold. Default: 0.5")
-    parser.add_argument("--scene-prefix", default=DEFAULT_SCENE_PREFIX, help="Numeric scene prefix. Default: scene")
-    parser.add_argument("--scene-aliases", default=DEFAULT_SCENE_ALIASES, help="Numeric scene aliases. Default: 1=boot")
+    parser.add_argument("--scene-prefix", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--scene-aliases", default="", help=argparse.SUPPRESS)
     parser.add_argument("--jsonl", default="", help="Optional path to append machine-readable packet logs")
     return parser
 

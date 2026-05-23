@@ -1,36 +1,39 @@
-# Windows 实验主机部署说明：SILAB Bridge + ESP32 音频播放
+# Windows 实验主机部署说明：Logic Bridge + ESP32 音频播放
 
 这份文档目标是把 Windows 实验主机配置成
-SILAB 与 ESP32 之间的桥接主机，并能完成播放、停止、模拟 SILAB、检查
-SILAB 数据包。
+逻辑判定程序与 ESP32 之间的桥接主机，并能完成播放、停止、模拟逻辑数据、
+检查 TCP 数据包。
 
 ## 最终交付的 5 个文件
 
 | 序号 | 类型 | 文件 | 用途 |
 | --- | --- | --- | --- |
-| 1 | 程序 | `silab_mqtt_bridge_gui.py` | Bridge 可视化程序。接收 SILAB TCP 数据，控制 ESP32 播放/停止，显示 ESP32 状态，并可转发 HRT TCP Device 数据 |
-| 2 | 程序 | `silab_tcp_simulator.py` | 模拟 SILAB 脚本。按固定频率发送 `TRIGGER;TIME_LOW;TIME_HIGH;SCENE;SEQ;SPEED` 数据包 |
-| 3 | 程序 | `silab_tcp_probe.py` | SILAB 数据包测试脚本。接收真实 SILAB 数据并打印解析结果 |
-| 4 | INC | `NOMIRobotStart_ESP32.inc` / `NOMITimeBase.inc` | SILAB 参考设计。说明 SILAB 如何向 Bridge 发送时间戳、触发标记、场景和序号 |
+| 1 | 程序 | `silab_mqtt_bridge_gui.py` | Bridge 可视化程序。接收逻辑判定程序 TCP 数据，控制 ESP32 播放/停止，显示 ESP32 状态 |
+| 2 | 程序 | `silab_tcp_simulator.py` | 模拟逻辑判定程序脚本。按固定频率发送 `TRIGGER;TIMESTAMP;SCENE;SEQ;SPEED` 数据包 |
+| 3 | 程序 | `silab_tcp_probe.py` | TCP 数据包测试脚本。接收真实逻辑判定程序数据并打印解析结果 |
+| 4 | INC | `NOMIRobotStart_ESP32.inc` / `NOMITimeBase.inc` | 旧版 SILAB 参考设计，仅作历史参考。正式链路由 Python 逻辑判定程序输出完整时间戳 |
 | 5 | 文档 | `WINDOWS_SILAB_BRIDGE_DEPLOYMENT.md` | 本中文部署文档 |
 
 注意：`silab_mqtt_bridge_gui.py` 和 `silab_tcp_probe.py` 都会监听 TCP
-`7777` 端口，因此二者不能同时运行。正式实验用 GUI；调试 SILAB 数据格式
+`7777` 端口，因此二者不能同时运行。正式实验用 GUI；调试逻辑数据格式
 时用 probe。
 
 ## 系统拓扑
 
 ```text
-SILAB --网线局域网 A / TCP 7777--> Windows 实验主机
-Windows 实验主机 --WiFi 局域网 B / MQTT 1883 + TCP 7777--> ESP32
-Windows 实验主机 --TCP Device--> HRT Host
+SILAB/车辆状态源 --> Python 逻辑判定程序
+Python 逻辑判定程序 --TCP 7777--> Windows 实验主机 Bridge GUI
+Windows 实验主机 Bridge GUI --WiFi 局域网 / MQTT 1883 + TCP 7777--> ESP32
 ```
+
+正式 Bridge 不再与 HRT 通讯。如果实验仍需要 HRT 数据，请由逻辑判定程序另开
+一条链路直接发送给 HRT，不要通过 Bridge 转发。
 
 Windows 实验主机有两个重要 IP：
 
 | 网络 | 给谁使用 | 例子 |
 | --- | --- | --- |
-| 网线局域网 A 的 IPv4 | 填到 SILAB 的 `Destination_IP` | `192.168.100.10` |
+| 网线局域网 A 的 IPv4 | 填到逻辑判定程序的 Bridge Host | `192.168.100.10` |
 | WiFi 局域网 B 的 IPv4 | 配给 ESP32 的 MQTT Broker URI | `mqtt://192.168.0.10:1883` |
 
 不要把 `127.0.0.1` 配给 ESP32。`127.0.0.1` 只代表 Windows 电脑自己。
@@ -236,91 +239,59 @@ GUI 打开后按下面步骤操作：
 
 10. 点击 `Stop`，ESP32 应停止播放，并回到中性表情。
 
-## 第五步：启动 SILAB TCP Host
+## 第五步：启动 Logic TCP Host
 
 在同一个 GUI 里：
 
-1. 在 `SILAB TCP Host` 区域设置：
+1. 在 `Logic TCP Host` 区域设置：
 
    ```text
    Bind = 0.0.0.0
    Port = 7777
    Threshold = 0.5
-   Aliases = 1=boot
+   Frame = TRIGGER;TIMESTAMP;SCENE;SEQ;SPEED
    ```
 
-2. 如果 SILAB 需要接收 ACK，可以勾选 `Send TCP ACK`。
+2. 如果逻辑判定程序需要接收 ACK，可以勾选 `Send TCP ACK`。
 
 3. 点击 `Start TCP Host`。
 
-4. 在 SILAB 里设置：
+4. 在逻辑判定程序里设置：
 
    ```text
-   Destination_IP = Windows 网线局域网 A 的 IPv4
-   Destination_Port = 7777
+   Bridge Host = Windows 网线局域网 A 的 IPv4
+   Bridge Port = 7777
    ```
 
-SILAB 发送格式：
+逻辑判定程序发送格式：
 
 ```text
-TRIGGER;TIME_LOW;TIME_HIGH;SCENE;SEQ;SPEED<LF>
+TRIGGER;TIMESTAMP;SCENE;SEQ;SPEED<LF>
 ```
 
-其中 `TIME_LOW` 是 Unix 时间低 6 位，`TIME_HIGH` 是 `Unix 时间 / 100000` 后取整数。Bridge 拼接方式是：
+其中 `TIMESTAMP` 是完整 Unix 时间戳，`SCENE` 是 TF 卡音频文件夹，
+`SEQ` 是文件名去掉 `.wav` 后的部分，`SPEED` 用于 GUI 和 Probe 观察。例子：
 
 ```text
-timestamp = TIME_HIGH * 100000 + (TIME_LOW % 100000)
+1;1779452836.933;common;left_rear_vehicle_merge;1.2
 ```
 
-`SPEED` 通常接 `VDyn.v_kmh`，用于 GUI、Probe 和 HRT 观察/状态判断。例子：
+这条命令会播放：
 
 ```text
-1;235200;17792;1;1;1.2
-```
-
-默认 `Aliases = 1=boot`，所以这条命令会播放：
-
-```text
-/sdcard/audio/boot/001.wav
+/sdcard/audio/common/left_rear_vehicle_merge.wav
 ```
 
 触发规则：
 
 - `trigger >= 0.5` 表示触发有效。
 - 只在 `0 -> 1` 上升沿播放一次。
-- SILAB 固定频率连续发送 `1` 时，不会重复播放。
+- 逻辑判定程序固定频率连续发送 `1` 时，不会重复播放。
 - 必须先回到 `0`，下一次 `1` 才会再次触发播放。
 
-## HRT TCP Device 转发
+## 使用模拟逻辑判定程序脚本
 
-如果需要把 SILAB 数据同步发给 HRT：
-
-1. 在 GUI 的 `HRT TCP Device` 区域填写：
-
-   ```text
-   HRT Host = HRT 所在主机 IP
-   HRT Port = HRT 监听端口，默认可填 9001
-   ```
-
-2. 勾选 `Forward SILAB samples to HRT`。
-
-3. 点击 `Connect HRT`。
-
-Bridge 会把每一条合法 SILAB 数据转成 HRT Device 文本：
-
-```text
-trigger,timestamp,scene,seq,speed;
-```
-
-例如：
-
-```text
-1,1779235200,boot,1,1.2;
-```
-
-## 使用模拟 SILAB 脚本
-
-当没有 SILAB 硬件，或正式实验前要检查链路时使用。
+当没有真实逻辑判定程序，或正式实验前要检查链路时使用。
 
 1. 启动 Bridge GUI。
 2. 点击 MQTT `Connect`。
@@ -328,7 +299,7 @@ trigger,timestamp,scene,seq,speed;
 4. 另开一个 PowerShell，进入解压后的交付文件夹，执行：
 
    ```powershell
-   py -3 tools\silab_tcp_simulator.py --host 127.0.0.1 --port 7777 --scene 1 --seq 1 --rate-hz 10 --pre-idle 1 --hold 2 --post-idle 1 --read-ack --verbose
+   py -3 tools\silab_tcp_simulator.py --host 127.0.0.1 --port 7777 --scene common --seq left_rear_vehicle_merge --rate-hz 10 --pre-idle 1 --hold 2 --post-idle 1 --read-ack --verbose
    ```
 
 5. 如果模拟器不在同一台电脑上，把 `--host 127.0.0.1` 改成运行 Bridge GUI
@@ -337,41 +308,41 @@ trigger,timestamp,scene,seq,speed;
 GUI 日志里应该出现类似内容：
 
 ```text
-[silab] connected ...
-[silab] #... play ts=... trigger=1 scene=boot seq=1 hrt=...
-[direct] play boot/001 sent ...
+[logic] connected ...
+[logic] #... play ts=... trigger=1 scene=common seq=left_rear_vehicle_merge speed=1.2
+[direct] play common/left_rear_vehicle_merge sent ...
 [esp32] screen speaking ...
 ```
 
-## 使用 SILAB 数据包测试脚本
+## 使用 TCP 数据包测试脚本
 
-这个脚本用于确认真实 SILAB 发来的数据格式是否正确。它只接收和打印数据，
+这个脚本用于确认真实逻辑判定程序发来的数据格式是否正确。它只接收和打印数据，
 不会控制 ESP32。
 
 1. 关闭 Bridge GUI 的 TCP Host，或者直接关闭 Bridge GUI。
 2. 打开 PowerShell，进入解压后的交付文件夹，执行：
 
    ```powershell
-   py -3 tools\silab_tcp_probe.py --host 0.0.0.0 --port 7777 --scene-aliases 1=boot --jsonl silab_probe_log.jsonl
+   py -3 tools\silab_tcp_probe.py --host 0.0.0.0 --port 7777 --jsonl logic_probe_log.jsonl
    ```
 
-3. 在 SILAB 里设置：
+3. 在逻辑判定程序里设置：
 
    ```text
-   Destination_IP = Windows 网线局域网 A 的 IPv4
-   Destination_Port = 7777
+   Bridge Host = Windows 网线局域网 A 的 IPv4
+   Bridge Port = 7777
    ```
 
-4. 运行 SILAB 场景。
+4. 运行逻辑判定程序。
 
 正常输出类似：
 
 ```text
 format: OK
-parsed: trigger=1.0 scene=1 seq=1
-bridge_audio_id: scene=boot seq=1
+parsed: timestamp=1779452836.933 source=logic_full trigger=1.0 scene=common seq=left_rear_vehicle_merge speed=1.2
+bridge_audio_id: scene=common seq=left_rear_vehicle_merge
 trigger_active=True rising_edge=True
-would_play: /sdcard/audio/boot/001.wav
+would_play: /sdcard/audio/common/left_rear_vehicle_merge.wav
 ```
 
 脚本还会把机器可读日志追加到：
@@ -392,7 +363,7 @@ silab_probe_log.jsonl
 8. `ESP Host` 已自动填写，`Direct ESP TCP` 已勾选。
 9. 手动 `Play` 和 `Stop` 均正常。
 10. GUI 的 `Start TCP Host` 已启动。
-11. SILAB 发送目标为 Windows 网线局域网 A IP，端口 `7777`。
+11. 逻辑判定程序发送目标为 Windows 网线局域网 A IP，端口 `7777`。
 
 ## 常见问题
 
@@ -405,12 +376,12 @@ silab_probe_log.jsonl
 - Windows 防火墙允许 TCP `1883`。
 - ESP32 和 Windows WiFi 在同一个局域网 B。
 
-### GUI 手动 Play 可以，但 SILAB 不触发
+### GUI 手动 Play 可以，但逻辑程序不触发
 
 检查：
 
 - GUI 的 `Start TCP Host` 是否已启动。
-- SILAB 的 `Destination_IP` 是否为 Windows 网线局域网 A IP。
+- 逻辑判定程序的 Bridge Host 是否为 Windows 网线局域网 A IP。
 - Windows 防火墙是否允许 TCP `7777`。
 - `silab_tcp_probe.py` 是否还在运行。probe 和 GUI 不能同时占用 `7777`。
 

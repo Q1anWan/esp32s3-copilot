@@ -1,25 +1,18 @@
 #!/usr/bin/env python3
-"""PC-side SILAB TCP to ESP32 MQTT bridge GUI.
+"""PC-side logic-decision TCP to ESP32 bridge GUI.
 
 Topology:
-  SILAB --LAN A/TCP--> experiment PC bridge GUI
-                         ├─ MQTT/direct TCP --> ESP32
-                         └─ TCP client/device --> HRT host
+  Logic decision program --LAN/TCP--> experiment PC bridge GUI
+                                      └─ direct TCP/MQTT --> ESP32
 
 MQTT is still used for ESP32 status, and as a play-command fallback when the
 direct TCP host is unavailable.
 
 The PC listens for fixed-rate logic-program audio-ID packets:
-  trigger;timestamp;scene;seq;speed<LF>
-
-It also accepts the older SILAB-friendly split timestamp packets:
-  trigger;time_low;time_high;scene;seq;speed<LF>
-
-time_low is the low 6 digits of Unix time. time_high is floor(unix / 100000).
+  TRIGGER;TIMESTAMP;SCENE;SEQ;SPEED<LF>
 
 Only trigger rising edges are forwarded to ESP32 as MQTT play commands.
-Every valid sample is forwarded to HRT as:
-  trigger,timestamp,scene,seq,speed;
+SCENE is the TF-card audio folder, and SEQ is the file name without extension.
 """
 
 from __future__ import annotations
@@ -44,14 +37,10 @@ DEFAULT_MQTT_HOST = os.environ.get("COPILOT_MQTT_BROKER", "127.0.0.1")
 DEFAULT_MQTT_PORT = int(os.environ.get("COPILOT_MQTT_PORT", "1883"))
 DEFAULT_CMD_TOPIC = os.environ.get("COPILOT_MQTT_TOPIC", "copilot/s3_copilot/cmd")
 DEFAULT_STATUS_TOPIC = os.environ.get("COPILOT_STATUS_TOPIC", "copilot/s3_copilot/status")
-DEFAULT_TCP_HOST = os.environ.get("SILAB_TCP_HOST", "0.0.0.0")
-DEFAULT_TCP_PORT = int(os.environ.get("SILAB_TCP_PORT", "7777"))
+DEFAULT_TCP_HOST = os.environ.get("COPILOT_LOGIC_TCP_HOST", os.environ.get("SILAB_TCP_HOST", "0.0.0.0"))
+DEFAULT_TCP_PORT = int(os.environ.get("COPILOT_LOGIC_TCP_PORT", os.environ.get("SILAB_TCP_PORT", "7777")))
 DEFAULT_ESP_TCP_HOST = os.environ.get("COPILOT_ESP_TCP_HOST", "")
 DEFAULT_ESP_TCP_PORT = int(os.environ.get("COPILOT_ESP_TCP_PORT", "7777"))
-DEFAULT_SCENE_PREFIX = os.environ.get("SILAB_SCENE_PREFIX", "scene")
-DEFAULT_SCENE_ALIASES = os.environ.get("SILAB_SCENE_ALIASES", "1=boot")
-DEFAULT_HRT_HOST = os.environ.get("COPILOT_HRT_HOST", "")
-DEFAULT_HRT_PORT = int(os.environ.get("COPILOT_HRT_PORT", "9001"))
 
 
 def require_mqtt():
@@ -304,33 +293,6 @@ def seq_token_is_valid(seq: str) -> bool:
     return bool(seq) and all(c in allowed for c in seq)
 
 
-def parse_scene_aliases(text: str) -> dict[int, str]:
-    aliases: dict[int, str] = {}
-    for item in text.replace(";", ",").split(","):
-        item = item.strip()
-        if not item or "=" not in item:
-            continue
-        key, value = item.split("=", 1)
-        numeric = parse_integer_like(key.strip())
-        value = value.strip()
-        if numeric is None or numeric < 0 or not scene_token_is_valid(value):
-            continue
-        aliases[numeric] = value
-    return aliases
-
-
-def normalize_scene(scene: str, prefix: str, aliases: str | dict[int, str] | None = None) -> str:
-    numeric = parse_integer_like(scene)
-    if numeric is not None and aliases:
-        alias_map = parse_scene_aliases(aliases) if isinstance(aliases, str) else aliases
-        alias = alias_map.get(numeric)
-        if alias:
-            return alias
-    if numeric is not None:
-        return f"{prefix}{numeric:03d}"
-    return scene
-
-
 def format_number_for_wire(value: float) -> str:
     if math.isfinite(value) and abs(value - round(value)) < 0.0001:
         return str(int(round(value)))
@@ -553,131 +515,16 @@ class MqttController:
         return ok
 
 
-class HrtTcpClient:
-    def __init__(self, events: "queue.Queue[tuple[str, object]]") -> None:
-        self.events = events
-        self.enabled = False
-        self.host = ""
-        self.port = DEFAULT_HRT_PORT
-        self.sock: socket.socket | None = None
-        self._lock = threading.Lock()
-        self._sent_count = 0
-
-    @property
-    def connected(self) -> bool:
-        return self.sock is not None
-
-    @property
-    def sent_count(self) -> int:
-        return self._sent_count
-
-    def configure(self, enabled: bool, host: str, port: int) -> None:
-        host = host.strip()
-        with self._lock:
-            changed = (host != self.host) or (port != self.port)
-            self.enabled = enabled
-            self.host = host
-            self.port = port
-            if (not enabled or changed) and self.sock:
-                self._close_locked(log=True)
-
-    def connect(self, host: str | None = None, port: int | None = None) -> bool:
-        with self._lock:
-            if host is not None:
-                self.host = host.strip()
-            if port is not None:
-                self.port = port
-            if not self.host:
-                self.events.put(("log", "[hrt] host is empty"))
-                return False
-            if self.port < 1 or self.port > 65535:
-                self.events.put(("log", f"[hrt] invalid port {self.port}"))
-                return False
-            if self.sock:
-                return True
-            try:
-                sock = socket.create_connection((self.host, self.port), timeout=0.5)
-                sock.settimeout(0.25)
-                try:
-                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                except OSError:
-                    pass
-            except OSError as exc:
-                self.events.put(("log", f"[hrt] connect failed {self.host}:{self.port}: {exc}"))
-                self.events.put(("hrt_connected", False))
-                return False
-            self.sock = sock
-            self.events.put(("log", f"[hrt] connected {self.host}:{self.port}"))
-            self.events.put(("hrt_connected", True))
-            return True
-
-    def disconnect(self) -> None:
-        with self._lock:
-            self._close_locked(log=True)
-
-    def _close_locked(self, log: bool = False) -> None:
-        sock = self.sock
-        self.sock = None
-        if sock:
-            try:
-                sock.close()
-            except OSError:
-                pass
-            if log:
-                self.events.put(("log", "[hrt] disconnected"))
-        self.events.put(("hrt_connected", False))
-
-    def send_packet(self, packet: AudioIdPacket, scene: str) -> bool:
-        if not self.enabled:
-            return False
-        fields = [
-            format_number_for_wire(packet.trigger),
-            format_number_for_wire(packet.timestamp),
-            scene,
-            packet.seq,
-        ]
-        if packet.speed is not None:
-            fields.append(format_number_for_wire(packet.speed))
-        data = (",".join(fields) + ";").encode("utf-8")
-        with self._lock:
-            if not self.sock:
-                host = self.host
-                port = self.port
-            else:
-                host = ""
-                port = 0
-        if host:
-            if not self.connect(host, port):
-                return False
-        with self._lock:
-            if not self.sock:
-                return False
-            try:
-                self.sock.sendall(data)
-            except OSError as exc:
-                self.events.put(("log", f"[hrt] send failed: {exc}"))
-                self._close_locked(log=False)
-                return False
-            self._sent_count += 1
-            return True
-
-
-class SilabTcpBridge:
+class LogicTcpBridge:
     def __init__(
         self,
         events: "queue.Queue[tuple[str, object]]",
         publish_cb,
-        hrt_forward_cb,
-        scene_prefix_cb,
-        scene_aliases_cb,
         threshold_cb,
         ack_cb,
     ) -> None:
         self.events = events
         self.publish_cb = publish_cb
-        self.hrt_forward_cb = hrt_forward_cb
-        self.scene_prefix_cb = scene_prefix_cb
-        self.scene_aliases_cb = scene_aliases_cb
         self.threshold_cb = threshold_cb
         self.ack_cb = ack_cb
         self._stop = threading.Event()
@@ -696,7 +543,7 @@ class SilabTcpBridge:
         if self.running:
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._server_loop, args=(host, port), name="silab-tcp-host", daemon=True)
+        self._thread = threading.Thread(target=self._server_loop, args=(host, port), name="logic-tcp-host", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -716,7 +563,7 @@ class SilabTcpBridge:
                 server.bind((host, port))
                 server.listen(4)
                 server.settimeout(0.5)
-                self.events.put(("log", f"[silab] TCP host listening on {host}:{port}"))
+                self.events.put(("log", f"[logic] TCP host listening on {host}:{port}"))
                 self.events.put(("tcp_running", True))
                 while not self._stop.is_set():
                     try:
@@ -727,14 +574,14 @@ class SilabTcpBridge:
                         break
                     threading.Thread(target=self._client_loop, args=(conn, addr), daemon=True).start()
         except Exception as exc:
-            self.events.put(("log", f"[silab] host failed: {exc}"))
+            self.events.put(("log", f"[logic] host failed: {exc}"))
         finally:
             self._listen_socket = None
             self.events.put(("tcp_running", False))
 
     def _client_loop(self, conn: socket.socket, addr) -> None:
         peer = f"{addr[0]}:{addr[1]}"
-        self.events.put(("log", f"[silab] connected {peer}"))
+        self.events.put(("log", f"[logic] connected {peer}"))
         buffer = bytearray()
         with conn:
             conn.settimeout(0.5)
@@ -755,11 +602,11 @@ class SilabTcpBridge:
                     else:
                         buffer.append(b)
                         if len(buffer) > 256:
-                            self.events.put(("log", "[silab] drop overlong line"))
+                            self.events.put(("log", "[logic] drop overlong line"))
                             buffer.clear()
             if buffer:
                 self._handle_line(conn, bytes(buffer).decode("utf-8", errors="replace"), peer)
-        self.events.put(("log", f"[silab] disconnected {peer}"))
+        self.events.put(("log", f"[logic] disconnected {peer}"))
 
     def _handle_line(self, conn: socket.socket, line: str, peer: str) -> None:
         packet = parse_audio_id_line(line)
@@ -767,8 +614,8 @@ class SilabTcpBridge:
             self._packet_count += 1
             packet_no = self._packet_count
         if packet is None:
-            self.events.put(("log", f"[silab] #{packet_no} BAD {line.strip()!r}"))
-            self._send_ack(conn, False, False, "", 0, "bad_format")
+            self.events.put(("log", f"[logic] #{packet_no} BAD {line.strip()!r}"))
+            self._send_ack(conn, False, False, "", "", "bad_format")
             return
 
         active = packet.trigger >= float(self.threshold_cb())
@@ -779,22 +626,21 @@ class SilabTcpBridge:
                 self._trigger_count += 1
             trigger_count = self._trigger_count
 
-        scene = normalize_scene(packet.scene, self.scene_prefix_cb(), self.scene_aliases_cb())
-        hrt_sent = bool(self.hrt_forward_cb(packet, scene))
+        scene = packet.scene
         accepted = False
         if rising:
             payload = {
                 "type": "play",
                 "scene": scene,
                 "seq": packet.seq,
-                "message_id": f"silab_{packet_no}_{trigger_count}_{int(time.time() * 1000)}",
+                "message_id": f"logic_{packet_no}_{trigger_count}_{int(time.time() * 1000)}",
             }
             accepted = bool(self.publish_cb(payload))
 
         state = "play" if rising else ("held" if active else "idle")
         self.events.put(
             (
-                "silab_packet",
+                "logic_packet",
                 {
                     "packet_no": packet_no,
                     "peer": peer,
@@ -806,7 +652,6 @@ class SilabTcpBridge:
                     "speed": packet.speed,
                     "state": state,
                     "accepted": accepted,
-                    "hrt_sent": hrt_sent,
                     "trigger_count": trigger_count,
                 },
             )
@@ -814,13 +659,12 @@ class SilabTcpBridge:
         self.events.put(
             (
                 "log",
-                f"[silab] #{packet_no} {state} ts={format_number_for_wire(packet.timestamp)} "
+                f"[logic] #{packet_no} {state} ts={format_number_for_wire(packet.timestamp)} "
                 f"trigger={packet.trigger:g} scene={scene} seq={packet.seq} "
-                f"speed={format_number_for_wire(packet.speed) if packet.speed is not None else '-'} "
-                f"hrt={'ok' if hrt_sent else '-'}",
+                f"speed={format_number_for_wire(packet.speed) if packet.speed is not None else '-'}",
             )
         )
-        self._send_ack(conn, True, accepted, scene, packet.seq, state, packet.timestamp, hrt_sent, packet.speed)
+        self._send_ack(conn, True, accepted, scene, packet.seq, state, packet.timestamp, packet.speed)
 
     def _send_ack(
         self,
@@ -831,7 +675,6 @@ class SilabTcpBridge:
         seq: str,
         state: str,
         timestamp: float | None = None,
-        hrt_sent: bool = False,
         speed: float | None = None,
     ) -> None:
         if not self.ack_cb():
@@ -841,7 +684,6 @@ class SilabTcpBridge:
             payload["timestamp"] = timestamp
         if speed is not None:
             payload["speed"] = speed
-        payload["hrt_sent"] = hrt_sent
         try:
             conn.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
         except OSError:
@@ -851,28 +693,19 @@ class SilabTcpBridge:
 class BridgeGui(tk.Tk):
     def __init__(self, args: argparse.Namespace) -> None:
         super().__init__()
-        self.title("Copilot SILAB MQTT Bridge")
+        self.title("Copilot ESP32 Bridge")
         self.minsize(1120, 720)
         self.args = args
         self.events: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self.mqtt = MqttController(self.events)
-        self.hrt = HrtTcpClient(self.events)
-        self._scene_prefix = args.scene_prefix.strip() or DEFAULT_SCENE_PREFIX
-        self._scene_aliases = args.scene_aliases.strip()
         self._trigger_threshold = float(args.trigger_threshold)
         self._tcp_ack = bool(args.tcp_ack)
         self._direct_tcp_enabled = not args.no_direct_tcp
         self._esp_tcp_host = args.esp_tcp_host.strip()
         self._esp_tcp_port = int(args.esp_tcp_port)
-        self._hrt_enabled = bool(args.enable_hrt or args.hrt_host.strip())
-        self._hrt_host = args.hrt_host.strip()
-        self._hrt_port = int(args.hrt_port)
-        self.tcp_bridge = SilabTcpBridge(
+        self.tcp_bridge = LogicTcpBridge(
             self.events,
             publish_cb=self._send_play_command,
-            hrt_forward_cb=self._forward_hrt_packet,
-            scene_prefix_cb=lambda: self._scene_prefix,
-            scene_aliases_cb=lambda: self._scene_aliases,
             threshold_cb=lambda: self._trigger_threshold,
             ack_cb=lambda: self._tcp_ack,
         )
@@ -921,7 +754,6 @@ class BridgeGui(tk.Tk):
         self._build_mqtt(left)
         self._build_usb(left)
         self._build_tcp(left)
-        self._build_hrt(left)
         self._build_play(left)
         self._build_status(right)
         self._build_log(right)
@@ -980,14 +812,12 @@ class BridgeGui(tk.Tk):
         ttk.Button(row, text="Save WiFi", command=self.configure_usb_wifi).grid(row=0, column=3, sticky="ew")
 
     def _build_tcp(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text="SILAB TCP Host")
+        box = ttk.LabelFrame(parent, text="Logic TCP Host")
         box.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         box.columnconfigure(1, weight=1)
         self.tcp_host_var = tk.StringVar(value=self.args.tcp_host)
         self.tcp_port_var = tk.IntVar(value=self.args.tcp_port)
         self.threshold_var = tk.DoubleVar(value=self.args.trigger_threshold)
-        self.scene_prefix_var = tk.StringVar(value=self.args.scene_prefix)
-        self.scene_aliases_var = tk.StringVar(value=self.args.scene_aliases)
         self.tcp_ack_var = tk.BooleanVar(value=self.args.tcp_ack)
         ttk.Label(box, text="Bind").grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
         ttk.Entry(box, textvariable=self.tcp_host_var, width=18).grid(row=0, column=1, sticky="ew", padx=8, pady=(8, 4))
@@ -995,34 +825,17 @@ class BridgeGui(tk.Tk):
         ttk.Entry(box, textvariable=self.tcp_port_var, width=10).grid(row=1, column=1, sticky="w", padx=8, pady=4)
         ttk.Label(box, text="Threshold").grid(row=2, column=0, sticky="w", padx=8, pady=4)
         ttk.Entry(box, textvariable=self.threshold_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=4)
-        ttk.Label(box, text="Prefix").grid(row=3, column=0, sticky="w", padx=8, pady=4)
-        ttk.Entry(box, textvariable=self.scene_prefix_var, width=10).grid(row=3, column=1, sticky="w", padx=8, pady=4)
-        ttk.Label(box, text="Aliases").grid(row=4, column=0, sticky="w", padx=8, pady=4)
-        ttk.Entry(box, textvariable=self.scene_aliases_var, width=18).grid(row=4, column=1, sticky="ew", padx=8, pady=4)
-        ttk.Checkbutton(box, text="Send TCP ACK", variable=self.tcp_ack_var).grid(row=5, column=0, columnspan=2, sticky="w", padx=8, pady=4)
-        self.tcp_btn = ttk.Button(box, text="Start TCP Host", command=self.toggle_tcp)
-        self.tcp_btn.grid(row=6, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
-
-    def _build_hrt(self, parent: ttk.Frame) -> None:
-        box = ttk.LabelFrame(parent, text="HRT TCP Device")
-        box.grid(row=3, column=0, sticky="ew", pady=(0, 10))
-        box.columnconfigure(1, weight=1)
-        self.hrt_enable_var = tk.BooleanVar(value=self._hrt_enabled)
-        self.hrt_host_var = tk.StringVar(value=self.args.hrt_host)
-        self.hrt_port_var = tk.IntVar(value=self.args.hrt_port)
-        ttk.Checkbutton(box, text="Forward SILAB samples to HRT", variable=self.hrt_enable_var).grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=8, pady=(8, 4)
+        ttk.Label(box, text="Frame").grid(row=3, column=0, sticky="w", padx=8, pady=4)
+        ttk.Label(box, text="TRIGGER;TIMESTAMP;SCENE;SEQ;SPEED").grid(
+            row=3, column=1, sticky="w", padx=8, pady=4
         )
-        ttk.Label(box, text="HRT Host").grid(row=1, column=0, sticky="w", padx=8, pady=4)
-        ttk.Entry(box, textvariable=self.hrt_host_var, width=18).grid(row=1, column=1, sticky="ew", padx=8, pady=4)
-        ttk.Label(box, text="HRT Port").grid(row=2, column=0, sticky="w", padx=8, pady=4)
-        ttk.Entry(box, textvariable=self.hrt_port_var, width=10).grid(row=2, column=1, sticky="w", padx=8, pady=4)
-        self.hrt_btn = ttk.Button(box, text="Connect HRT", command=self.toggle_hrt)
-        self.hrt_btn.grid(row=3, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
+        ttk.Checkbutton(box, text="Send TCP ACK", variable=self.tcp_ack_var).grid(row=4, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+        self.tcp_btn = ttk.Button(box, text="Start TCP Host", command=self.toggle_tcp)
+        self.tcp_btn.grid(row=5, column=0, columnspan=2, sticky="ew", padx=8, pady=(4, 8))
 
     def _build_play(self, parent: ttk.Frame) -> None:
         box = ttk.LabelFrame(parent, text="Manual Play")
-        box.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+        box.grid(row=3, column=0, sticky="ew", pady=(0, 10))
         box.columnconfigure(1, weight=1)
         self.play_scene_var = tk.StringVar(value="boot")
         self.play_seq_var = tk.StringVar(value="1")
@@ -1053,11 +866,11 @@ class BridgeGui(tk.Tk):
         top.columnconfigure(0, weight=1)
         ttk.Label(top, text="Bridge Status", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         self.mqtt_state_var = tk.StringVar(value="MQTT: disconnected")
-        self.tcp_state_var = tk.StringVar(value="SILAB: stopped")
+        self.tcp_state_var = tk.StringVar(value="Logic: stopped")
         ttk.Label(top, textvariable=self.mqtt_state_var).grid(row=0, column=1, sticky="e")
         ttk.Label(top, textvariable=self.tcp_state_var).grid(row=1, column=1, sticky="e")
 
-        status = ttk.LabelFrame(parent, text="ESP32 / SILAB")
+        status = ttk.LabelFrame(parent, text="ESP32 / Logic")
         status.grid(row=1, column=0, sticky="ew", pady=(8, 10))
         for col in range(4):
             status.columnconfigure(col, weight=1)
@@ -1068,10 +881,10 @@ class BridgeGui(tk.Tk):
             ("Audio", "audio"),
             ("SD", "sd"),
             ("Path", "path"),
-            ("SILAB", "silab"),
+            ("Logic", "logic"),
             ("Trigger", "trigger"),
             ("Speed", "speed"),
-            ("HRT", "hrt"),
+            ("Timestamp", "timestamp"),
             ("Files", "files"),
         ]
         for index, (label, key) in enumerate(fields):
@@ -1167,20 +980,7 @@ class BridgeGui(tk.Tk):
         try:
             self.tcp_bridge.start(self.tcp_host_var.get().strip(), int(self.tcp_port_var.get()))
         except Exception as exc:
-            messagebox.showerror("SILAB TCP", str(exc))
-
-    def toggle_hrt(self) -> None:
-        if not self.hrt_enable_var.get():
-            self.hrt_enable_var.set(True)
-        self._sync_runtime_config()
-        if self.hrt.connected:
-            self.hrt.disconnect()
-            return
-        if not self._hrt_host:
-            messagebox.showwarning("HRT", "HRT Host is empty")
-            return
-        if not self.hrt.connect(self._hrt_host, self._hrt_port):
-            messagebox.showerror("HRT", f"Cannot connect to {self._hrt_host}:{self._hrt_port}")
+            messagebox.showerror("Logic TCP", str(exc))
 
     def fill_usb_broker_uri(self) -> None:
         host = self.mqtt_host_var.get().strip()
@@ -1320,8 +1120,6 @@ class BridgeGui(tk.Tk):
             self.events.put(("log", f"[usb] {item}"))
 
     def _sync_runtime_config(self) -> None:
-        self._scene_prefix = self.scene_prefix_var.get().strip() or DEFAULT_SCENE_PREFIX
-        self._scene_aliases = self.scene_aliases_var.get().strip()
         try:
             self._trigger_threshold = float(self.threshold_var.get())
         except (tk.TclError, ValueError):
@@ -1333,13 +1131,6 @@ class BridgeGui(tk.Tk):
             self._esp_tcp_port = int(self.esp_tcp_port_var.get())
         except (tk.TclError, ValueError):
             self._esp_tcp_port = DEFAULT_ESP_TCP_PORT
-        self._hrt_enabled = bool(self.hrt_enable_var.get())
-        self._hrt_host = self.hrt_host_var.get().strip()
-        try:
-            self._hrt_port = int(self.hrt_port_var.get())
-        except (tk.TclError, ValueError):
-            self._hrt_port = DEFAULT_HRT_PORT
-        self.hrt.configure(self._hrt_enabled, self._hrt_host, self._hrt_port)
 
     def _direct_tcp_target(self) -> tuple[str, int] | None:
         host = self._esp_tcp_host
@@ -1411,9 +1202,6 @@ class BridgeGui(tk.Tk):
     def _send_play_command(self, payload: dict) -> bool:
         return self._send_control_command(payload, track_play=True)
 
-    def _forward_hrt_packet(self, packet: AudioIdPacket, scene: str) -> bool:
-        return self.hrt.send_packet(packet, scene)
-
     def play_manual(self) -> None:
         self._sync_runtime_config()
         scene = self.play_scene_var.get().strip()
@@ -1421,8 +1209,9 @@ class BridgeGui(tk.Tk):
         if not scene or not seq_token_is_valid(seq):
             messagebox.showwarning("Play", "Scene must be non-empty and seq must use letters, digits, _ or -")
             return
-        scene = normalize_scene(scene, self.scene_prefix_var.get().strip() or DEFAULT_SCENE_PREFIX,
-                                self.scene_aliases_var.get().strip())
+        if not scene_token_is_valid(scene):
+            messagebox.showwarning("Play", "Scene must use letters, digits, _ or -")
+            return
         message_id = f"manual_{int(time.time() * 1000)}"
         payload = {"type": "play", "scene": scene, "seq": seq, "message_id": message_id}
         if self._send_play_command(payload):
@@ -1475,24 +1264,18 @@ class BridgeGui(tk.Tk):
                     self._update_status(payload if isinstance(payload, dict) else {})
                 elif kind == "usb_config":
                     self._apply_usb_config(payload if isinstance(payload, dict) else {})
-                elif kind == "silab_packet":
-                    self._update_silab(payload if isinstance(payload, dict) else {})
+                elif kind == "logic_packet":
+                    self._update_logic(payload if isinstance(payload, dict) else {})
                 elif kind == "track_play":
                     self._track_play_request(payload if isinstance(payload, dict) else {})
                 elif kind == "tcp_running":
                     running = bool(payload)
                     self.tcp_btn.configure(text="Stop TCP Host" if running else "Start TCP Host")
-                    self.tcp_state_var.set("SILAB: listening" if running else "SILAB: stopped")
-                elif kind == "hrt_connected":
-                    connected = bool(payload)
-                    self.hrt_btn.configure(text="Disconnect HRT" if connected else "Connect HRT")
-                    state = "connected" if connected else ("enabled" if self._hrt_enabled else "disabled")
-                    self.status_vars["hrt"].set(f"{state} sent={self.hrt.sent_count}")
+                    self.tcp_state_var.set("Logic: listening" if running else "Logic: stopped")
         except queue.Empty:
             pass
         self.mqtt_state_var.set("MQTT: connected" if self.mqtt.connected else "MQTT: disconnected")
         self.mqtt_btn.configure(text="Disconnect" if self.mqtt.connected else "Connect")
-        self.hrt_btn.configure(text="Disconnect HRT" if self.hrt.connected else "Connect HRT")
         self.after(80, self._drain_events)
 
     def _apply_usb_config(self, payload: dict) -> None:
@@ -1590,8 +1373,8 @@ class BridgeGui(tk.Tk):
             self._last_audio_error = last_error
             self._last_files_played = files_played
 
-    def _update_silab(self, packet: dict) -> None:
-        self.status_vars["silab"].set(
+    def _update_logic(self, packet: dict) -> None:
+        self.status_vars["logic"].set(
             f"#{packet.get('packet_no')} {packet.get('state')} {packet.get('scene')}/{packet.get('seq')}"
         )
         self.status_vars["trigger"].set(
@@ -1601,10 +1384,9 @@ class BridgeGui(tk.Tk):
         self.status_vars["speed"].set(
             format_number_for_wire(float(speed)) if isinstance(speed, (int, float)) else "-"
         )
-        hrt_state = "sent" if packet.get("hrt_sent") else ("enabled" if self._hrt_enabled else "disabled")
         timestamp = packet.get("timestamp")
         ts_text = format_number_for_wire(float(timestamp)) if isinstance(timestamp, (int, float)) else "-"
-        self.status_vars["hrt"].set(f"{hrt_state} ts={ts_text} count={self.hrt.sent_count}")
+        self.status_vars["timestamp"].set(ts_text)
 
     def _log_publish(self, event: dict) -> None:
         payload = event.get("payload") or {}
@@ -1634,7 +1416,6 @@ class BridgeGui(tk.Tk):
         if self.auto_status_after:
             self.after_cancel(self.auto_status_after)
         self.tcp_bridge.stop()
-        self.hrt.disconnect()
         self.mqtt.disconnect()
         if self.broker_proc and self.broker_proc.poll() is None:
             self.broker_proc.terminate()
@@ -1646,23 +1427,23 @@ class BridgeGui(tk.Tk):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="SILAB TCP to ESP32 MQTT bridge GUI.")
+    parser = argparse.ArgumentParser(description="Logic-decision TCP to ESP32 bridge GUI.")
     parser.add_argument("--broker", default=DEFAULT_MQTT_HOST, help="MQTT broker host for this GUI. Default: 127.0.0.1")
     parser.add_argument("--mqtt-port", type=int, default=DEFAULT_MQTT_PORT, help="MQTT broker port. Default: 1883")
     parser.add_argument("--topic", default=DEFAULT_CMD_TOPIC, help="ESP32 command topic")
     parser.add_argument("--status-topic", default=DEFAULT_STATUS_TOPIC, help="ESP32 status topic")
-    parser.add_argument("--tcp-host", default=DEFAULT_TCP_HOST, help="SILAB TCP bind host. Default: 0.0.0.0")
-    parser.add_argument("--tcp-port", type=int, default=DEFAULT_TCP_PORT, help="SILAB TCP port. Default: 7777")
+    parser.add_argument("--tcp-host", default=DEFAULT_TCP_HOST, help="Logic TCP bind host. Default: 0.0.0.0")
+    parser.add_argument("--tcp-port", type=int, default=DEFAULT_TCP_PORT, help="Logic TCP port. Default: 7777")
     parser.add_argument("--esp-tcp-host", default=DEFAULT_ESP_TCP_HOST, help="ESP32 direct TCP host. Auto-filled from status when empty")
     parser.add_argument("--esp-tcp-port", type=int, default=DEFAULT_ESP_TCP_PORT, help="ESP32 direct TCP port. Default: 7777")
     parser.add_argument("--no-direct-tcp", action="store_true", help="Disable direct TCP play and use MQTT for play commands")
-    parser.add_argument("--hrt-host", default=DEFAULT_HRT_HOST, help="HRT TCP host IP. Empty disables HRT forwarding by default")
-    parser.add_argument("--hrt-port", type=int, default=DEFAULT_HRT_PORT, help="HRT TCP port. Default: 9001")
-    parser.add_argument("--enable-hrt", action="store_true", help="Enable HRT forwarding even if the GUI has not connected manually")
     parser.add_argument("--trigger-threshold", type=float, default=0.5, help="Trigger active threshold. Default: 0.5")
-    parser.add_argument("--scene-prefix", default=DEFAULT_SCENE_PREFIX, help="Numeric scene prefix. Default: scene")
-    parser.add_argument("--scene-aliases", default=DEFAULT_SCENE_ALIASES, help="Numeric scene aliases, for example 1=boot,2=scene002")
-    parser.add_argument("--tcp-ack", action="store_true", help="Send JSON ACK lines back to SILAB TCP client")
+    parser.add_argument("--tcp-ack", action="store_true", help="Send JSON ACK lines back to logic TCP client")
+    parser.add_argument("--hrt-host", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--hrt-port", type=int, default=9001, help=argparse.SUPPRESS)
+    parser.add_argument("--enable-hrt", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--scene-prefix", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--scene-aliases", default="", help=argparse.SUPPRESS)
     parser.add_argument("--port", default="auto", help="ESP32 USB serial port for setup. Default: auto")
     parser.add_argument("--baud", type=int, default=115_200, help="ESP32 USB serial baud. Default: 115200")
     parser.add_argument("--ssid", default="", help="Pre-fill ESP32 WiFi SSID")

@@ -1,6 +1,6 @@
 # 网络/TCP/数据帧知识库
 
-本文用于解释本项目里 SILAB 主机、逻辑判定程序、Windows Bridge GUI、ESP32、HRT 之间的数据通信原理。它不是部署步骤，而是帮助实验员和工程同学理解：为什么要配置 IP，为什么要分清 TCP Host/Device，Python 怎样收发 TCP，以及为什么数据帧要定义格式、精度、拆分和合并规则。
+本文用于解释本项目里 SILAB 主机、逻辑判定程序、Windows Bridge GUI、ESP32 之间的数据通信原理。它不是部署步骤，而是帮助实验员和工程同学理解：为什么要配置 IP，为什么要分清 TCP Host/Device，Python 怎样收发 TCP，以及为什么数据帧要定义格式、精度、拆分和合并规则。
 
 主要参考资料：
 
@@ -22,9 +22,6 @@ SILAB 主机/仿真系统
         | 本机读取系统状态，只和本机 Python 脚本交互
         v
 Python 逻辑判定程序
-        |\
-        | \--TCP/LAN--> HRT Host
-        |
         \--TCP/LAN--> Windows Bridge GUI --Direct TCP + MQTT/LAN B--> ESP32
 ```
 
@@ -32,22 +29,20 @@ Python 逻辑判定程序
 
 | 链路 | 主动方/数据来源 | 接收方 | 项目含义 |
 | --- | --- | --- | --- |
-| SILAB -> 逻辑判定程序 | SILAB 主机内部程序或本机接口 | Python 逻辑判定程序 | 逻辑程序读取 SILAB 系统状态，不让 Bridge/HRT 直接处理 SILAB 原始数据 |
+| SILAB -> 逻辑判定程序 | SILAB 主机内部程序或本机接口 | Python 逻辑判定程序 | 逻辑程序读取 SILAB 系统状态，不让 Bridge 直接处理 SILAB 原始数据 |
 | 逻辑判定程序 -> Bridge | Python 逻辑判定程序 | Bridge GUI | 发送触发标志、时间戳、场景名、序号、本车速度 |
-| 逻辑判定程序 -> HRT | Python 逻辑判定程序 | HRT Host | 发送同一份判定后的实验数据，供 HRT 记录或联动 |
 | Bridge -> ESP32 Direct TCP | Bridge GUI | ESP32 | Bridge 优先用低延迟直连 TCP 下发播放命令 |
 | Bridge/ESP32 -> MQTT Broker | Bridge GUI、ESP32 | Windows Mosquitto | ESP32 上报状态，Bridge 做状态监控和兜底控制 |
 
 注意：TCP 连接建立后，两端都能收发数据；所谓 Host/Device、主/从、Server/Client，通常是应用层约定。TCP 协议本身更关心连接、字节流、可靠传输和端口。
 
-这个架构的核心变化是：SILAB 不再直接对 Bridge 或 HRT 输出最终控制协议。SILAB 主机上运行一个 Python 逻辑判定程序，由它读取 SILAB 系统状态，判断是否触发、选择播放哪个场景和序号，然后把已经整理好的标准数据发给 Bridge 与 HRT。这样 Bridge、ESP32、HRT 不需要理解 SILAB 内部格式，也不受 SILAB 本身数值口、字符串口或拆分字段限制。
+这个架构的核心变化是：SILAB 不再直接对 Bridge 输出最终控制协议。SILAB 主机上运行一个 Python 逻辑判定程序，由它读取 SILAB 系统状态，判断是否触发、选择播放哪个场景和序号，然后把已经整理好的标准数据发给 Bridge。这样 Bridge 和 ESP32 不需要理解 SILAB 内部格式，也不受 SILAB 本身数值口、字符串口或拆分字段限制。
 
-这里最容易漏掉的一点是：**Bridge 和 HRT 都是 TCP Host**。也就是说，它们都先打开一个端口，站在原地等别人连接。逻辑判定程序不是 Host，而是 TCP Client/Device：它判定完一帧数据后，主动连接 Bridge Host 发送播放控制数据，同时主动连接 HRT Host 发送记录/联动数据。
+这里最容易漏掉的一点是：**正式 ESP32 Bridge 是 TCP Host**。也就是说，Bridge 先打开一个端口，站在原地等别人连接。逻辑判定程序不是 Host，而是 TCP Client/Device：它判定完一帧数据后，主动连接 Bridge Host 发送播放控制数据。
 
 ```text
 Bridge Host:  bind 0.0.0.0:7777  等逻辑判定程序连接
-HRT Host:     bind HRT_IP:9001    等逻辑判定程序连接
-逻辑判定程序: connect Bridge_IP:7777 + connect HRT_IP:9001
+逻辑判定程序: connect Bridge_IP:7777
 ```
 
 `0.0.0.0` 只适合 Host 监听，表示“监听本机所有网卡”。Client 连接时不能填 `0.0.0.0`，必须填目标电脑在局域网里的真实 IP，例如 `192.168.0.12`。
@@ -78,12 +73,11 @@ IP 负责把一个数据包从源主机送到目标主机。RFC 791 将 IP 的�
 | Bridge 主机 IP | Bridge 所在网络 | 填到逻辑判定程序的 Bridge 目标地址 |
 | Windows WiFi IP | LAN B | 配给 ESP32 的 MQTT Broker URI |
 | ESP32 WiFi IP | LAN B | Bridge 直接 TCP 控制 ESP32，并通过 MQTT 监控状态 |
-| HRT Host IP | HRT 所在网络 | 填到逻辑判定程序的 HRT 目标地址 |
 
 常见错误：
 
 - 把 `127.0.0.1` 填给远端设备。`127.0.0.1` 只代表“本机自己”，只能用于同一台电脑内部互连。
-- 让 SILAB、Bridge、HRT、ESP32 相互理解对方内部格式。正确做法是让逻辑判定程序输出统一标准帧。
+- 让 SILAB、Bridge、ESP32 相互理解对方内部格式。正确做法是让逻辑判定程序输出统一标准帧。
 - 不区分网线 IP 和 WiFi IP。Windows 双网卡时，这两个 IP 很可能不同。
 
 ## 3. TCP 协议原理
@@ -101,7 +95,7 @@ TCP 的关键特点：
 
 更底层一点看，TCP 主要靠这些机制保证可靠：
 
-- 端口：同一台电脑上区分不同程序，例如 Bridge 监听 `7777`，HRT 监听 `9001`。
+- 端口：同一台电脑上区分不同程序，例如 Bridge 监听 `7777`，MQTT Broker 监听 `1883`。
 - 序号：给字节流编号，让接收方知道顺序。
 - ACK 确认：接收方告诉发送方“我收到哪里了”。
 - 重传：发送方发现迟迟没有确认，就再发一次。
@@ -122,9 +116,7 @@ TCP 的关键特点：
 
 - Bridge GUI 是逻辑判定程序的 TCP Host，因为它监听 `0.0.0.0:7777`。
 - 逻辑判定程序是 Bridge 的 TCP Client，因为它连接 Bridge 主机 IP 的 `7777`。
-- HRT 是 TCP Host，因为它监听某个端口。
-- 逻辑判定程序是 HRT 的 TCP Device，因为它主动连接 HRT。
-- SILAB 主机和逻辑判定程序之间可以是本机 TCP、本机文件、API、共享内存或厂商接口；这部分属于 SILAB 内部采集，不再作为 Bridge/HRT 的公共协议。
+- SILAB 主机和逻辑判定程序之间可以是本机 TCP、本机文件、API、共享内存或厂商接口；这部分属于 SILAB 内部采集，不再作为 Bridge 的公共协议。
 
 这里的“主从”只描述谁等连接、谁主动连接，不代表谁更高级，也不代表数据只能单向流动。连接建立后，Host 和 Client 都可以收发数据。
 
@@ -156,13 +148,13 @@ c\ndef\n
 TRIGGER;TIMESTAMP;SCENE;SEQ;SPEED<LF>
 ```
 
-逻辑判定程序 -> HRT 可以沿用 HRT 现有的分号结束格式：
+可选的逻辑判定程序 -> HRT 链路可以沿用 HRT 现有的分号结束格式：
 
 ```text
 trigger,timestamp,scene,seq,speed;
 ```
 
-两条链路发送的是同一份语义数据：触发标志、完整 Unix 时间戳、场景名称、场景序号、本车速度。差别只在于接收端历史习惯不同，Bridge 更适合按行读取，HRT 可能已有逗号字段、分号结尾的解析逻辑。
+如果启用可选 HRT 链路，两条链路发送的是同一份语义数据：触发标志、完整 Unix 时间戳、场景名称、场景序号、本车速度。差别只在于接收端历史习惯不同，Bridge 更适合按行读取，HRT 可能已有逗号字段、分号结尾的解析逻辑。
 
 ### 为什么 Bridge 输入用 `<LF>`
 
@@ -182,7 +174,7 @@ trigger,timestamp,scene,seq,speed;
 1,1779235200,boot,1,1.2;
 ```
 
-新架构下，HRT 数据可以由逻辑判定程序直接发送，不必再由 Bridge 转发。Bridge 是否继续转发 HRT，可作为兼容旧流程的调试选项，而不是主路径。
+新架构下，HRT 数据可以由逻辑判定程序直接发送，不必也不应该再由 Bridge 转发。
 
 ## 5. Python 如何用 TCP 收发数据
 
@@ -286,14 +278,15 @@ speed     = 1.2
 逻辑判定程序负责判断 `TRIGGER` 和 `SCENE/SEQ`。Bridge 收到标准帧后，只在 `TRIGGER` 从无效变有效时发送播放命令：
 
 ```json
-{"type":"play","scene":"boot","seq":1,"message_id":"silab_..."}
+{"type":"play","scene":"boot","seq":"1","message_id":"logic_..."}
 ```
 
 连续多帧 `TRIGGER=1` 不会重复播放。必须先收到 `TRIGGER=0`，下一次 `TRIGGER=1` 才会再次触发。
 
-### 逻辑判定程序 -> HRT
+### 可选：逻辑判定程序 -> HRT
 
-逻辑判定程序会把每一条判定后的合法帧发送给 HRT。若 HRT 沿用现有逗号字段、分号结尾格式，可使用：
+正式 ESP32 Bridge 不再与 HRT 通讯。如果实验仍需要 HRT 数据，应由逻辑判定程序
+另开一条 TCP 链路直接发送给 HRT。若 HRT 沿用现有逗号字段、分号结尾格式，可使用：
 
 ```text
 trigger,timestamp,scene,seq,speed;
@@ -305,7 +298,7 @@ trigger,timestamp,scene,seq,speed;
 1,1779235200,boot,1,1.2;
 ```
 
-HRT 发送不是上升沿触发，而是每条合法帧都发送，方便记录完整状态。如果某个旧版 HRT 脚本仍要求 `timestamp,trigger,scene,seq,speed;`，应在逻辑判定程序里单独做适配，不应让 Bridge 或 ESP32 继续背负旧格式。Bridge 也可以保留 HRT 转发能力用于兼容旧流程，但新主路径应由逻辑判定程序直接发给 HRT。
+HRT 发送不是上升沿触发，而是每条合法帧都发送，方便记录完整状态。如果某个旧版 HRT 脚本仍要求 `timestamp,trigger,scene,seq,speed;`，应在逻辑判定程序里单独做适配，不应让 Bridge 或 ESP32 继续背负旧格式。
 
 ## 7. 数据精度
 
@@ -570,7 +563,7 @@ python3 tools/silab_tcp_simulator.py --host 127.0.0.1 --port 7777 --scene boot -
 正常链路里，GUI 日志应能看到：
 
 ```text
-[silab] #... play ts=... trigger=1 scene=boot seq=1 speed=1.2 hrt=ok
+[logic] #... play ts=... trigger=1 scene=boot seq=1 speed=1.2
 [direct] play boot/001 sent ...
 [esp32] screen speaking ...
 [audio] played /sdcard/audio/boot/001.wav ...
@@ -584,13 +577,6 @@ python3 tools/silab_tcp_simulator.py --host 127.0.0.1 --port 7777 --scene boot -
 - `SCENE` 和 `SEQ` 是否能映射到 TF 卡文件，例如 `/sdcard/audio/boot/001.wav`。
 - ESP32 是否在线，TF 卡是否 mounted。
 
-如果 HRT 没数据，优先检查：
-
-- HRT Host IP/Port 是否正确。
-- 逻辑判定程序是否启用了 HRT 发送。
-- 逻辑判定程序是否已经连接 HRT。
-- HRT 是否真的在监听 TCP，而不是 UDP 或串口。
-
 ## 11. 一句话总结
 
-IP 负责找到机器，TCP 负责可靠地传字节，应用层帧格式负责把字节解释成实验数据。本项目的新关键边界是 Python 逻辑判定程序：它读取 SILAB 状态，生成统一的触发标志、时间戳、场景、序号和速度，再分别发送给 Bridge 与 HRT。Bridge 专注于控制 ESP32 播放和监控状态，不再直接理解 SILAB 原始数据格式。
+IP 负责找到机器，TCP 负责可靠地传字节，应用层帧格式负责把字节解释成实验数据。本项目的新关键边界是 Python 逻辑判定程序：它读取 SILAB 状态，生成统一的触发标志、时间戳、场景、序号和速度，再发送给 Bridge。Bridge 专注于控制 ESP32 播放和监控状态，不再直接理解 SILAB 原始数据格式，也不再负责 HRT 转发。

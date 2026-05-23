@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Simulate a SILAB TCP sender for Copilot audio trigger tests.
+"""Simulate a logic-decision TCP sender for Copilot audio trigger tests.
 
-The simulator acts as the SILAB TCP client and connects to the experiment PC
+The simulator acts as the logic TCP client and connects to the experiment PC
 bridge GUI:
 
   simulator --TCP--> tools/silab_mqtt_bridge_gui.py --direct TCP--> ESP32
@@ -10,7 +10,7 @@ MQTT is still used by the GUI for ESP32 status and as a playback fallback.
 
 Default packet format, one line per fixed-rate sample:
 
-  trigger;time_low;time_high;scene;seq;speed<LF>
+  TRIGGER;TIMESTAMP;SCENE;SEQ;SPEED<LF>
 
 The bridge should play only when trigger rises from 0 to 1. Repeated trigger=1
 samples are intentionally sent so the edge latch can be tested.
@@ -31,11 +31,17 @@ from dataclasses import dataclass
 class Sample:
     trigger: float
     scene: str
-    seq: int
+    seq: str
     speed: float
 
     def line(self, delimiter: str, timestamp_mode: str, timestamp: float) -> str:
         ts_int = int(timestamp)
+        timestamp_text = f"{timestamp:.3f}".rstrip("0").rstrip(".")
+        if timestamp_mode == "full":
+            return (
+                f"{self.trigger:g}{delimiter}{timestamp_text}{delimiter}"
+                f"{self.scene}{delimiter}{self.seq}{delimiter}{self.speed:g}\n"
+            )
         if timestamp_mode == "silab":
             time_low = ts_int % 1_000_000
             time_high = ts_int // 100_000
@@ -45,8 +51,8 @@ class Sample:
             )
         if timestamp_mode == "none":
             prefix = ""
-        elif timestamp_mode == "full":
-            prefix = f"{timestamp:.3f}".rstrip("0").rstrip(".") + delimiter
+        elif timestamp_mode == "timestamp_first":
+            prefix = timestamp_text + delimiter
         elif timestamp_mode == "split5":
             prefix = f"{ts_int // 100000}{delimiter}{ts_int % 100000}{delimiter}"
         elif timestamp_mode == "split10000":
@@ -56,7 +62,7 @@ class Sample:
         return f"{prefix}{self.trigger:g}{delimiter}{self.scene}{delimiter}{self.seq}\n"
 
 
-def parse_pattern(text: str, scene: str, seq: int, idle_speed: float, active_speed: float) -> list[tuple[float, Sample]]:
+def parse_pattern(text: str, scene: str, seq: str, idle_speed: float, active_speed: float) -> list[tuple[float, Sample]]:
     """Parse a compact pattern string.
 
     Format:
@@ -173,9 +179,6 @@ def run(args: argparse.Namespace) -> None:
     elif delimiter in ("semicolon", ";"):
         args.delimiter = ";"
 
-    if args.seq < 1 or args.seq > 65535:
-        raise ValueError("seq must be 1..65535")
-
     steps = parse_pattern(args.pattern, args.scene, args.seq, args.idle_speed, args.active_speed) if args.pattern else default_steps(args)
     samples = expand_steps(steps, args.rate_hz)
     if args.dry_run:
@@ -201,16 +204,16 @@ def run(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Simulate SILAB fixed-rate TCP audio trigger packets.")
+    parser = argparse.ArgumentParser(description="Simulate logic-decision fixed-rate TCP audio trigger packets.")
     parser.add_argument("--host", default="127.0.0.1", help="Bridge TCP host IP. Default: 127.0.0.1")
     parser.add_argument("--port", type=int, default=7777, help="Bridge TCP port. Default: 7777")
-    parser.add_argument("--scene", default="1", help="Scene ID sent by SILAB. Default: 1")
-    parser.add_argument("--seq", type=int, default=1, help="Sequence ID sent by SILAB. Default: 1")
+    parser.add_argument("--scene", default="boot", help="Scene folder sent to Bridge. Default: boot")
+    parser.add_argument("--seq", default="1", help="Sequence file stem sent to Bridge. Default: 1")
     parser.add_argument(
         "--timestamp-mode",
-        choices=("silab", "full", "split5", "split10000", "none"),
-        default="silab",
-        help="Packet mode. silab: trigger time_low6 time_high scene seq speed; full/split5/split10000/none are legacy modes. Default: silab",
+        choices=("full", "silab", "timestamp_first", "split5", "split10000", "none"),
+        default="full",
+        help="Packet mode. full: trigger timestamp scene seq speed. Other modes are legacy. Default: full",
     )
     parser.add_argument("--rate-hz", type=float, default=10.0, help="Fixed send rate. Default: 10")
     parser.add_argument("--pre-idle", type=float, default=1.0, help="Seconds of trigger=0 before pulse. Default: 1")

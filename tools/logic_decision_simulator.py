@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Simulate the SILAB-side logic decision program.
+"""Simulate the logic decision program.
 
 The real logic program will read SILAB state, decide trigger/scene/seq, then
-send the same decision to the small robot Bridge Host and HRT Host.
+send the decision to the ESP32 Bridge Host.
 
 Robot/Bridge frame:
     TRIGGER;TIMESTAMP;SCENE;SEQ;SPEED<LF>
 
-HRT frame:
+Optional legacy HRT frame:
     TRIGGER,TIMESTAMP,SCENE,SEQ,SPEED;
 """
 
@@ -143,7 +143,7 @@ def run(args: argparse.Namespace) -> None:
     )
 
     bridge = None if args.no_bridge else TcpSink("robot", args.bridge_host, args.bridge_port, args.timeout)
-    hrt = None if args.no_hrt else TcpSink("hrt", args.hrt_host, args.hrt_port, args.timeout)
+    hrt = TcpSink("hrt", args.hrt_host, args.hrt_port, args.timeout) if args.enable_hrt and not args.no_hrt else None
     period_s = 1.0 / args.rate_hz
 
     try:
@@ -167,18 +167,17 @@ def run(args: argparse.Namespace) -> None:
                         ts = frame_timestamp()
                         speed = args.active_speed if step.trigger >= args.threshold else args.idle_speed
                         b_frame = bridge_frame(entry, step.trigger, ts, speed)
-                        h_frame = hrt_frame(entry, step.trigger, ts, speed)
                         if args.verbose or args.dry_run:
-                            print(
-                                f"[sample {sample_no:04d}] bridge={b_frame.rstrip()} hrt={h_frame}",
-                                flush=True,
-                            )
+                            line = f"[sample {sample_no:04d}] bridge={b_frame.rstrip()}"
+                            if hrt:
+                                line += f" hrt={hrt_frame(entry, step.trigger, ts, speed)}"
+                            print(line, flush=True)
                         start = time.monotonic()
                         if not args.dry_run:
                             if bridge:
                                 bridge.send(b_frame)
                             if hrt:
-                                hrt.send(h_frame)
+                                hrt.send(hrt_frame(entry, step.trigger, ts, speed))
                         elapsed = time.monotonic() - start
                         sleep_s = period_s - elapsed
                         if sleep_s > 0 and not args.dry_run:
@@ -196,11 +195,11 @@ def run(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Simulate the SILAB logic decision TCP client.")
+    parser = argparse.ArgumentParser(description="Simulate the logic decision TCP client.")
     parser.add_argument("--bridge-host", default="127.0.0.1", help="Robot/Bridge Host IP. Default: 127.0.0.1")
     parser.add_argument("--bridge-port", type=int, default=7777, help="Robot/Bridge Host port. Default: 7777")
-    parser.add_argument("--hrt-host", default="127.0.0.1", help="HRT Host IP. Default: 127.0.0.1")
-    parser.add_argument("--hrt-port", type=int, default=9001, help="HRT Host port. Default: 9001")
+    parser.add_argument("--hrt-host", default="127.0.0.1", help=argparse.SUPPRESS)
+    parser.add_argument("--hrt-port", type=int, default=9001, help=argparse.SUPPRESS)
     parser.add_argument("--voice-package", type=Path, help="Path to common_voice_test_assets_YYYYMMDD package")
     parser.add_argument("--voice-md", type=Path, help="Path to playback Markdown if no package directory is used")
     parser.add_argument("--audio-root", type=Path, help="Path to package audio directory")
@@ -219,7 +218,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--active-speed", type=float, default=1.2, help="Speed sent while trigger is active. Default: 1.2")
     parser.add_argument("--timeout", type=float, default=3.0, help="TCP connect timeout. Default: 3")
     parser.add_argument("--no-bridge", action="store_true", help="Do not send robot/Bridge frames")
-    parser.add_argument("--no-hrt", action="store_true", help="Do not send HRT frames")
+    parser.add_argument("--enable-hrt", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--no-hrt", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true", help="Print frames without connecting")
     parser.add_argument("--verbose", action="store_true", help="Print every generated frame")
     return parser
@@ -244,4 +244,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -1,79 +1,66 @@
-# PC SILAB Bridge
+# PC ESP32 Bridge
 
 ## Target Topology
 
 ```text
-SILAB --Ethernet LAN A/TCP--> Experiment PC --WiFi LAN B/direct TCP play + MQTT status--> ESP32
-                                  └-- TCP device packet --> HRT
+SILAB / vehicle state source
+        |
+        v
+Python logic decision program --TCP 7777--> Experiment PC Bridge GUI
+                                             |
+                                             +--direct TCP play--> ESP32
+                                             +--MQTT status/fallback--> ESP32
 ```
 
-The experiment PC is the stable protocol boundary:
+The formal Bridge no longer communicates with HRT. If an experiment still needs
+HRT records, send them from the logic decision program as a separate optional
+link. Do not route HRT traffic through the ESP32 Bridge.
 
-- Mosquitto MQTT broker listens on `0.0.0.0:1883` and is reachable from WiFi LAN B for status and fallback control.
-- `tools/silab_mqtt_bridge_gui.py` listens as the TCP host for SILAB on LAN A.
-- The GUI forwards only trigger rising edges to ESP32, using ESP32 direct TCP first and MQTT only as fallback.
-- The GUI forwards every valid SILAB sample to HRT as a TCP device packet when HRT host/port is configured.
-- ESP32 still reports status over MQTT, so the GUI can discover the ESP32 IP and monitor TF/audio state.
+## Logic Packet
 
-## SILAB Packet
-
-SILAB sends one text line per sample:
+The logic decision program sends one UTF-8 text line per sample:
 
 ```text
-TRIGGER;TIME_LOW;TIME_HIGH;SCENE;SEQ;SPEED<LF>
+TRIGGER;TIMESTAMP;SCENE;SEQ;SPEED<LF>
 ```
 
 Rules:
 
-- `trigger >= 0.5` is active.
+- `TRIGGER >= 0.5` is active.
 - Playback happens only on a `0 -> 1` rising edge.
-- Continuous fixed-rate `trigger=1` packets are ignored until a `trigger=0` packet resets the latch.
-- `TIME_LOW` is the low 6 digits of Unix time.
-- `TIME_HIGH` is `floor(unix_time / 100000)`.
-- The bridge reconstructs `timestamp = TIME_HIGH * 100000 + (TIME_LOW % 100000)`.
-- `SPEED` is displayed for observation/debug and forwarded to HRT.
-- HRT forwarding is not edge-triggered; every valid SILAB sample is sent as `trigger,timestamp,scene,seq,speed;`.
-- Numeric scene IDs first use GUI aliases, then fall back to the GUI prefix.
-  The default alias is `1=boot` so the current TF-card test file
-  `/sdcard/audio/boot/001.wav` works immediately. Without an alias, `1` maps
-  to `scene001`.
+- Continuous fixed-rate `TRIGGER=1` packets are ignored until a `TRIGGER=0`
+  packet resets the latch.
+- `TIMESTAMP` is a complete Unix timestamp in seconds, integer or decimal.
+- `SCENE` is the TF-card audio folder.
+- `SEQ` is the file stem. Numeric `1` maps to `001.wav` on ESP32; text IDs map
+  directly, for example `common/left_rear_vehicle_merge.wav`.
+- `SPEED` is displayed for observation/debug only.
 
 Example:
 
 ```text
-1;235200;17792;1;1;1.2
+1;1779452836.933;common;left_rear_vehicle_merge;1.2
 ```
 
-The GUI forwards this play payload over ESP32 direct TCP by default:
+The GUI forwards this play payload to ESP32:
 
 ```json
-{"type":"play","scene":"boot","seq":1,"message_id":"silab_..."}
+{"type":"play","scene":"common","seq":"left_rear_vehicle_merge","message_id":"logic_..."}
 ```
 
 ESP32 then plays:
 
 ```text
-/sdcard/audio/boot/001.wav
+/sdcard/audio/common/left_rear_vehicle_merge.wav
 ```
 
 ## Run On Experiment PC
-
-For a step-by-step Windows handover guide, see
-`docs/WINDOWS_SILAB_BRIDGE_DEPLOYMENT.md`.
 
 Install dependencies:
 
 ```bash
 python -m pip install paho-mqtt pyserial
 ```
-
-Install Mosquitto:
-
-```bash
-sudo apt install mosquitto
-```
-
-Windows: install Mosquitto from the official installer and add it to `PATH`.
 
 Start the GUI:
 
@@ -85,17 +72,19 @@ In the GUI:
 
 1. Use an external Mosquitto service for formal tests. The GUI `Start Dev Broker`
    button is only for local developer checks.
-2. Set the broker host/port used by the GUI. `127.0.0.1:1883` is fine for the GUI itself.
-3. Set `ESP32 USB Setup / Broker URI` to the experiment PC WiFi LAN B IP, for example `mqtt://192.168.0.10:1883`.
+2. Set the broker host/port used by the GUI. `127.0.0.1:1883` is fine when the
+   broker runs on the experiment PC.
+3. Set `ESP32 USB Setup / Broker URI` to the experiment PC WiFi LAN IP, for
+   example `mqtt://192.168.0.10:1883`.
 4. Press `Save MQTT` with ESP32 connected over USB.
 5. Press `Connect` in the MQTT panel.
-6. Wait for ESP32 status; the GUI auto-fills `ESP Host` from `tcp_host` or WiFi IP.
+6. Wait for ESP32 status; the GUI auto-fills `ESP Host` from `tcp_host` or WiFi
+   IP.
 7. Keep `Direct ESP TCP` enabled for low-latency playback.
-8. Press `Start TCP Host` and set SILAB `Destination_IP` to the experiment PC Ethernet LAN A IP.
-9. If HRT is used, set `HRT Host` and `HRT Port`, check `Forward SILAB samples to HRT`, then press `Connect HRT`.
-10. Keep `Aliases = 1=boot` for the current TF-card test audio. For formal
-   multi-scene audio, copy files such as `/sdcard/audio/scene001/001.wav` and
-   clear or edit the alias field.
+8. In `Logic TCP Host`, set `Bind = 0.0.0.0`, `Port = 7777`, then press
+   `Start TCP Host`.
+9. Point the Python logic decision program to the experiment PC IP and port
+   `7777`.
 
 ## ESP32 MQTT Topics
 
@@ -115,7 +104,7 @@ Manual status query:
 Manual playback:
 
 ```json
-{"type":"play","scene":"boot","seq":1}
+{"type":"play","scene":"common","seq":"left_rear_vehicle_merge"}
 ```
 
 Manual stop:
@@ -138,39 +127,30 @@ WiFi configuration remains:
 python3 tools/copilot_usb_config.py --port /dev/ttyACM2 wifi --ssid YOUR_WIFI --password YOUR_PASS
 ```
 
-## SILAB Debug Probe
+## Packet Probe
 
-Before connecting SILAB to the GUI, validate the actual TCP packet format on the PC:
+Before connecting the real logic program to the GUI, validate the packet format:
 
 ```bash
 python3 tools/silab_tcp_probe.py --host 0.0.0.0 --port 7777
 ```
 
-The probe should print `format: OK` and `rising_edge=True` when the trigger changes from `0` to `1`.
+The probe should print `format: OK` and `rising_edge=True` when the trigger
+changes from `0` to `1`.
 
-## SILAB Simulator
+## Simulator
 
 To test the full bridge without SILAB hardware, start the GUI TCP host and run:
 
 ```bash
-python3 tools/silab_tcp_simulator.py --host 127.0.0.1 --port 7777 --scene 1 --seq 1 --read-ack --verbose
-```
-
-The default simulation sends one pulse:
-
-```text
-0<TAB>1<TAB>1
-...
-1<TAB>1<TAB>1
-...
-0<TAB>1<TAB>1
+python3 tools/silab_tcp_simulator.py --host 127.0.0.1 --port 7777 --scene common --seq left_rear_vehicle_merge --read-ack --verbose
 ```
 
 Useful options:
 
 ```bash
 # Repeat three trigger cycles at 20 Hz
-python3 tools/silab_tcp_simulator.py --host <PC_LAN_A_IP> --cycles 3 --rate-hz 20
+python3 tools/silab_tcp_simulator.py --host <PC_IP> --cycles 3 --rate-hz 20
 
 # Custom fixed-rate pattern: idle 1s, active 3s, idle 1s
 python3 tools/silab_tcp_simulator.py --pattern "0:1,1:3,0:1"

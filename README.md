@@ -2,6 +2,12 @@
 
 A cute animated face companion for ESP32-S3 with AMOLED display, featuring smooth expressions, motion response, and MQTT control.
 
+## Repository responsibility
+
+This repository owns robot firmware, device protocols, on-device UI/audio behavior, and deployment integration. Voice scripts and WAV generation belong to `D:\WorkSpace\copilot\silent_failure_tts`; experiment data analysis belongs to `D:\WorkSpace\copilot\Experiments`; academic writing belongs to `D:\WorkSpace\copilot\Thesis`.
+
+Only validated audio packages and manifests should cross from the TTS repository into firmware/deployment testing. Do not store participant data, analysis databases, TTS credentials, Wi-Fi passwords, or MQTT secrets here.
+
 ## Hardware
 
 - **Board**: Waveshare ESP32-S3-Touch-AMOLED-1.75 (466x466 round display)
